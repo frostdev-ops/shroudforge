@@ -1,7 +1,10 @@
 #include "code-inventory/resolve_original_call_graph.h"
 #include "code-inventory/inspect_game_functions.h"
 #include "named-services/named_service_contract.h"
+#include <cstring>
 #include <deque>
+#include <filesystem>
+#include <fstream>
 #include <map>
 #include <set>
 
@@ -86,6 +89,68 @@ struct Image {
 };
 const Image& image() { static const Image value; return value; }
 
+// The executable file's own code bytes at their image offsets. Another module's
+// detour replaces the first instructions of a function with a jump out of the
+// image, which hides that function's real callees from the reachability walk.
+// These bytes only let the walk pass through such a function. They are never
+// retained as evidence, and a function read from here is never selected.
+struct FileImage {
+    std::vector<std::uint8_t> bytes;
+    FileImage() {
+        try {
+            const auto& im = image();
+            if (!im.size) return;
+            std::wstring path(32768, L'\0');
+            const auto length = GetModuleFileNameW(nullptr, path.data(), static_cast<DWORD>(path.size()));
+            if (!length || length >= path.size()) return;
+            path.resize(length);
+            std::ifstream file(std::filesystem::path(path), std::ios::binary);
+            IMAGE_DOS_HEADER dos{};
+            IMAGE_NT_HEADERS64 nt{};
+            if (!file.read(reinterpret_cast<char*>(&dos), sizeof(dos)) || dos.e_magic != IMAGE_DOS_SIGNATURE ||
+                dos.e_lfanew < 0 || dos.e_lfanew > 0x100000) return;
+            file.seekg(dos.e_lfanew);
+            // Without relocation the file's code equals the loaded code byte for byte.
+            if (!file.read(reinterpret_cast<char*>(&nt), sizeof(nt)) || nt.Signature != IMAGE_NT_SIGNATURE ||
+                nt.OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC ||
+                nt.OptionalHeader.ImageBase != im.base || nt.OptionalHeader.SizeOfImage != im.size) return;
+            std::vector<std::uint8_t> loaded(im.size);
+            for (const auto& section : im.sections) {
+                if (!(section.Characteristics & IMAGE_SCN_MEM_EXECUTE) ||
+                    (section.Characteristics & IMAGE_SCN_MEM_WRITE)) continue;
+                const auto count = (std::min)(section.SizeOfRawData, section.Misc.VirtualSize);
+                if (!count) continue;
+                file.seekg(section.PointerToRawData);
+                if (!file.read(reinterpret_cast<char*>(loaded.data() + section.VirtualAddress), count)) return;
+            }
+            bytes = std::move(loaded);
+        } catch (...) {}
+    }
+    bool Read(std::uint32_t offset, void* out, std::size_t count) const {
+        if (bytes.empty() || offset > bytes.size() || count > bytes.size() - offset) return false;
+        std::memcpy(out, bytes.data() + offset, count);
+        return true;
+    }
+};
+const FileImage& file_image() { static const FileImage value; return value; }
+
+// Whether the loaded bytes of the procedure at entry differ from the file's.
+bool differs_from_file(std::uintptr_t entry) {
+    const auto& im = image();
+    const auto& file = file_image();
+    if (file.bytes.empty() || entry < im.base || entry - im.base >= im.size) return false;
+    const auto offset = static_cast<std::uint32_t>(entry - im.base);
+    const auto differs = [&](std::uint32_t begin, std::uint32_t end) {
+        std::vector<std::uint8_t> live(end - begin);
+        return im.Read(begin, live.data(), live.size()) &&
+            std::memcmp(live.data(), file.bytes.data() + begin, live.size()) != 0;
+    };
+    const auto found = im.procedures.find(offset);
+    if (found == im.procedures.end()) return differs(offset, (std::min)(im.size, offset + 16));
+    for (const auto& range : found->second) if (differs(range.begin, range.end)) return true;
+    return false;
+}
+
 bool executable_span(std::uintptr_t at, std::size_t size) {
     if (!size || size > UINTPTR_MAX - at) return false;
     const auto& im = image();
@@ -116,7 +181,7 @@ bool target(const Instruction& ins, std::uintptr_t& address) {
     address = static_cast<std::uintptr_t>(absolute);
     return NamedServiceImplementation::executable_callback(address);
 }
-bool read_leaf(std::uintptr_t entry, const ZydisDecoder& decoder, Procedure& result) {
+bool read_leaf(std::uintptr_t entry, const ZydisDecoder& decoder, Procedure& result, const FileImage* file = nullptr) {
     // A missing unwind entry only admits a small call-free control-flow graph.
     // Every edge must terminate in this graph or return. Internal labels of an
     // unwind-owned function are never reinterpreted as leaf procedure entries.
@@ -127,7 +192,11 @@ bool read_leaf(std::uintptr_t entry, const ZydisDecoder& decoder, Procedure& res
     const auto count = (std::min)(limit, static_cast<std::size_t>(im.size - offset));
     if (!executable_span(entry, count)) return false;
     std::vector<std::uint8_t> bytes(count), repeated(count);
-    if (!copy(bytes.data(), reinterpret_cast<const void*>(entry), count)) return false;
+    const auto read = [&](std::uint8_t* out) {
+        return file ? file->Read(static_cast<std::uint32_t>(offset), out, count)
+                    : copy(out, reinterpret_cast<const void*>(entry), count);
+    };
+    if (!read(bytes.data())) return false;
     std::set<std::uintptr_t> pending{entry};
     std::map<std::uintptr_t, Instruction> instructions;
     while (!pending.empty()) {
@@ -167,7 +236,7 @@ bool read_leaf(std::uintptr_t entry, const ZydisDecoder& decoder, Procedure& res
             at += ins.decoded.length;
         }
     }
-    if (instructions.empty() || !copy(repeated.data(), reinterpret_cast<const void*>(entry), count) || repeated != bytes) return false;
+    if (instructions.empty() || !read(repeated.data()) || repeated != bytes) return false;
     for (auto& [at, ins] : instructions) result.instructions.push_back(std::move(ins));
     return true;
 }
@@ -232,7 +301,8 @@ bool ReadImageSections(std::vector<ImageSection>& output) {
     } catch (...) { return false; }
 }
 
-bool ReadProcedure(std::uintptr_t entry, Procedure& output) {
+namespace {
+bool read_procedure(std::uintptr_t entry, Procedure& output, const FileImage* file) {
     try {
         const auto& im = image();
         if (!im.size || entry < im.base || entry - im.base >= im.size ||
@@ -242,7 +312,7 @@ bool ReadProcedure(std::uintptr_t entry, Procedure& output) {
         Procedure result; result.entry = entry;
         const auto found = im.procedures.find(static_cast<std::uint32_t>(entry - im.base));
         if (found == im.procedures.end()) {
-            if (!read_leaf(entry, decoder, result)) return false;
+            if (!read_leaf(entry, decoder, result, file)) return false;
         } else {
             struct Snapshot { Range range; std::vector<std::uint8_t> bytes; };
             std::vector<Snapshot> snapshots;
@@ -257,7 +327,8 @@ bool ReadProcedure(std::uintptr_t entry, Procedure& output) {
                 total += size;
                 if (total > 1024 * 1024 || !executable_span(im.base + snapshot.range.begin, size)) return false;
                 snapshot.bytes.resize(size);
-                if (!im.Read(snapshot.range.begin, snapshot.bytes.data(), size)) return false;
+                if (!(file ? file->Read(snapshot.range.begin, snapshot.bytes.data(), size)
+                           : im.Read(snapshot.range.begin, snapshot.bytes.data(), size))) return false;
             }
             const auto containing = [&](std::uintptr_t at) -> const Snapshot* {
                 for (const auto& snapshot : snapshots)
@@ -403,7 +474,9 @@ bool ReadProcedure(std::uintptr_t entry, Procedure& output) {
             }
             for (const auto& snapshot : snapshots) {
                 std::vector<std::uint8_t> repeated(snapshot.bytes.size());
-                if (!im.Read(snapshot.range.begin, repeated.data(), repeated.size()) || repeated != snapshot.bytes) return false;
+                if (!(file ? file->Read(snapshot.range.begin, repeated.data(), repeated.size())
+                           : im.Read(snapshot.range.begin, repeated.data(), repeated.size())) ||
+                    repeated != snapshot.bytes) return false;
             }
             for(const auto& data:result.read_only_data) {
                 std::vector<std::uint8_t> repeated(data.bytes.size());
@@ -414,6 +487,14 @@ bool ReadProcedure(std::uintptr_t entry, Procedure& output) {
         output = std::move(result);
         return true;
     } catch (...) { return false; }
+}
+}
+
+bool ReadProcedure(std::uintptr_t entry, Procedure& output) { return read_procedure(entry, output, nullptr); }
+
+bool ReadOriginalProcedure(std::uintptr_t entry, Procedure& output, bool& foreign) {
+    foreign = differs_from_file(entry);
+    return read_procedure(entry, output, foreign ? &file_image() : nullptr);
 }
 
 bool ReadContainingProcedure(std::uintptr_t address, Procedure& output) {
@@ -470,8 +551,12 @@ bool FindUniqueReachable(std::uintptr_t root, unsigned maximum_depth,
             if (!visited.insert(entry).second) continue;
             if (visited.size() > maximum_functions) return false;
             Procedure code;
-            if (!ReadProcedure(entry, code)) return false;
-            if (predicate(code)) {
+            // A function another module detoured is read from the executable
+            // file, so the walk still sees its real callees. It is a path
+            // only and can never be the selected procedure.
+            const bool foreign = differs_from_file(entry);
+            if (!(foreign ? read_procedure(entry, code, &file_image()) : ReadProcedure(entry, code))) return false;
+            if (!foreign && predicate(code)) {
                 if (selected && selected != entry) return false;
                 selected = entry;
             }

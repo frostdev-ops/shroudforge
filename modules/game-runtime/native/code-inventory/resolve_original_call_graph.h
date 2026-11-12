@@ -44,6 +44,10 @@ bool EvidenceUnchanged(const CodeEvidence& evidence);
 // Complete chained PE unwind ranges, or a bounded call-free leaf CFG. Never
 // treats E8 bytes inside operands as calls and never scans for byte signatures.
 bool ReadProcedure(std::uintptr_t entry, Procedure& output);
+// Like ReadProcedure, but a procedure another module detoured is read from the
+// executable file and reported as foreign. A foreign procedure shows the
+// original call graph only. It is not evidence and must not be retained as such.
+bool ReadOriginalProcedure(std::uintptr_t entry, Procedure& output, bool& foreign);
 // Resolves an interior instruction through the canonical chained unwind owner.
 // The address must be an instruction boundary reached by that owner's CFG.
 bool ReadContainingProcedure(std::uintptr_t address, Procedure& output);

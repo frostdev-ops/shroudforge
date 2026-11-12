@@ -671,9 +671,13 @@ bool resolve_contract(Contract& output) {
     bool linked=std::find(root_body.calls.begin(),root_body.calls.end(),helper)!=root_body.calls.end();
     for(const auto callee:root_body.calls) {
         Procedure intermediate;
-        if(OriginalCode::ReadProcedure(callee,intermediate) &&
+        // The caller between the system and the helper only proves the link. When another
+        // module detoured it, the executable file shows that link and it is not retained
+        // as evidence. The helper and its callees are still captured from loaded code.
+        bool foreign{};
+        if(OriginalCode::ReadOriginalProcedure(callee,intermediate,foreign) &&
            std::find(intermediate.calls.begin(),intermediate.calls.end(),helper)!=intermediate.calls.end()) {
-            if(!capture_code(intermediate,found))return false;linked=true;
+            if(!foreign && !capture_code(intermediate,found))return false;linked=true;
         }
     }
     if(!linked || !validate_code(found))return false;
