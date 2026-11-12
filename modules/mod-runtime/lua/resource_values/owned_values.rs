@@ -92,15 +92,19 @@ impl StructValue {
     }
 
     pub fn set(&self, key: String, value: &LuaValue, lua: &mlua::Lua) -> mlua::Result<()> {
-        if !self.fields.borrow().contains_key(&key) {
-            return Err(LuaError::generic(format!(
-                "attempt to set invalid property '{key}' on {}",
-                name_of(&self.r#type)
-            )));
-        }
+        let field_type = match self.r#type.get_field_type(&key) {
+            Some(field_type) if self.fields.borrow().contains_key(&key) => field_type,
+            _ => {
+                return Err(LuaError::generic(format!(
+                    "attempt to set invalid property '{key}' on {}",
+                    name_of(&self.r#type)
+                )));
+            }
+        };
 
+        // the field's type, as MappedStructValue::set checks it (not the struct's own type)
         let value =
-            validate_and_clone_lua_value(value, &self.r#type, lua).map_err(LuaError::external)?;
+            validate_and_clone_lua_value(value, &field_type, lua).map_err(LuaError::external)?;
 
         self.fields.borrow_mut().insert(key, value);
 
@@ -308,8 +312,9 @@ impl ArrayValue {
     pub fn set(&self, index: usize, value: &LuaValue, lua: &mlua::Lua) -> mlua::Result<()> {
         let index = self.check_range(index, 1, self.len())?;
 
-        let value =
-            validate_and_clone_lua_value(value, &self.r#type, lua).map_err(LuaError::external)?;
+        // the element type, as MappedArrayValue::set checks it (not the array's own type)
+        let value = validate_and_clone_lua_value(value, &self.inner_type, lua)
+            .map_err(LuaError::external)?;
 
         self.values.borrow_mut()[index] = value;
 
@@ -320,8 +325,8 @@ impl ArrayValue {
         let index = self.check_range(index, 1, self.len() + 1)?;
         self.check_static()?;
 
-        let value =
-            validate_and_clone_lua_value(value, &self.r#type, lua).map_err(LuaError::external)?;
+        let value = validate_and_clone_lua_value(value, &self.inner_type, lua)
+            .map_err(LuaError::external)?;
 
         self.values.borrow_mut().insert(index, value);
 

@@ -26,6 +26,8 @@ mod value_path;
 use value_path as tree_path;
 mod validate_resource_values;
 use validate_resource_values as validator;
+#[cfg(test)]
+mod tests;
 
 pub fn convert_lua_to_value(
     lua_value: &LuaValue,
