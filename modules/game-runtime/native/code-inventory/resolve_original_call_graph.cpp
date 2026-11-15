@@ -7,14 +7,18 @@
 #include <fstream>
 #include <map>
 #include <set>
+#include <atomic>
+#include <cstdio>
 
 namespace OriginalCode {
 namespace {
 using NamedServiceImplementation::copy;
-struct Range { std::uint32_t begin{}, end{}; };
+using Range = OriginalFile::Range;
 struct Image {
     std::uintptr_t base{};
     std::uint32_t size{};
+    OriginalFile::Layout layout;
+    std::map<std::uint32_t,std::uint32_t> range_owners;
     std::map<std::uint32_t, std::vector<Range>> procedures;
     std::vector<Range> ranges;
     std::vector<IMAGE_SECTION_HEADER> sections;
@@ -46,6 +50,16 @@ struct Image {
         for (const auto& section : sections)
             if (section.VirtualAddress > size || section.Misc.VirtualSize > size - section.VirtualAddress)
                 throw std::runtime_error("invalid original section range");
+        layout.preferred=nt.OptionalHeader.ImageBase; layout.loaded=base; layout.size=size;
+        layout.machine=nt.FileHeader.Machine; layout.timestamp=nt.FileHeader.TimeDateStamp;
+        layout.checksum=nt.OptionalHeader.CheckSum; layout.count=nt.FileHeader.NumberOfSections;
+        for (const auto& section:sections) {
+            OriginalFile::Section value;
+            std::copy_n(section.Name,8,value.name.begin());
+            value.rva=section.VirtualAddress; value.size=section.Misc.VirtualSize;
+            value.raw=section.PointerToRawData; value.raw_size=section.SizeOfRawData; value.flags=section.Characteristics;
+            layout.sections.push_back(value);
+        }
         const auto dir = nt.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
         if (!size || dir.Size % sizeof(RUNTIME_FUNCTION) || !dir.Size || dir.Size > 16 * 1024 * 1024)
             throw std::runtime_error("invalid original unwind directory");
@@ -82,6 +96,7 @@ struct Image {
             const Range range{record.BeginAddress, record.EndAddress};
             procedures[root.BeginAddress].push_back(range);
             ranges.push_back(range);
+            range_owners.emplace(range.begin,root.BeginAddress);
         }
         for (auto& [entry, parts] : procedures)
             std::sort(parts.begin(), parts.end(), [](const Range& a, const Range& b) { return a.begin < b.begin; });
@@ -89,66 +104,156 @@ struct Image {
 };
 const Image& image() { static const Image value; return value; }
 
-// The executable file's own code bytes at their image offsets. Another module's
-// detour replaces the first instructions of a function with a jump out of the
-// image, which hides that function's real callees from the reachability walk.
-// These bytes only let the walk pass through such a function. They are never
-// retained as evidence, and a function read from here is never selected.
-struct FileImage {
-    std::vector<std::uint8_t> bytes;
-    FileImage() {
-        try {
-            const auto& im = image();
-            if (!im.size) return;
-            std::wstring path(32768, L'\0');
-            const auto length = GetModuleFileNameW(nullptr, path.data(), static_cast<DWORD>(path.size()));
-            if (!length || length >= path.size()) return;
-            path.resize(length);
-            std::ifstream file(std::filesystem::path(path), std::ios::binary);
-            IMAGE_DOS_HEADER dos{};
-            IMAGE_NT_HEADERS64 nt{};
-            if (!file.read(reinterpret_cast<char*>(&dos), sizeof(dos)) || dos.e_magic != IMAGE_DOS_SIGNATURE ||
-                dos.e_lfanew < 0 || dos.e_lfanew > 0x100000) return;
-            file.seekg(dos.e_lfanew);
-            // Without relocation the file's code equals the loaded code byte for byte.
-            if (!file.read(reinterpret_cast<char*>(&nt), sizeof(nt)) || nt.Signature != IMAGE_NT_SIGNATURE ||
-                nt.OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC ||
-                nt.OptionalHeader.ImageBase != im.base || nt.OptionalHeader.SizeOfImage != im.size) return;
-            std::vector<std::uint8_t> loaded(im.size);
-            for (const auto& section : im.sections) {
-                if (!(section.Characteristics & IMAGE_SCN_MEM_EXECUTE) ||
-                    (section.Characteristics & IMAGE_SCN_MEM_WRITE)) continue;
-                const auto count = (std::min)(section.SizeOfRawData, section.Misc.VirtualSize);
-                if (!count) continue;
-                file.seekg(section.PointerToRawData);
-                if (!file.read(reinterpret_cast<char*>(loaded.data() + section.VirtualAddress), count)) return;
-            }
-            bytes = std::move(loaded);
-        } catch (...) {}
+using Reader = std::function<bool(std::uint64_t,void*,std::size_t)>;
+void file_diagnostic(const char* reason) {
+    char message[512];
+    std::snprintf(message,sizeof(message),"ShroudForge original call graph: executable file refused: %s; live-only resolution\n",reason);
+    using Log = void(__cdecl*)(std::uint8_t,const wchar_t*,const char*);
+    const auto runtime=GetModuleHandleW(L"shroudforge-runtime.dll");
+    const auto sink=runtime?reinterpret_cast<Log>(GetProcAddress(runtime,"shroudforge_game_profile_discovery_log")):nullptr;
+    if (sink) {
+        wchar_t path[32768]{};
+        const auto length=GetModuleFileNameW(nullptr,path,32768);
+        if (length && length<32768) {
+            const auto root=std::filesystem::path(path).parent_path();
+            sink('W',root.c_str(),message);return;
+        }
     }
-    bool Read(std::uint32_t offset, void* out, std::size_t count) const {
-        if (bytes.empty() || offset > bytes.size() || count > bytes.size() - offset) return false;
-        std::memcpy(out, bytes.data() + offset, count);
+    OutputDebugStringA(message);
+}
+std::size_t instruction_length(const std::uint8_t* bytes,std::size_t size) {
+    ZydisDecoder decoder;
+    ZydisDecodedInstruction instruction{};
+    if (!ZYAN_SUCCESS(ZydisDecoderInit(&decoder,ZYDIS_MACHINE_MODE_LONG_64,ZYDIS_STACK_WIDTH_64)) ||
+        !ZYAN_SUCCESS(ZydisDecoderDecodeInstruction(&decoder,nullptr,bytes,size,&instruction))) return 0;
+    return instruction.length;
+}
+struct FileImage {
+    struct Section { std::uint32_t rva; std::vector<std::uint8_t> bytes; };
+    std::vector<Section> sections;
+    mutable std::atomic<bool> usable{false};
+    mutable std::atomic<bool> diagnosed{false};
+    void Refuse(const char* reason) const {
+        usable.store(false);
+        if (!diagnosed.exchange(true)) file_diagnostic(reason);
+    }
+    bool Read(std::uint32_t offset,void* out,std::size_t count) const {
+        for (const auto& section:sections) if (offset>=section.rva && offset-section.rva<=section.bytes.size() &&
+            count<=section.bytes.size()-(offset-section.rva)) {
+            std::memcpy(out,section.bytes.data()+offset-section.rva,count);return true;
+        }
+        return false;
+    }
+    OriginalFile::Admission Classify(std::uint32_t entry,OriginalFile::Detour& record) const {
+        const auto& im=image();
+        const auto found=im.procedures.find(entry);
+        // No unwind owner: never infer a detour span from a speculative leaf extent.
+        if (found==im.procedures.end()) return OriginalFile::Admission::refuse;
+        // Validate the existing map's extents without allocating a comparison snapshot.
+        if (!OriginalFile::bounded(found->second,im.size)) return OriginalFile::Admission::refuse;
+        Reader file=[&](std::uint64_t at,void* out,std::size_t size) {
+            return at>=im.base && at-im.base<=UINT32_MAX && Read(static_cast<std::uint32_t>(at-im.base),out,size);
+        };
+        Reader live=[](std::uint64_t at,void* out,std::size_t size) {
+            return copy(out,reinterpret_cast<const void*>(static_cast<std::uintptr_t>(at)),size);
+        };
+        return OriginalFile::admit(im.base,entry,found->second,file,live,instruction_length,
+            [](std::uint64_t at){return NamedServiceImplementation::executable_callback(static_cast<std::uintptr_t>(at));},record);
+    }
+    // First-use resolution before the caller acquires a Scene gate; never repeated by cached validation.
+    // No sparse SizeOfImage allocation.
+    bool CompareImage() const {
+        const auto& im=image();
+        std::array<std::uint8_t,4096> live{};
+        std::set<std::uint32_t> admitted;
+        for (const auto& section:sections) {
+            std::size_t offset{};
+            while (offset<section.bytes.size()) {
+                const auto n=(std::min)(live.size(),section.bytes.size()-offset);
+                const auto rva=section.rva+static_cast<std::uint32_t>(offset);
+                if (!im.Read(rva,live.data(),n)) {Refuse("unreadable loaded code");return false;}
+                const auto* original=section.bytes.data()+offset;
+                if (!std::memcmp(original,live.data(),n)) {offset+=n;continue;}
+                std::size_t changed{};
+                while (changed<n && original[changed]==live[changed]) ++changed;
+                const auto at=rva+static_cast<std::uint32_t>(changed);
+                auto owner=im.range_owners.upper_bound(at);
+                OriginalFile::Detour detour;
+                if (owner==im.range_owners.begin() ||
+                    Classify(std::prev(owner)->second,detour)!=OriginalFile::Admission::detour ||
+                    at<detour.rva || at-detour.rva>=detour.span) {
+                    char reason[160];std::snprintf(reason,sizeof(reason),"function RVA 0x%08x differs from the file other than by an entry detour",
+                        owner==im.range_owners.begin()?at:std::prev(owner)->second);
+                    Refuse(reason);return false;
+                }
+                admitted.insert(detour.rva);
+                if (admitted.size()>OriginalFile::function_limit) {Refuse("entry detour count bound");return false;}
+                offset=detour.rva+detour.span-section.rva;
+            }
+        }
         return true;
     }
+    FileImage() {
+        try {
+            const auto& im=image();
+            if (!im.size) {Refuse("invalid loaded image");return;}
+            std::wstring path(32768,L'\0');
+            const auto length=GetModuleFileNameW(nullptr,path.data(),static_cast<DWORD>(path.size()));
+            if (!length || length>=path.size()) {Refuse("module path");return;}
+            path.resize(length);
+            std::ifstream file(std::filesystem::path(path),std::ios::binary);
+            IMAGE_DOS_HEADER dos{}; IMAGE_NT_HEADERS64 nt{};
+            if (!file.read(reinterpret_cast<char*>(&dos),sizeof(dos)) || dos.e_magic!=IMAGE_DOS_SIGNATURE ||
+                dos.e_lfanew<0 || dos.e_lfanew>0x100000) {Refuse("DOS header");return;}
+            file.seekg(dos.e_lfanew);
+            if (!file.read(reinterpret_cast<char*>(&nt),sizeof(nt)) || nt.Signature!=IMAGE_NT_SIGNATURE ||
+                nt.OptionalHeader.Magic!=IMAGE_NT_OPTIONAL_HDR64_MAGIC ||
+                nt.FileHeader.SizeOfOptionalHeader<sizeof(IMAGE_OPTIONAL_HEADER64) ||
+                nt.FileHeader.NumberOfSections>128) {Refuse("PE header");return;}
+            OriginalFile::Layout layout;
+            layout.preferred=nt.OptionalHeader.ImageBase;layout.size=nt.OptionalHeader.SizeOfImage;
+            layout.machine=nt.FileHeader.Machine;layout.timestamp=nt.FileHeader.TimeDateStamp;
+            layout.checksum=nt.OptionalHeader.CheckSum;layout.count=nt.FileHeader.NumberOfSections;
+            // Read the FILE's own table, not raw offsets taken from memory.
+            file.seekg(static_cast<std::uint64_t>(dos.e_lfanew)+offsetof(IMAGE_NT_HEADERS64,OptionalHeader)+nt.FileHeader.SizeOfOptionalHeader);
+            for (unsigned i=0;i<layout.count;++i) {
+                IMAGE_SECTION_HEADER section{};
+                if (!file.read(reinterpret_cast<char*>(&section),sizeof(section))) {Refuse("file section table");return;}
+                OriginalFile::Section value;std::copy_n(section.Name,8,value.name.begin());
+                value.rva=section.VirtualAddress;value.size=section.Misc.VirtualSize;
+                value.raw=section.PointerToRawData;value.raw_size=section.SizeOfRawData;value.flags=section.Characteristics;
+                layout.sections.push_back(value);
+            }
+            if (const auto reason=OriginalFile::identity(im.layout,layout)) {Refuse(reason);return;}
+            for (const auto& section:layout.sections) {
+                if (!(section.flags & IMAGE_SCN_MEM_EXECUTE) || !section.size) continue;
+                Section cached{section.rva,std::vector<std::uint8_t>(section.size)};
+                const auto count=(std::min)(section.raw_size,section.size);
+                file.seekg(section.raw);
+                if (!file.read(reinterpret_cast<char*>(cached.bytes.data()),count)) {Refuse("executable section read");return;}
+                sections.push_back(std::move(cached));
+            }
+            if (CompareImage()) usable.store(true);
+        } catch (...) {Refuse("exception loading executable sections");}
+    }
 };
-const FileImage& file_image() { static const FileImage value; return value; }
+const FileImage& file_image() { static const FileImage value;return value; }
 
-// Whether the loaded bytes of the procedure at entry differ from the file's.
-bool differs_from_file(std::uintptr_t entry) {
-    const auto& im = image();
-    const auto& file = file_image();
-    if (file.bytes.empty() || entry < im.base || entry - im.base >= im.size) return false;
-    const auto offset = static_cast<std::uint32_t>(entry - im.base);
-    const auto differs = [&](std::uint32_t begin, std::uint32_t end) {
-        std::vector<std::uint8_t> live(end - begin);
-        return im.Read(begin, live.data(), live.size()) &&
-            std::memcmp(live.data(), file.bytes.data() + begin, live.size()) != 0;
-    };
-    const auto found = im.procedures.find(offset);
-    if (found == im.procedures.end()) return differs(offset, (std::min)(im.size, offset + 16));
-    for (const auto& range : found->second) if (differs(range.begin, range.end)) return true;
-    return false;
+// A refused file restores pre-PR live-only resolution. While usable, an unexplained
+// procedure mismatch refuses this read as well as disabling all future file reads.
+OriginalFile::Admission classify(std::uintptr_t entry,OriginalFile::Detour& record) {
+    const auto& im=image();const auto& file=file_image();
+    if (!file.usable.load()) return OriginalFile::Admission::live;
+    if (entry<im.base || entry-im.base>=im.size) return OriginalFile::Admission::refuse;
+    const auto rva=static_cast<std::uint32_t>(entry-im.base);
+    // A call-free leaf has no reliable unwind extent. Read it live first, then
+    // compare only its reached instructions, never a window over neighbouring functions.
+    if (!im.procedures.contains(rva)) return OriginalFile::Admission::live;
+    const auto result=file.Classify(rva,record);
+    if (result!=OriginalFile::Admission::refuse) return result;
+    char reason[160];std::snprintf(reason,sizeof(reason),"function RVA 0x%08x differs from the file other than by an entry detour (or exceeds bounds)",rva);
+    file.Refuse(reason);
+    return OriginalFile::Admission::refuse;
 }
 
 bool executable_span(std::uintptr_t at, std::size_t size) {
@@ -243,6 +348,7 @@ bool read_leaf(std::uintptr_t entry, const ZydisDecoder& decoder, Procedure& res
 }
 
 bool AppendEvidence(const Procedure& procedure, CodeEvidence& output) {
+    if (procedure.entry_detour) return false;
     constexpr std::size_t maximum_block = 4096;
     CodeEvidence prepared;
     const auto append = [&](std::uintptr_t address, const std::uint8_t* bytes, std::size_t size) {
@@ -490,11 +596,47 @@ bool read_procedure(std::uintptr_t entry, Procedure& output, const FileImage* fi
 }
 }
 
+bool DetoursUnchanged(const std::vector<OriginalFile::Detour>& evidence) {
+    try {
+        if (evidence.empty()) return true;
+        const auto& file=file_image();
+        if (!file.usable.load()) return false;
+        for (const auto& saved:evidence) {
+            OriginalFile::Detour current;
+            const auto admission=file.Classify(saved.rva,current);
+            if (admission==OriginalFile::Admission::refuse) {
+                char reason[160];std::snprintf(reason,sizeof(reason),"function RVA 0x%08x differs from the file other than by an entry detour during revalidation",saved.rva);
+                file.Refuse(reason);return false;
+            }
+            if (admission!=OriginalFile::Admission::detour || current!=saved) return false;
+        }
+        return file.usable.load();
+    } catch (...) { return false; }
+}
+
 bool ReadProcedure(std::uintptr_t entry, Procedure& output) { return read_procedure(entry, output, nullptr); }
 
 bool ReadOriginalProcedure(std::uintptr_t entry, Procedure& output, bool& foreign) {
-    foreign = differs_from_file(entry);
-    return read_procedure(entry, output, foreign ? &file_image() : nullptr);
+    try {
+        OriginalFile::Detour record;
+        const auto admission=classify(entry,record);
+        foreign=admission==OriginalFile::Admission::detour;
+        if (admission==OriginalFile::Admission::refuse || !read_procedure(entry,output,foreign?&file_image():nullptr)) return false;
+        if (!foreign && file_image().usable.load() && !image().procedures.contains(static_cast<std::uint32_t>(entry-image().base))) {
+            std::array<std::uint8_t,15> original{};
+            for (const auto& instruction:output.instructions) {
+                const auto size=instruction.decoded.length;
+                if (!size || size>original.size() ||
+                    !file_image().Read(static_cast<std::uint32_t>(instruction.address-image().base),original.data(),size) ||
+                    !std::equal(original.begin(),original.begin()+size,instruction.bytes.begin())) {
+                    char reason[160];std::snprintf(reason,sizeof(reason),"function RVA 0x%08x differs from the file other than by an entry detour (no unwind extent)",static_cast<unsigned>(entry-image().base));
+                    file_image().Refuse(reason);return false;
+                }
+            }
+        }
+        if (foreign) output.entry_detour=record;
+        return true;
+    } catch (...) { foreign=false;return false; }
 }
 
 bool ReadContainingProcedure(std::uintptr_t address, Procedure& output) {
@@ -540,9 +682,9 @@ bool ResolveNamedSystemCode(const char* exact_name, std::uintptr_t& output) {
 
 bool FindUniqueReachable(std::uintptr_t root, unsigned maximum_depth,
     const std::function<bool(const Procedure&)>& predicate, std::uintptr_t& output) {
-    if (!root || maximum_depth > 8 || !predicate) return false;
+    if (!root || maximum_depth > OriginalFile::depth_limit || !predicate) return false;
     try {
-        constexpr std::size_t maximum_functions = 4096;
+        constexpr std::size_t maximum_functions = OriginalFile::function_limit;
         std::deque<std::pair<std::uintptr_t, unsigned>> pending{{root, 0}};
         std::set<std::uintptr_t> visited;
         std::uintptr_t selected{};
@@ -554,9 +696,9 @@ bool FindUniqueReachable(std::uintptr_t root, unsigned maximum_depth,
             // A function another module detoured is read from the executable
             // file, so the walk still sees its real callees. It is a path
             // only and can never be the selected procedure.
-            const bool foreign = differs_from_file(entry);
-            if (!(foreign ? read_procedure(entry, code, &file_image()) : ReadProcedure(entry, code))) return false;
-            if (!foreign && predicate(code)) {
+            bool foreign{};
+            if (!ReadOriginalProcedure(entry,code,foreign)) return false;
+            if (OriginalFile::selectable(foreign?OriginalFile::Admission::detour:OriginalFile::Admission::live) && predicate(code)) {
                 if (selected && selected != entry) return false;
                 selected = entry;
             }
