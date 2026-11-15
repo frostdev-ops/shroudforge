@@ -34,10 +34,12 @@ struct Detour {
     bool operator==(const Detour&) const = default;
 };
 enum class Admission { live, detour, refuse };
+// `live.preferred` is the loaded header's ImageBase. A relocated (ASLR) image is this file's image when that names the
+// loaded base (Windows and Wine write it there) or still the file's; its code is compared after relocate() below.
 inline const char* identity(const Layout& live, const Layout& file) {
-    if (live.loaded != live.preferred) return "relocated image";
+    if (live.preferred != live.loaded && live.preferred != file.preferred) return "image base";
     if (!live.size || live.size > image_limit || file.size > image_limit) return "image size bound";
-    if (file.preferred != live.preferred || file.size != live.size) return "image base/size";
+    if (file.size != live.size) return "image size";
     if (file.machine != live.machine) return "machine";
     if (file.timestamp != live.timestamp) return "timestamp";
     if (file.checksum != live.checksum) return "checksum";
@@ -54,6 +56,54 @@ inline const char* identity(const Layout& live, const Layout& file) {
         }
     }
     return nullptr;
+}
+constexpr std::size_t relocation_limit = 16 * 1024 * 1024;
+struct CodeBytes { std::uint32_t rva{}; std::span<std::uint8_t> bytes; };
+// The file's base relocation table (IMAGE_DIRECTORY_ENTRY_BASERELOC) applied to the cached executable sections for
+// the load delta (loaded base minus the file's preferred base, modulo 2^64), as the loader applied it to the loaded
+// image. Every block is checked, also where it touches no cached section. Not relocated: nothing applied or read.
+inline const char* relocate(std::span<const std::uint8_t> table, std::uint32_t image_size, std::uint64_t delta,
+    std::span<const CodeBytes> sections) {
+    if (!delta) return nullptr;
+    if (table.empty()) return "relocated image without base relocations";
+    if (table.size()>relocation_limit) return "base relocation table bound";
+    for (std::size_t offset{};offset<table.size();) {
+        if (table.size()-offset<8) return "truncated base relocation table";
+        std::uint32_t page{}, size{};
+        std::memcpy(&page,table.data()+offset,4);std::memcpy(&size,table.data()+offset+4,4);
+        if (size<8 || size%2 || size>table.size()-offset) return "malformed base relocation block";
+        if (page>=image_size) return "base relocation block outside the image";
+        for (auto at=offset+8;at<offset+size;at+=2) {
+            std::uint16_t entry{};std::memcpy(&entry,table.data()+at,2);
+            const auto type=entry>>12;
+            if (!type) continue;  // IMAGE_REL_BASED_ABSOLUTE: padding
+            const std::size_t width=type==10?8:type==3?4:0;  // DIR64, HIGHLOW
+            if (!width) return "unsupported base relocation type";
+            const auto field=static_cast<std::uint64_t>(page)+(entry&0xfffu);
+            if (field+width>image_size) return "base relocation outside the image";
+            for (const auto& section:sections) {
+                const std::uint64_t begin=section.rva, end=begin+section.bytes.size();
+                if (field+width<=begin || field>=end) continue;
+                if (field<begin || field+width>end) return "base relocation across the end of a code section";
+                auto* bytes=section.bytes.data()+(field-begin);
+                if (width==8) {std::uint64_t value{};std::memcpy(&value,bytes,8);value+=delta;std::memcpy(bytes,&value,8);}
+                else {std::uint32_t value{};std::memcpy(&value,bytes,4);value+=static_cast<std::uint32_t>(delta);std::memcpy(bytes,&value,4);}
+            }
+        }
+        offset+=size;
+    }
+    return nullptr;
+}
+// Where `size` bytes at `rva` lie in the file: inside one section, within its raw data.
+inline bool file_offset(std::span<const Section> sections, std::uint32_t rva, std::uint32_t size, std::uint64_t& out) {
+    for (const auto& section:sections) {
+        if (rva<section.rva || rva-section.rva>=section.size) continue;
+        const auto at=rva-section.rva;
+        if (size>section.size-at || at>section.raw_size || size>section.raw_size-at) return false;
+        out=static_cast<std::uint64_t>(section.raw)+at;
+        return true;
+    }
+    return false;
 }
 inline bool bounded(std::span<const Range> ranges, std::uint32_t image_size) {
     std::size_t total{};

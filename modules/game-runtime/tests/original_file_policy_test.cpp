@@ -15,7 +15,12 @@ int main() {
     b=a; ++b.checksum; check(identity(a,b),"changed checksum");
     b=a; ++b.machine; check(identity(a,b),"changed machine");
     b=a; ++b.count; check(identity(a,b),"changed section count");
-    b=a; b.loaded+=4096; check(identity(b,a),"relocated base");
+    // A relocated (ASLR) image is this file's image when the loaded header names the loaded base (Windows and Wine
+    // write it there) or still the file's; its code is then compared after the file's relocations (below).
+    b=a; b.loaded+=0x10000; b.preferred=b.loaded; check(!identity(b,a),"relocated base, loaded header names the loaded base");
+    b=a; b.loaded+=0x10000; check(!identity(b,a),"relocated base, loaded header still names the file's base");
+    b=a; b.loaded+=0x10000; b.preferred+=0x20000; check(identity(b,a),"loaded header base neither the loaded nor the file's refused");
+    b=a; b.size+=4096; check(identity(b,a),"image size differs");
     std::array<std::uint8_t,256> disk{}, memory{}; disk.fill(0x90); memory=disk;
     // Original prologue consists of 3-byte instructions, then single-byte NOPs.
     auto decode=[](const std::uint8_t* p,std::size_t n) -> std::size_t { return n && *p==0x55 ? (n>=3?3:0) : n>=4 && p[0]==0x0f && p[1]==0x1f ? 4 : n?1:0; };
@@ -200,6 +205,78 @@ int main() {
         check(accepted(0,interior_image_limit),"image: interior jumps up to the image bound");
         e9(0x3003+0x20*interior_image_limit,6); check(refused(),"image: one interior jump over the image bound refused");
         memory=disk;
+    }
+    // Base relocations: the file's table applied to the cached code for the load delta, as the loader applied it.
+    {
+        constexpr std::uint64_t preferred=0x140000000, loaded=0x6ffffc670000, delta=loaded-preferred;
+        constexpr std::uint32_t size=0x4000, text=0x1000, text_size=0x200;
+        auto block=[](std::vector<std::uint8_t>& table,std::uint32_t page,std::vector<std::uint16_t> entries) {
+            const auto size=static_cast<std::uint32_t>(8+2*entries.size());
+            const auto at=table.size(); table.resize(at+size);
+            std::memcpy(table.data()+at,&page,4); std::memcpy(table.data()+at+4,&size,4);
+            std::memcpy(table.data()+at+8,entries.data(),2*entries.size());
+        };
+        // One function at 0x1000..0x1200 holding a 64-bit and a 32-bit absolute field; one more field in data.
+        std::vector<std::uint8_t> disk(size,0xcc);
+        for (std::uint32_t at=text;at+3<=text+text_size;at+=3) { disk[at]=0x55; disk[at+1]=0x01; disk[at+2]=0x02; }
+        const std::uint64_t pointer=preferred+0x1234; const std::uint32_t low=0x40001000;
+        std::memcpy(disk.data()+0x1010,&pointer,8); std::memcpy(disk.data()+0x1040,&low,4);
+        std::vector<std::uint8_t> table;
+        block(table,0x1000,{0xa010,0x3040,0x0000}); block(table,0x3000,{0xa008});
+        auto relocated=[&](std::vector<std::uint8_t>& image,const std::vector<std::uint8_t>& relocations,std::uint64_t by) {
+            const std::array<CodeBytes,1> code{{{text,std::span<std::uint8_t>(image.data()+text,text_size)}}};
+            return relocate(relocations,size,by,code);
+        };
+        auto copy=disk;
+        check(!relocated(copy,table,delta),"relocation table applied");
+        std::uint64_t moved{}; std::uint32_t moved_low{};
+        std::memcpy(&moved,copy.data()+0x1010,8); std::memcpy(&moved_low,copy.data()+0x1040,4);
+        check(moved==pointer+delta && moved_low==low+static_cast<std::uint32_t>(delta),"DIR64 and HIGHLOW fields moved by the delta");
+        copy[0x1010]=disk[0x1010]; copy[0x1011]=disk[0x1011]; copy[0x1012]=disk[0x1012]; copy[0x1013]=disk[0x1013];
+        copy[0x1014]=disk[0x1014]; copy[0x1015]=disk[0x1015]; copy[0x1016]=disk[0x1016]; copy[0x1017]=disk[0x1017];
+        copy[0x1040]=disk[0x1040]; copy[0x1041]=disk[0x1041]; copy[0x1042]=disk[0x1042]; copy[0x1043]=disk[0x1043];
+        check(copy==disk,"no other byte touched (the data field lies outside the cached code)");
+        copy=disk; check(!relocated(copy,{},0) && copy==disk,"not relocated: nothing applied, nothing read");
+        copy=disk; check(relocated(copy,{},delta)!=nullptr,"relocated image without base relocations refused");
+        auto corrupt=[&](std::vector<std::uint8_t> bad) { auto image=disk; return relocated(image,bad,delta)!=nullptr; };
+        auto bad=table; bad.resize(bad.size()+4); check(corrupt(bad),"truncated block header refused");
+        bad=table; bad.pop_back(); bad.pop_back(); check(corrupt(bad),"truncated block refused");
+        bad=table; bad[4]=6; check(corrupt(bad),"block shorter than its header refused");
+        bad.clear(); block(bad,0x1000,{0xa010,0xa018}); bad[4]=11; bad.resize(11);
+        check(corrupt(bad),"block of odd size ending the table refused, nothing read past it");
+        bad.clear(); block(bad,0x1000,{0x4010}); check(corrupt(bad),"unsupported relocation type refused");
+        bad.clear(); block(bad,size,{0xa000}); check(corrupt(bad),"block page outside the image refused");
+        bad.clear(); block(bad,0x3000,{0xaffc}); check(corrupt(bad),"field past the end of the image refused");
+        bad.clear(); block(bad,0x1000,{0xa1fc}); check(corrupt(bad),"field across the end of a code section refused");
+        bad.assign(relocation_limit+8,0); check(corrupt(bad),"table over the bound refused before it is read");
+        std::vector<Section> file_sections{{{},0x1000,0x800,0x400,0x600,0x60000020},{{},0x2000,0x100,0xa00,0x200,0x42000040}};
+        std::uint64_t at{};
+        check(file_offset(file_sections,0x2010,0x40,at) && at==0xa10,"relocation table found in its section's raw data");
+        check(!file_offset(file_sections,0x1500,0x200,at),"table beyond its section's raw data refused");
+        check(!file_offset(file_sections,0x20f0,0x20,at) && !file_offset(file_sections,0x3000,8,at),"table outside a section refused");
+        // End to end: the relocated loaded code is accepted, any other change is still refused.
+        std::map<std::uint32_t,std::uint32_t> owners{{text,text}};
+        std::map<std::uint32_t,std::vector<Range>> procedures{{text,{{text,text+text_size}}}};
+        auto decode3=[](const std::uint8_t* p,std::size_t n) -> std::size_t { return n>=3 && *p==0x55 ? 3 : n ? 1 : 0; };
+        auto compare=[&](const std::vector<std::uint8_t>& memory) {
+            auto cached=disk;
+            if (relocated(cached,table,delta)) return false;
+            using Reader=std::function<bool(std::uint64_t,void*,std::size_t)>;
+            Reader file=[&](std::uint64_t p,void* out,std::size_t n) { if (p<loaded||p-loaded>size||n>size-(p-loaded)) return false; std::memcpy(out,cached.data()+(p-loaded),n); return true; };
+            Reader live=[&](std::uint64_t p,void* out,std::size_t n) { if (p<loaded||p-loaded>size||n>size-(p-loaded)) return false; std::memcpy(out,memory.data()+(p-loaded),n); return true; };
+            auto executable=[](std::uint64_t){ return true; };
+            const std::array<CodeSection,1> code{{{text,std::span<const std::uint8_t>(cached.data()+text,text_size)}}};
+            return !compare_image(loaded,size,code,owners,procedures,[&](std::uint32_t rva,void* out,std::size_t n){return live(loaded+rva,out,n);},
+                [&](std::uint32_t root,Detour& d){return admit(loaded,root,procedures.at(root),file,live,decode3,executable,d);},
+                file,live,decode3,executable).reason;
+        };
+        auto memory=disk;
+        const std::uint64_t moved_pointer=pointer+delta; const std::uint32_t moved_field=low+static_cast<std::uint32_t>(delta);
+        std::memcpy(memory.data()+0x1010,&moved_pointer,8); std::memcpy(memory.data()+0x1040,&moved_field,4);
+        check(compare(memory),"relocated image: loaded code equals the file after its relocations");
+        auto changed=memory; changed[0x1100]^=1; check(!compare(changed),"relocated image: a byte no relocation explains refused");
+        changed=memory; ++changed[0x1010]; check(!compare(changed),"relocated image: a relocated field holding another value refused");
+        check(!compare(disk),"relocated image: relocations the loader did not apply refused");
     }
     std::printf("%d checks, %d failures\n",checks,failures);return failures?1:0;
 }

@@ -141,6 +141,7 @@ std::size_t instruction_length(const std::uint8_t* bytes,std::size_t size) {
 struct FileImage {
     struct Section { std::uint32_t rva; std::vector<std::uint8_t> bytes; };
     std::vector<Section> sections;
+    std::uint64_t delta{};  // loaded base minus the file's preferred base (ASLR)
     mutable std::atomic<bool> usable{false};
     mutable std::atomic<bool> diagnosed{false};
     void Refuse(const char* reason) const {
@@ -192,9 +193,9 @@ struct FileImage {
             std::snprintf(message,sizeof(message),"%s (RVA 0x%08x)",result.reason,result.rva);
             Refuse(message);return false;
         }
-        std::snprintf(message,sizeof(message),"ShroudForge original call graph: executable file accepted beside %zu entry "
-            "detour(s) and %zu interior jump(s); a function holding an interior jump is never read through it\n",
-            result.entries,result.interiors);
+        std::snprintf(message,sizeof(message),"ShroudForge original call graph: executable file accepted (load delta 0x%llx) "
+            "beside %zu entry detour(s) and %zu interior jump(s); a function holding an interior jump is never read "
+            "through it\n",static_cast<unsigned long long>(delta),result.entries,result.interiors);
         file_log('I',message);
         return true;
     }
@@ -237,6 +238,27 @@ struct FileImage {
                 file.seekg(section.raw);
                 if (!file.read(reinterpret_cast<char*>(cached.bytes.data()),count)) {Refuse("executable section read");return;}
                 sections.push_back(std::move(cached));
+            }
+            // A relocated (ASLR) image: the loader applied the file's base relocations, so apply them to the cached
+            // code as well. The table is read from the file, located through the file's own section table.
+            delta=static_cast<std::uint64_t>(im.base)-layout.preferred;
+            if (delta) {
+                std::vector<std::uint8_t> table;
+                const auto& directory=nt.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC];
+                if (nt.OptionalHeader.NumberOfRvaAndSizes>IMAGE_DIRECTORY_ENTRY_BASERELOC &&
+                    !(nt.FileHeader.Characteristics & IMAGE_FILE_RELOCS_STRIPPED) && directory.Size) {
+                    if (directory.Size>OriginalFile::relocation_limit) {Refuse("base relocation table bound");return;}
+                    std::uint64_t at{};
+                    if (!OriginalFile::file_offset(layout.sections,directory.VirtualAddress,directory.Size,at)) {
+                        Refuse("base relocation table location");return;
+                    }
+                    table.resize(directory.Size);
+                    file.seekg(static_cast<std::streamoff>(at));
+                    if (!file.read(reinterpret_cast<char*>(table.data()),directory.Size)) {Refuse("base relocation table read");return;}
+                }
+                std::vector<OriginalFile::CodeBytes> code;
+                for (auto& section:sections) code.push_back({section.rva,section.bytes});
+                if (const auto reason=OriginalFile::relocate(table,layout.size,delta,code)) {Refuse(reason);return;}
             }
             if (CompareImage()) usable.store(true);
         } catch (...) {Refuse("exception loading executable sections");}

@@ -231,13 +231,18 @@ void check_bounded_code_evidence() {
 }
 
 // A hook library's trampolines and stubs: private executable memory within rel32 reach of the image.
-std::uint8_t* allocate_near(std::uintptr_t image) {
+std::uint8_t* allocate_near(std::uintptr_t image, std::size_t image_size) {
     SYSTEM_INFO info{};
     GetSystemInfo(&info);
     const std::uintptr_t step = info.dwAllocationGranularity;
+    const auto attempt = [](std::uintptr_t at) {
+        return static_cast<std::uint8_t*>(VirtualAlloc(reinterpret_cast<void*>(at), 4096, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE));
+    };
     for (auto at = (image & ~(step - 1)) - step; at > step && image - at < 0x70000000; at -= step)
-        if (auto* page = VirtualAlloc(reinterpret_cast<void*>(at), 4096, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE))
-            return static_cast<std::uint8_t*>(page);
+        if (auto* page = attempt(at)) return page;
+    const auto end = (image + image_size + step - 1) & ~(step - 1);
+    for (auto at = end; at - image < 0x70000000; at += step)
+        if (auto* page = attempt(at)) return page;
     return nullptr;
 }
 void write_code(std::uintptr_t at, const std::uint8_t* bytes, std::size_t size) {
@@ -281,7 +286,7 @@ Patch mid_hook;
 // the detoured function through the file. Restored afterwards, so the later checks see unchanged code.
 void check_patched_image() {
     const auto& im = OriginalCode::image();
-    auto* stub = allocate_near(im.base);
+    auto* stub = allocate_near(im.base, im.size);
     check(stub != nullptr);
     std::memset(stub, 0xc3, 64);
     const auto entry = code_address(detour_fixture), body = code_address(mid_hook_fixture);
