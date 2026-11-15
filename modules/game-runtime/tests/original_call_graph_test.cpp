@@ -51,7 +51,13 @@ __declspec(noinline) unsigned detour_fixture(unsigned value) {
     volatile auto second = leaf_b(first);
     return first * 3u + second;
 }
-unsigned (*volatile const patch_fixtures[])(unsigned) = {detour_fixture};
+__declspec(noinline) unsigned mid_hook_fixture(unsigned value) {
+    volatile auto first = leaf_b(value);
+    volatile auto second = leaf_a(first ^ 0x5au);
+    volatile auto third = leaf_b(second + 7u);
+    return first + second * 5u + third;
+}
+unsigned (*volatile const patch_fixtures[])(unsigned) = {detour_fixture, mid_hook_fixture};
 
 struct NativeDependency { const char* name; std::uint64_t size; };
 struct NativeDescriptor {
@@ -268,19 +274,29 @@ Patch prepare_patch(std::uintptr_t at, std::vector<std::uint8_t> bytes) {
 bool calls(const OriginalCode::Procedure& code, std::uintptr_t callee) {
     return std::find(code.calls.begin(), code.calls.end(), callee) != code.calls.end();
 }
+Patch mid_hook;
 // Before the executable file is first read (it is cached once per process): an entry detour into a private
-// executable page, as Kiln's hook registry writes it over PlaceProp. Then the walk reads that function through
-// the file. Restored afterwards, so the later checks see unchanged code.
+// executable page, as Kiln's hook registry writes it over PlaceProp, and a mid hook in another function, as
+// Kiln's Rules service writes them at every start. The image is still this file's image and the walk reads
+// the detoured function through the file. Restored afterwards, so the later checks see unchanged code.
 void check_patched_image() {
     const auto& im = OriginalCode::image();
     auto* stub = allocate_near(im.base);
     check(stub != nullptr);
     std::memset(stub, 0xc3, 64);
-    const auto entry = code_address(detour_fixture);
+    const auto entry = code_address(detour_fixture), body = code_address(mid_hook_fixture);
     check(im.procedures.contains(static_cast<std::uint32_t>(entry - im.base)));
     const auto entry_span = whole_instructions(entry, 5);
     check(entry_span >= 5 && entry_span < 64);
-    std::vector<Patch> patches{prepare_patch(entry, kiln_jump(entry, entry_span, address(stub)))};
+    // The mid hook: the first original instruction boundary at least 16 bytes in, as the production decoder walks it.
+    const auto found = im.procedures.find(static_cast<std::uint32_t>(body - im.base));
+    check(found != im.procedures.end());
+    auto site = body;
+    while (site < body + 16) { const auto step = whole_instructions(site, 1); check(step != 0); site += step; }
+    const auto site_span = whole_instructions(site, 5);
+    check(site_span >= 5 && site + site_span <= im.base + found->second.front().end);
+    mid_hook = prepare_patch(site, kiln_jump(site, site_span, address(stub) + 16));
+    std::vector<Patch> patches{prepare_patch(entry, kiln_jump(entry, entry_span, address(stub))), mid_hook};
     for (const auto& patch : patches) write_code(patch.at, patch.bytes.data(), patch.bytes.size());
     OriginalCode::Procedure code;
     bool foreign{};
@@ -474,5 +490,14 @@ int wmain(int argc,wchar_t** argv) {
     check(!OriginalCode::FindUniqueReachable(code_address(directed_root),9,leaf_match,selected));
     check(!OriginalCode::FindUniqueReachable(0,2,leaf_match,selected));
     check(!OriginalCode::FindUniqueReachable(code_address(directed_root),2,{},selected));
+    // Last, as it refuses the file for the rest of the process: a function holding a mid hook is never read
+    // through the file, even though the image check admitted the hook.
+    write_code(mid_hook.at, mid_hook.bytes.data(), mid_hook.bytes.size());
+    {
+        OriginalCode::Procedure code;
+        bool foreign{true};
+        check(!OriginalCode::ReadOriginalProcedure(code_address(mid_hook_fixture), code, foreign) && !foreign);
+    }
+    write_code(mid_hook.at, mid_hook.original.data(), mid_hook.original.size());
     std::printf("original call graph checks passed: %u\n",checks);
 }

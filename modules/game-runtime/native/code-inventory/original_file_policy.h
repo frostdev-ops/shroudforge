@@ -4,6 +4,9 @@
 #include <array>
 #include <cstdint>
 #include <cstring>
+#include <iterator>
+#include <map>
+#include <set>
 #include <span>
 #include <vector>
 namespace OriginalFile {
@@ -155,6 +158,128 @@ Admission admit(std::uint64_t base, std::uint32_t entry, std::span<const Range> 
     out.rva=entry;out.span=static_cast<std::uint32_t>(span);out.target=destination;out.cell=cell;out.cell_value=cell_value;
     std::copy_n(patched.begin(),span,out.bytes.begin());
     return Admission::detour;
+}
+// Whole-image identity only. A procedure containing an interior jump is never read through the file: admit() above
+// still refuses it, so it is never a traversal link and never selected.
+// The jump is one transfer written over whole ORIGINAL instructions, as a detour library's mid hook writes it
+// (safetyhook, Kiln's hook registry): `E9 rel32`, `FF 25 00000000` with the 8-byte absolute target inline, or
+// `FF 25 disp32` through an 8-byte cell outside the span; then 0x90 up to the end of the fewest whole original
+// instructions that hold the transfer, and no further. Its target lies outside this image and is executable.
+constexpr std::size_t interior_span_limit = 32;
+constexpr std::size_t interior_function_limit = 8;
+constexpr std::size_t interior_image_limit = 256;
+struct Interior { std::uint32_t rva{}, span{}; std::uint64_t target{}, cell{}; };
+// `original` (file) and `patched` (loaded) hold `window` bytes at `site`, an original instruction boundary.
+template<class Read, class Decode, class Executable>
+bool transfer_at(std::uint64_t base, std::uint32_t image_size, std::uint32_t site, std::uint32_t changed,
+    const std::uint8_t* original, const std::uint8_t* patched, std::size_t window,
+    Read live, Decode decode, Executable executable, Interior& out) {
+    const auto address=base+site;
+    std::size_t encoding{};
+    std::uint64_t destination{}, cell{};
+    std::int32_t disp{};
+    if (window>=5 && patched[0]==0xe9) {
+        encoding=5;std::memcpy(&disp,patched+1,4);
+        if (!add(address+5,disp,destination)) return false;
+    } else if (window>=6 && patched[0]==0xff && patched[1]==0x25) {
+        std::memcpy(&disp,patched+2,4);
+        if (!disp) {
+            if (window<14) return false;
+            encoding=14;std::memcpy(&destination,patched+6,8);
+        } else {
+            encoding=6;
+            if (!add(address+6,disp,cell)) return false;
+        }
+    } else return false;
+    std::size_t span{};
+    while (span<encoding) {
+        const auto length=decode(original+span,window-span);
+        if (!length || length>window-span) return false;
+        span+=length;
+    }
+    if (span>interior_span_limit || changed<site || changed-site>=span) return false;
+    for (auto i=encoding;i<span;++i) if (patched[i]!=0x90) return false;
+    if (cell && ((cell>=address && cell-address<span) || (cell<address && address-cell<8))) return false;
+    if (cell && !live(cell,&destination,8)) return false;
+    if (!destination || (destination>=base && destination-base<image_size) || !executable(destination)) return false;
+    out={site,static_cast<std::uint32_t>(span),destination,cell};
+    return true;
+}
+// `changed` is the first differing RVA in the unwind range `part`; every byte from `floor` to it equals the file.
+// Walks the range's original instructions from its start (an unwind range begins at an instruction) and tries each
+// boundary in [floor, changed] less than interior_span_limit bytes before the change.
+template<class Read, class Decode, class Executable>
+bool interior(std::uint64_t base, std::uint32_t image_size, Range part, std::uint32_t floor, std::uint32_t changed,
+    Read file, Read live, Decode decode, Executable executable, Interior& out) {
+    out={};
+    if (part.begin>=part.end || part.end>image_size || changed<part.begin || changed>=part.end || floor>changed ||
+        part.end-part.begin>procedure_limit || base>UINT64_MAX-image_size) return false;
+    std::array<std::uint8_t,64> original{}, patched{};
+    for (auto site=part.begin;site<=changed;) {
+        const auto window=(std::min)(original.size(),static_cast<std::size_t>(part.end-site));
+        if (!file(base+site,original.data(),window)) return false;
+        const auto step=decode(original.data(),window);
+        if (!step || step>window) return false;
+        if (site>=floor && changed-site<interior_span_limit) {
+            if (!live(base+site,patched.data(),window)) return false;
+            if (transfer_at(base,image_size,site,changed,original.data(),patched.data(),window,live,decode,executable,out))
+                return true;
+        }
+        site+=static_cast<std::uint32_t>(step);
+    }
+    out={};
+    return false;
+}
+struct CodeSection { std::uint32_t rva{}; std::span<const std::uint8_t> bytes; };
+struct ImageCheck { const char* reason{}; std::uint32_t rva{}; std::size_t entries{}, interiors{}; };
+// The loaded executable sections against the file's, once at first use: every byte equal, or inside an entry detour
+// admitted by `classify` (admit() of the owning procedure), or inside an interior jump (above).
+// `loaded` reads the loaded image by RVA; `file` and `live` read by address, as for admit().
+template<class Loaded, class Classify, class Read, class Decode, class Executable>
+ImageCheck compare_image(std::uint64_t base, std::uint32_t image_size, std::span<const CodeSection> sections,
+    const std::map<std::uint32_t,std::uint32_t>& owners, const std::map<std::uint32_t,std::vector<Range>>& procedures,
+    Loaded loaded, Classify classify, Read file, Read live, Decode decode, Executable executable) {
+    std::array<std::uint8_t,4096> current{};
+    std::set<std::uint32_t> entries;
+    std::map<std::uint32_t,std::size_t> per_function;
+    std::size_t interiors{};
+    for (const auto& section:sections) {
+        std::size_t offset{};
+        auto floor=section.rva;
+        while (offset<section.bytes.size()) {
+            const auto n=(std::min)(current.size(),section.bytes.size()-offset);
+            const auto rva=section.rva+static_cast<std::uint32_t>(offset);
+            if (!loaded(rva,current.data(),n)) return {"unreadable loaded code",rva};
+            const auto* original=section.bytes.data()+offset;
+            if (!std::memcmp(original,current.data(),n)) {offset+=n;continue;}
+            std::size_t changed{};
+            while (changed<n && original[changed]==current[changed]) ++changed;
+            const auto at=rva+static_cast<std::uint32_t>(changed);
+            const auto owner=owners.upper_bound(at);
+            if (owner==owners.begin()) return {"code outside every function differs from the file",at};
+            const auto root=std::prev(owner)->second;
+            Detour detour;
+            if (classify(root,detour)==Admission::detour && at>=detour.rva && at-detour.rva<detour.span) {
+                entries.insert(detour.rva);
+                if (entries.size()>function_limit) return {"entry detour count bound",root};
+                offset=detour.rva+detour.span-section.rva;
+                floor=detour.rva+detour.span;
+                continue;
+            }
+            const auto found=procedures.find(root);
+            const Range* part{};
+            if (found!=procedures.end() && bounded(found->second,image_size))
+                for (const auto& r:found->second) if (r.begin<=at && at<r.end) part=&r;
+            Interior jump;
+            if (!part || !interior(base,image_size,*part,floor,at,file,live,decode,executable,jump))
+                return {"function differs from the file other than by an entry detour or an interior jump",root};
+            if (++per_function[root]>interior_function_limit) return {"interior jump count bound in one function",root};
+            if (++interiors>interior_image_limit) return {"interior jump count bound",root};
+            offset=jump.rva+jump.span-section.rva;
+            floor=jump.rva+jump.span;
+        }
+    }
+    return {nullptr,0,entries.size(),interiors};
 }
 inline bool selectable(Admission a) { return a == Admission::live; }
 }

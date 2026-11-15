@@ -105,9 +105,7 @@ struct Image {
 const Image& image() { static const Image value; return value; }
 
 using Reader = std::function<bool(std::uint64_t,void*,std::size_t)>;
-void file_diagnostic(const char* reason) {
-    char message[512];
-    std::snprintf(message,sizeof(message),"ShroudForge original call graph: executable file refused: %s; live-only resolution\n",reason);
+void file_log(std::uint8_t level,const char* message) {
     using Log = void(__cdecl*)(std::uint8_t,const wchar_t*,const char*);
     const auto runtime=GetModuleHandleW(L"shroudforge-runtime.dll");
     const auto sink=runtime?reinterpret_cast<Log>(GetProcAddress(runtime,"shroudforge_game_profile_discovery_log")):nullptr;
@@ -116,10 +114,15 @@ void file_diagnostic(const char* reason) {
         const auto length=GetModuleFileNameW(nullptr,path,32768);
         if (length && length<32768) {
             const auto root=std::filesystem::path(path).parent_path();
-            sink('W',root.c_str(),message);return;
+            sink(level,root.c_str(),message);return;
         }
     }
     OutputDebugStringA(message);
+}
+void file_diagnostic(const char* reason) {
+    char message[512];
+    std::snprintf(message,sizeof(message),"ShroudForge original call graph: executable file refused: %s; live-only resolution\n",reason);
+    file_log('W',message);
 }
 // A detour's target (a trampoline, a hook stub, another module's code), not the game image's own code.
 bool detour_target(std::uint64_t at) {
@@ -168,35 +171,31 @@ struct FileImage {
     }
     // First-use resolution before the caller acquires a Scene gate; never repeated by cached validation.
     // No sparse SizeOfImage allocation.
+    // Identity only (original_file_policy.h compare_image): entry detours and interior jumps are admitted here,
+    // but Classify still refuses to read any function holding an interior jump through the file.
     bool CompareImage() const {
         const auto& im=image();
-        std::array<std::uint8_t,4096> live{};
-        std::set<std::uint32_t> admitted;
-        for (const auto& section:sections) {
-            std::size_t offset{};
-            while (offset<section.bytes.size()) {
-                const auto n=(std::min)(live.size(),section.bytes.size()-offset);
-                const auto rva=section.rva+static_cast<std::uint32_t>(offset);
-                if (!im.Read(rva,live.data(),n)) {Refuse("unreadable loaded code");return false;}
-                const auto* original=section.bytes.data()+offset;
-                if (!std::memcmp(original,live.data(),n)) {offset+=n;continue;}
-                std::size_t changed{};
-                while (changed<n && original[changed]==live[changed]) ++changed;
-                const auto at=rva+static_cast<std::uint32_t>(changed);
-                auto owner=im.range_owners.upper_bound(at);
-                OriginalFile::Detour detour;
-                if (owner==im.range_owners.begin() ||
-                    Classify(std::prev(owner)->second,detour)!=OriginalFile::Admission::detour ||
-                    at<detour.rva || at-detour.rva>=detour.span) {
-                    char reason[160];std::snprintf(reason,sizeof(reason),"function RVA 0x%08x differs from the file other than by an entry detour",
-                        owner==im.range_owners.begin()?at:std::prev(owner)->second);
-                    Refuse(reason);return false;
-                }
-                admitted.insert(detour.rva);
-                if (admitted.size()>OriginalFile::function_limit) {Refuse("entry detour count bound");return false;}
-                offset=detour.rva+detour.span-section.rva;
-            }
+        std::vector<OriginalFile::CodeSection> code;
+        for (const auto& section:sections) code.push_back({section.rva,section.bytes});
+        Reader file=[&](std::uint64_t at,void* out,std::size_t size) {
+            return at>=im.base && at-im.base<=UINT32_MAX && Read(static_cast<std::uint32_t>(at-im.base),out,size);
+        };
+        Reader live=[](std::uint64_t at,void* out,std::size_t size) {
+            return copy(out,reinterpret_cast<const void*>(static_cast<std::uintptr_t>(at)),size);
+        };
+        const auto result=OriginalFile::compare_image(im.base,im.size,code,im.range_owners,im.procedures,
+            [&](std::uint32_t rva,void* out,std::size_t size){return im.Read(rva,out,size);},
+            [&](std::uint32_t entry,OriginalFile::Detour& record){return Classify(entry,record);},
+            file,live,instruction_length,detour_target);
+        char message[256];
+        if (result.reason) {
+            std::snprintf(message,sizeof(message),"%s (RVA 0x%08x)",result.reason,result.rva);
+            Refuse(message);return false;
         }
+        std::snprintf(message,sizeof(message),"ShroudForge original call graph: executable file accepted beside %zu entry "
+            "detour(s) and %zu interior jump(s); a function holding an interior jump is never read through it\n",
+            result.entries,result.interiors);
+        file_log('I',message);
         return true;
     }
     FileImage() {
