@@ -82,5 +82,13 @@ int main() {
     b=a;b.sections[0].flags|=0x80000000;check(identity(b,b),"writable executable section");
     b=a;b.size=image_limit+1;check(identity(b,b),"oversized image");
     b=a;b.sections[0].size=executable_limit+1;check(identity(b,b),"oversized executable section");
+    // Detour targets: committed executable memory of any kind (VirtualQuery State and Protect values).
+    check(executable_page(0x1000,0x20) && executable_page(0x1000,0x40) && executable_page(0x1000,0x10) &&
+        executable_page(0x1000,0x80),"detour target: RX, RWX, X and WCX pages (trampolines are private RWX)");
+    check(executable_page(0x1000,0x220),"detour target: executable page with a cache modifier");
+    check(!executable_page(0x1000,0x04) && !executable_page(0x1000,0x02) && !executable_page(0x1000,0x01) &&
+        !executable_page(0x1000,0x08),"detour target: data and no-access pages refused");
+    check(!executable_page(0x1000,0x120),"detour target: guard page refused");
+    check(!executable_page(0x2000,0x20) && !executable_page(0x10000,0x01) && !executable_page(0,0x20),"detour target: reserved or free memory refused");
     std::printf("%d checks, %d failures\n",checks,failures);return failures?1:0;
 }

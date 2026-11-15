@@ -121,6 +121,13 @@ void file_diagnostic(const char* reason) {
     }
     OutputDebugStringA(message);
 }
+// A detour's target (a trampoline, a hook stub, another module's code), not the game image's own code.
+bool detour_target(std::uint64_t at) {
+    MEMORY_BASIC_INFORMATION page{};
+    return at && at<=UINTPTR_MAX &&
+        VirtualQuery(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(at)),&page,sizeof(page))==sizeof(page) &&
+        OriginalFile::executable_page(page.State,page.Protect);
+}
 std::size_t instruction_length(const std::uint8_t* bytes,std::size_t size) {
     ZydisDecoder decoder;
     ZydisDecodedInstruction instruction{};
@@ -157,8 +164,7 @@ struct FileImage {
         Reader live=[](std::uint64_t at,void* out,std::size_t size) {
             return copy(out,reinterpret_cast<const void*>(static_cast<std::uintptr_t>(at)),size);
         };
-        return OriginalFile::admit(im.base,entry,found->second,file,live,instruction_length,
-            [](std::uint64_t at){return NamedServiceImplementation::executable_callback(static_cast<std::uintptr_t>(at));},record);
+        return OriginalFile::admit(im.base,entry,found->second,file,live,instruction_length,detour_target,record);
     }
     // First-use resolution before the caller acquires a Scene gate; never repeated by cached validation.
     // No sparse SizeOfImage allocation.

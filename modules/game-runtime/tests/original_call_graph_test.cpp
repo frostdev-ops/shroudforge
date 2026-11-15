@@ -45,6 +45,13 @@ __declspec(noinline) unsigned directed_root(unsigned value) {
     volatile auto second = branch_b(value);
     return first + second;
 }
+// Patched in place before the executable file is first read; never called.
+__declspec(noinline) unsigned detour_fixture(unsigned value) {
+    volatile auto first = leaf_a(value);
+    volatile auto second = leaf_b(first);
+    return first * 3u + second;
+}
+unsigned (*volatile const patch_fixtures[])(unsigned) = {detour_fixture};
 
 struct NativeDependency { const char* name; std::uint64_t size; };
 struct NativeDescriptor {
@@ -217,6 +224,73 @@ void check_bounded_code_evidence() {
     check(!OriginalCode::EvidenceUnchanged(evidence));
 }
 
+// A hook library's trampolines and stubs: private executable memory within rel32 reach of the image.
+std::uint8_t* allocate_near(std::uintptr_t image) {
+    SYSTEM_INFO info{};
+    GetSystemInfo(&info);
+    const std::uintptr_t step = info.dwAllocationGranularity;
+    for (auto at = (image & ~(step - 1)) - step; at > step && image - at < 0x70000000; at -= step)
+        if (auto* page = VirtualAlloc(reinterpret_cast<void*>(at), 4096, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE))
+            return static_cast<std::uint8_t*>(page);
+    return nullptr;
+}
+void write_code(std::uintptr_t at, const std::uint8_t* bytes, std::size_t size) {
+    DWORD previous{}, ignored{};
+    check(VirtualProtect(reinterpret_cast<void*>(at), size, PAGE_EXECUTE_READWRITE, &previous) != FALSE);
+    std::memcpy(reinterpret_cast<void*>(at), bytes, size);
+    check(VirtualProtect(reinterpret_cast<void*>(at), size, previous, &ignored) != FALSE);
+    FlushInstructionCache(GetCurrentProcess(), reinterpret_cast<void*>(at), size);
+}
+// The whole original instructions at `at` that hold `need` bytes, by the production decoder.
+std::size_t whole_instructions(std::uintptr_t at, std::size_t need) {
+    std::size_t span{};
+    while (span < need) {
+        const auto length = OriginalCode::instruction_length(reinterpret_cast<const std::uint8_t*>(at + span), 15);
+        if (!length) return 0;
+        span += length;
+    }
+    return span;
+}
+// Kiln's registry form: E9 rel32, then 0x90 over the rest of the overwritten instructions.
+std::vector<std::uint8_t> kiln_jump(std::uintptr_t at, std::size_t span, std::uintptr_t target) {
+    std::vector<std::uint8_t> bytes(span, 0x90);
+    bytes[0] = 0xe9;
+    const auto relative = static_cast<std::int32_t>(static_cast<std::intptr_t>(target) - static_cast<std::intptr_t>(at + 5));
+    std::memcpy(bytes.data() + 1, &relative, 4);
+    return bytes;
+}
+struct Patch { std::uintptr_t at{}; std::vector<std::uint8_t> bytes, original; };
+Patch prepare_patch(std::uintptr_t at, std::vector<std::uint8_t> bytes) {
+    Patch patch{at, std::move(bytes), {}};
+    patch.original.assign(reinterpret_cast<const std::uint8_t*>(at), reinterpret_cast<const std::uint8_t*>(at) + patch.bytes.size());
+    return patch;
+}
+bool calls(const OriginalCode::Procedure& code, std::uintptr_t callee) {
+    return std::find(code.calls.begin(), code.calls.end(), callee) != code.calls.end();
+}
+// Before the executable file is first read (it is cached once per process): an entry detour into a private
+// executable page, as Kiln's hook registry writes it over PlaceProp. Then the walk reads that function through
+// the file. Restored afterwards, so the later checks see unchanged code.
+void check_patched_image() {
+    const auto& im = OriginalCode::image();
+    auto* stub = allocate_near(im.base);
+    check(stub != nullptr);
+    std::memset(stub, 0xc3, 64);
+    const auto entry = code_address(detour_fixture);
+    check(im.procedures.contains(static_cast<std::uint32_t>(entry - im.base)));
+    const auto entry_span = whole_instructions(entry, 5);
+    check(entry_span >= 5 && entry_span < 64);
+    std::vector<Patch> patches{prepare_patch(entry, kiln_jump(entry, entry_span, address(stub)))};
+    for (const auto& patch : patches) write_code(patch.at, patch.bytes.data(), patch.bytes.size());
+    OriginalCode::Procedure code;
+    bool foreign{};
+    check(OriginalCode::ReadOriginalProcedure(entry, code, foreign));
+    check(foreign && code.entry_detour && code.entry_detour->target == address(stub) && code.entry_detour->span == entry_span);
+    check(OriginalCode::file_image().usable.load());
+    check(calls(code, code_address(leaf_a)) && calls(code, code_address(leaf_b)));
+    for (auto patch = patches.rbegin(); patch != patches.rend(); ++patch) write_code(patch->at, patch->original.data(), patch->original.size());
+}
+
 nlohmann::json failure_details(std::uintptr_t entry) {
     const auto& im = OriginalCode::image();
     nlohmann::json result{{"rva",entry >= im.base ? entry-im.base : 0}};
@@ -378,6 +452,8 @@ int wmain(int argc,wchar_t** argv) {
     check(std::find(procedure.calls.begin(),procedure.calls.end(),code_address(branch_a))!=procedure.calls.end());
     check(std::find(procedure.calls.begin(),procedure.calls.end(),code_address(branch_b))!=procedure.calls.end());
     expect_rejected(code_address(directed_root)+1);
+    check(patch_fixtures[0]==detour_fixture);
+    check_patched_image();
     std::uintptr_t selected=0x12345678;
     check(OriginalCode::ResolveNamedSystemCode(root_name,selected) && selected==code_address(directed_root));
     selected=0x12345678;

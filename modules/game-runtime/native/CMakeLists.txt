@@ -225,6 +225,11 @@ foreach(test_target kfc-runtime-test-entity-command-queue kfc-runtime-test-entit
         "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 endforeach()
 target_link_libraries(kfc-runtime-test-original-code PRIVATE Zydis)
+# The test's fixture code is const data in its own .graph section; clang-cl emits that section as read-only data
+# (0x40000040), so its first leaf read fails. Mark it executable at link time (link.exe and lld-link take /SECTION).
+if(MSVC)
+    target_link_options(kfc-runtime-test-original-code PRIVATE /SECTION:.graph,ER)
+endif()
 target_link_libraries(kfc-runtime-test-native-mutation-contract PRIVATE Zydis)
 target_compile_features(kfc-runtime-test-building-input PRIVATE cxx_std_20)
 target_include_directories(kfc-runtime-test-building-input PRIVATE

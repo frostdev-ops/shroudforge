@@ -73,6 +73,17 @@ inline bool add(std::uint64_t base, std::int64_t displacement, std::uint64_t& re
     }
     return true;
 }
+// Where a detour may lead: committed executable memory of any image or allocation, never a guard page. Hook
+// trampolines and stubs are private allocations and another loader's code is its own image, so the game image's own
+// code is not the test. Values as VirtualQuery reports them (State, Protect).
+inline bool executable_page(std::uint32_t state, std::uint32_t protect) {
+    constexpr std::uint32_t committed=0x1000, guard=0x100;
+    if (state!=committed || (protect & guard)) return false;
+    switch (protect & 0xff) {
+    case 0x10: case 0x20: case 0x40: case 0x80: return true;  // EXECUTE, _READ, _READWRITE, _WRITECOPY
+    default: return false;
+    }
+}
 // No procedure-sized allocation: compare fixed chunks, then inspect at most 64 entry bytes.
 // Decode returns the length of the FILE instruction at a supplied byte buffer.
 template<class Read, class Decode, class Executable>
