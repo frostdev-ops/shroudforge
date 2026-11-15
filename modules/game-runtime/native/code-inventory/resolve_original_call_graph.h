@@ -1,5 +1,7 @@
 #pragma once
 #include <Zydis/Zydis.h>
+#include "original_file_policy.h"
+#include <optional>
 #include <array>
 #include <cstdint>
 #include <functional>
@@ -17,6 +19,7 @@ struct Instruction {
 struct Procedure {
     struct ReadOnlyData { std::uintptr_t address{}; std::vector<std::uint8_t> bytes; };
     std::uintptr_t entry{};
+    std::optional<OriginalFile::Detour> entry_detour;
     std::vector<Instruction> instructions;
     std::vector<std::uintptr_t> calls;
     bool indirect_calls{};
@@ -40,10 +43,18 @@ struct EvidenceBlock { std::uintptr_t address{}; std::vector<std::uint8_t> bytes
 using CodeEvidence = std::vector<EvidenceBlock>;
 bool AppendEvidence(const Procedure& procedure, CodeEvidence& output);
 bool EvidenceUnchanged(const CodeEvidence& evidence);
+// Exact entry bytes, span, target and indirect cell are rechecked against loaded memory.
+bool DetoursUnchanged(const std::vector<OriginalFile::Detour>& evidence);
 
 // Complete chained PE unwind ranges, or a bounded call-free leaf CFG. Never
 // treats E8 bytes inside operands as calls and never scans for byte signatures.
 bool ReadProcedure(std::uintptr_t entry, Procedure& output);
+// Like ReadProcedure, but a procedure another module detoured is read from the
+// executable file and reported as foreign. A foreign procedure shows the
+// original call graph only. It is not evidence and must not be retained as such.
+// entry_detour describes the loaded entry, not file code; retain it separately
+// and use DetoursUnchanged wherever invocation evidence is revalidated.
+bool ReadOriginalProcedure(std::uintptr_t entry, Procedure& output, bool& foreign);
 // Resolves an interior instruction through the canonical chained unwind owner.
 // The address must be an instruction boundary reached by that owner's CFG.
 bool ReadContainingProcedure(std::uintptr_t address, Procedure& output);

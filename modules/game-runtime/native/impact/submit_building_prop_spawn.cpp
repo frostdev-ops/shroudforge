@@ -596,6 +596,7 @@ std::string helper_contract_recipe(const EngineContext::BuildingPropSpawnLayout&
 struct Contract {
     std::uintptr_t helper{}, spawn_flag{}, explicit_id{};
     OriginalCode::CodeEvidence code;
+    std::vector<OriginalFile::Detour> entry_detours;
     EngineContext::BuildingPropSpawnLayout layout;
 };
 
@@ -604,7 +605,7 @@ bool capture_code(const Procedure& code, Contract& contract) {
 }
 
 bool validate_code(const Contract& contract) {
-    return OriginalCode::EvidenceUnchanged(contract.code);
+    return OriginalCode::EvidenceUnchanged(contract.code) && OriginalCode::DetoursUnchanged(contract.entry_detours);
 }
 
 bool rip_operands(const Procedure& code, ZydisMnemonic mnemonic,
@@ -668,12 +669,21 @@ bool resolve_contract(Contract& output) {
         if (!capture_code(*procedure, found)) return false;
     Procedure root_body;
     if(!OriginalCode::ReadProcedure(root,root_body) || !capture_code(root_body,found))return false;
+    if (root_body.calls.size()>OriginalFile::function_limit) return false;
     bool linked=std::find(root_body.calls.begin(),root_body.calls.end(),helper)!=root_body.calls.end();
     for(const auto callee:root_body.calls) {
         Procedure intermediate;
-        if(OriginalCode::ReadProcedure(callee,intermediate) &&
+        // The caller between the system and the helper only proves the link. When another
+        // module detoured it, the executable file shows that link and it is not retained
+        // as evidence. The helper and its callees are still captured from loaded code.
+        bool foreign{};
+        if(OriginalCode::ReadOriginalProcedure(callee,intermediate,foreign) &&
            std::find(intermediate.calls.begin(),intermediate.calls.end(),helper)!=intermediate.calls.end()) {
-            if(!capture_code(intermediate,found))return false;linked=true;
+            if (foreign) {
+                if (!intermediate.entry_detour) return false;
+                found.entry_detours.push_back(*intermediate.entry_detour);
+            } else if (!capture_code(intermediate,found)) return false;
+            linked=true;
         }
     }
     if(!linked || !validate_code(found))return false;
