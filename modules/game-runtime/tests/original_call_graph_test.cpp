@@ -45,6 +45,23 @@ __declspec(noinline) unsigned directed_root(unsigned value) {
     volatile auto second = branch_b(value);
     return first + second;
 }
+// Patched in place before the executable file is first read; never called.
+__declspec(noinline) unsigned detour_fixture(unsigned value) {
+    volatile auto first = leaf_a(value);
+    volatile auto second = leaf_b(first);
+    return first * 3u + second;
+}
+__declspec(noinline) unsigned mid_hook_fixture(unsigned value) {
+    volatile auto first = leaf_b(value);
+    volatile auto second = leaf_a(first ^ 0x5au);
+    volatile auto third = leaf_b(second + 7u);
+    return first + second * 5u + third;
+}
+__declspec(noinline) unsigned call_site_fixture(unsigned value) {
+    volatile auto first = leaf_a(value + 3u);
+    return first ^ 0x77u;
+}
+unsigned (*volatile const patch_fixtures[])(unsigned) = {detour_fixture, mid_hook_fixture, call_site_fixture};
 
 struct NativeDependency { const char* name; std::uint64_t size; };
 struct NativeDescriptor {
@@ -217,6 +234,101 @@ void check_bounded_code_evidence() {
     check(!OriginalCode::EvidenceUnchanged(evidence));
 }
 
+// A hook library's trampolines and stubs: private executable memory within rel32 reach of the image.
+std::uint8_t* allocate_near(std::uintptr_t image, std::size_t image_size) {
+    SYSTEM_INFO info{};
+    GetSystemInfo(&info);
+    const std::uintptr_t step = info.dwAllocationGranularity;
+    const auto attempt = [](std::uintptr_t at) {
+        return static_cast<std::uint8_t*>(VirtualAlloc(reinterpret_cast<void*>(at), 4096, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE));
+    };
+    for (auto at = (image & ~(step - 1)) - step; at > step && image - at < 0x70000000; at -= step)
+        if (auto* page = attempt(at)) return page;
+    const auto end = (image + image_size + step - 1) & ~(step - 1);
+    for (auto at = end; at - image < 0x70000000; at += step)
+        if (auto* page = attempt(at)) return page;
+    return nullptr;
+}
+void write_code(std::uintptr_t at, const std::uint8_t* bytes, std::size_t size) {
+    DWORD previous{}, ignored{};
+    check(VirtualProtect(reinterpret_cast<void*>(at), size, PAGE_EXECUTE_READWRITE, &previous) != FALSE);
+    std::memcpy(reinterpret_cast<void*>(at), bytes, size);
+    check(VirtualProtect(reinterpret_cast<void*>(at), size, previous, &ignored) != FALSE);
+    FlushInstructionCache(GetCurrentProcess(), reinterpret_cast<void*>(at), size);
+}
+// The whole original instructions at `at` that hold `need` bytes, by the production decoder.
+std::size_t whole_instructions(std::uintptr_t at, std::size_t need) {
+    std::size_t span{};
+    while (span < need) {
+        const auto length = OriginalCode::instruction_length(reinterpret_cast<const std::uint8_t*>(at + span), 15);
+        if (!length) return 0;
+        span += length;
+    }
+    return span;
+}
+// Kiln's registry form: E9 rel32, then 0x90 over the rest of the overwritten instructions.
+std::vector<std::uint8_t> kiln_jump(std::uintptr_t at, std::size_t span, std::uintptr_t target) {
+    std::vector<std::uint8_t> bytes(span, 0x90);
+    bytes[0] = 0xe9;
+    const auto relative = static_cast<std::int32_t>(static_cast<std::intptr_t>(target) - static_cast<std::intptr_t>(at + 5));
+    std::memcpy(bytes.data() + 1, &relative, 4);
+    return bytes;
+}
+struct Patch { std::uintptr_t at{}; std::vector<std::uint8_t> bytes, original; };
+Patch prepare_patch(std::uintptr_t at, std::vector<std::uint8_t> bytes) {
+    Patch patch{at, std::move(bytes), {}};
+    patch.original.assign(reinterpret_cast<const std::uint8_t*>(at), reinterpret_cast<const std::uint8_t*>(at) + patch.bytes.size());
+    return patch;
+}
+bool calls(const OriginalCode::Procedure& code, std::uintptr_t callee) {
+    return std::find(code.calls.begin(), code.calls.end(), callee) != code.calls.end();
+}
+Patch mid_hook;
+// Before the executable file is first read (it is cached once per process): an entry detour into a private
+// executable page, as Kiln's hook registry writes it over PlaceProp, and a mid hook in another function, as
+// Kiln's Rules service writes them at every start. The image is still this file's image and the walk reads
+// the detoured function through the file. Restored afterwards, so the later checks see unchanged code.
+void check_patched_image() {
+    const auto& im = OriginalCode::image();
+    auto* stub = allocate_near(im.base, im.size);
+    check(stub != nullptr);
+    std::memset(stub, 0xc3, 64);
+    const auto entry = code_address(detour_fixture), body = code_address(mid_hook_fixture);
+    check(im.procedures.contains(static_cast<std::uint32_t>(entry - im.base)));
+    const auto entry_span = whole_instructions(entry, 5);
+    check(entry_span >= 5 && entry_span < 64);
+    // The mid hook: the first original instruction boundary at least 16 bytes in, as the production decoder walks it.
+    const auto found = im.procedures.find(static_cast<std::uint32_t>(body - im.base));
+    check(found != im.procedures.end());
+    auto site = body;
+    while (site < body + 16) { const auto step = whole_instructions(site, 1); check(step != 0); site += step; }
+    const auto site_span = whole_instructions(site, 5);
+    check(site_span >= 5 && site + site_span <= im.base + found->second.front().end);
+    mid_hook = prepare_patch(site, kiln_jump(site, site_span, address(stub) + 16));
+    // ShroudForge's own main-menu kind of patch: one E8 call site redirected to a near thunk, recorded first.
+    const auto caller = code_address(call_site_fixture);
+    auto call = caller;
+    while (*reinterpret_cast<const std::uint8_t*>(call) != 0xe8 || whole_instructions(call, 1) != 5) {
+        const auto step = whole_instructions(call, 1);
+        check(step != 0 && call - caller < 64);
+        call += step;
+    }
+    auto redirected = kiln_jump(call, 5, address(stub) + 32);
+    redirected[0] = 0xe8;
+    const auto own = prepare_patch(call, redirected);
+    check(OriginalCode::RecordOwnPatch(own.at, own.original.data(), own.bytes.data(), own.bytes.size()));
+    std::vector<Patch> patches{prepare_patch(entry, kiln_jump(entry, entry_span, address(stub))), mid_hook, own};
+    for (const auto& patch : patches) write_code(patch.at, patch.bytes.data(), patch.bytes.size());
+    OriginalCode::Procedure code;
+    bool foreign{};
+    check(OriginalCode::ReadOriginalProcedure(entry, code, foreign));
+    check(foreign && code.entry_detour && code.entry_detour->target == address(stub) && code.entry_detour->span == entry_span);
+    check(OriginalCode::file_image().usable.load());
+    check(calls(code, code_address(leaf_a)) && calls(code, code_address(leaf_b)));
+    for (auto patch = patches.rbegin(); patch != patches.rend(); ++patch) write_code(patch->at, patch->original.data(), patch->original.size());
+    OriginalCode::ForgetOwnPatch(own.at);
+}
+
 nlohmann::json failure_details(std::uintptr_t entry) {
     const auto& im = OriginalCode::image();
     nlohmann::json result{{"rva",entry >= im.base ? entry-im.base : 0}};
@@ -378,6 +490,8 @@ int wmain(int argc,wchar_t** argv) {
     check(std::find(procedure.calls.begin(),procedure.calls.end(),code_address(branch_a))!=procedure.calls.end());
     check(std::find(procedure.calls.begin(),procedure.calls.end(),code_address(branch_b))!=procedure.calls.end());
     expect_rejected(code_address(directed_root)+1);
+    check(patch_fixtures[0]==detour_fixture);
+    check_patched_image();
     std::uintptr_t selected=0x12345678;
     check(OriginalCode::ResolveNamedSystemCode(root_name,selected) && selected==code_address(directed_root));
     selected=0x12345678;
@@ -398,5 +512,31 @@ int wmain(int argc,wchar_t** argv) {
     check(!OriginalCode::FindUniqueReachable(code_address(directed_root),9,leaf_match,selected));
     check(!OriginalCode::FindUniqueReachable(0,2,leaf_match,selected));
     check(!OriginalCode::FindUniqueReachable(code_address(directed_root),2,{},selected));
+    // Last: an indirect mid hook can still be decoded live as a terminal edge. Refusing it once must never
+    // turn the next read into live-only admission, or a depth-zero walk can select the patched function.
+    auto* retry_stub=allocate_near(base,nt->OptionalHeader.SizeOfImage);
+    check(retry_stub!=nullptr);
+    const auto retry_span=whole_instructions(mid_hook.at,14);
+    const auto& retry_parts=OriginalCode::image().procedures.at(static_cast<std::uint32_t>(code_address(mid_hook_fixture)-base));
+    check(retry_span>=14 && retry_span<=32 && mid_hook.at+retry_span<=base+retry_parts.front().end);
+    std::vector<std::uint8_t> retry_bytes(retry_span,0x90);
+    retry_bytes[0]=0xff; retry_bytes[1]=0x25;
+    std::fill(retry_bytes.begin()+2,retry_bytes.begin()+6,0);
+    const auto retry_target=address(retry_stub);
+    std::memcpy(retry_bytes.data()+6,&retry_target,8);
+    const auto retry_patch=prepare_patch(mid_hook.at,retry_bytes);
+    write_code(retry_patch.at,retry_patch.bytes.data(),retry_patch.bytes.size());
+    {
+        OriginalCode::Procedure code;
+        bool foreign{true};
+        check(!OriginalCode::ReadOriginalProcedure(code_address(mid_hook_fixture), code, foreign) && !foreign);
+        check(OriginalCode::ReadProcedure(code_address(mid_hook_fixture),code));
+        check(!OriginalCode::ReadOriginalProcedure(code_address(mid_hook_fixture), code, foreign) && !foreign);
+        selected=0x12345678;
+        check(!OriginalCode::FindUniqueReachable(code_address(mid_hook_fixture),0,[](const auto&){return true;},selected));
+        check(selected==0x12345678);
+    }
+    write_code(retry_patch.at,retry_patch.original.data(),retry_patch.original.size());
+    VirtualFree(retry_stub,0,MEM_RELEASE);
     std::printf("original call graph checks passed: %u\n",checks);
 }

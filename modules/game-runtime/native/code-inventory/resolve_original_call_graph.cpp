@@ -9,6 +9,7 @@
 #include <set>
 #include <atomic>
 #include <cstdio>
+#include <mutex>
 
 namespace OriginalCode {
 namespace {
@@ -53,6 +54,10 @@ struct Image {
         layout.preferred=nt.OptionalHeader.ImageBase; layout.loaded=base; layout.size=size;
         layout.machine=nt.FileHeader.Machine; layout.timestamp=nt.FileHeader.TimeDateStamp;
         layout.checksum=nt.OptionalHeader.CheckSum; layout.count=nt.FileHeader.NumberOfSections;
+        if (nt.OptionalHeader.NumberOfRvaAndSizes>IMAGE_DIRECTORY_ENTRY_BASERELOC) {
+            layout.relocation_rva=nt.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].VirtualAddress;
+            layout.relocation_size=nt.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].Size;
+        }
         for (const auto& section:sections) {
             OriginalFile::Section value;
             std::copy_n(section.Name,8,value.name.begin());
@@ -105,9 +110,7 @@ struct Image {
 const Image& image() { static const Image value; return value; }
 
 using Reader = std::function<bool(std::uint64_t,void*,std::size_t)>;
-void file_diagnostic(const char* reason) {
-    char message[512];
-    std::snprintf(message,sizeof(message),"ShroudForge original call graph: executable file refused: %s; live-only resolution\n",reason);
+void file_log(std::uint8_t level,const char* message) {
     using Log = void(__cdecl*)(std::uint8_t,const wchar_t*,const char*);
     const auto runtime=GetModuleHandleW(L"shroudforge-runtime.dll");
     const auto sink=runtime?reinterpret_cast<Log>(GetProcAddress(runtime,"shroudforge_game_profile_discovery_log")):nullptr;
@@ -116,21 +119,46 @@ void file_diagnostic(const char* reason) {
         const auto length=GetModuleFileNameW(nullptr,path,32768);
         if (length && length<32768) {
             const auto root=std::filesystem::path(path).parent_path();
-            sink('W',root.c_str(),message);return;
+            sink(level,root.c_str(),message);return;
         }
     }
     OutputDebugStringA(message);
 }
-std::size_t instruction_length(const std::uint8_t* bytes,std::size_t size) {
+void file_diagnostic(const char* reason) {
+    char message[512];
+    std::snprintf(message,sizeof(message),"ShroudForge original call graph: executable file refused: %s; live-only resolution\n",reason);
+    file_log('W',message);
+}
+// Own code-patch records and writes share a lock with image comparisons and original-code readers.
+OriginalFile::OwnPatchRegistry own_patches;
+// A detour's target (a trampoline, a hook stub, another module's code), not the game image's own code.
+bool detour_target(std::uint64_t at) {
+    MEMORY_BASIC_INFORMATION page{};
+    return at && at<=UINTPTR_MAX &&
+        VirtualQuery(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(at)),&page,sizeof(page))==sizeof(page) &&
+        OriginalFile::executable_page(page.State,page.Protect);
+}
+OriginalFile::InstructionStep instruction_length(const std::uint8_t* bytes,std::size_t size) {
     ZydisDecoder decoder;
     ZydisDecodedInstruction instruction{};
+    std::array<ZydisDecodedOperand,ZYDIS_MAX_OPERAND_COUNT> operands{};
     if (!ZYAN_SUCCESS(ZydisDecoderInit(&decoder,ZYDIS_MACHINE_MODE_LONG_64,ZYDIS_STACK_WIDTH_64)) ||
-        !ZYAN_SUCCESS(ZydisDecoderDecodeInstruction(&decoder,nullptr,bytes,size,&instruction))) return 0;
-    return instruction.length;
+        !ZYAN_SUCCESS(ZydisDecoderDecodeFull(&decoder,bytes,size,&instruction,operands.data()))) return {0};
+    OriginalFile::InstructionStep step{instruction.length};
+    const auto category=instruction.meta.category;
+    step.fallthrough=category!=ZYDIS_CATEGORY_UNCOND_BR && category!=ZYDIS_CATEGORY_RET &&
+        category!=ZYDIS_CATEGORY_INTERRUPT && instruction.mnemonic!=ZYDIS_MNEMONIC_UD2;
+    if ((category==ZYDIS_CATEGORY_UNCOND_BR || category==ZYDIS_CATEGORY_COND_BR) &&
+        operands[0].type==ZYDIS_OPERAND_TYPE_IMMEDIATE && operands[0].imm.is_relative) {
+        step.branch=true; step.relative=operands[0].imm.value.s;
+    }
+    return step;
 }
 struct FileImage {
     struct Section { std::uint32_t rva; std::vector<std::uint8_t> bytes; };
     std::vector<Section> sections;
+    std::uint64_t delta{};  // loaded base minus the file's preferred base (ASLR)
+    bool matched{}; // Immutable after construction: keep strict function classification even after file reads stop.
     mutable std::atomic<bool> usable{false};
     mutable std::atomic<bool> diagnosed{false};
     void Refuse(const char* reason) const {
@@ -157,40 +185,39 @@ struct FileImage {
         Reader live=[](std::uint64_t at,void* out,std::size_t size) {
             return copy(out,reinterpret_cast<const void*>(static_cast<std::uintptr_t>(at)),size);
         };
-        return OriginalFile::admit(im.base,entry,found->second,file,live,instruction_length,
-            [](std::uint64_t at){return NamedServiceImplementation::executable_callback(static_cast<std::uintptr_t>(at));},record);
+        return OriginalFile::admit(im.base,entry,found->second,file,live,instruction_length,detour_target,record);
     }
     // First-use resolution before the caller acquires a Scene gate; never repeated by cached validation.
     // No sparse SizeOfImage allocation.
+    // Identity only (original_file_policy.h compare_image): entry detours, interior jumps and ShroudForge's own
+    // recorded patches are admitted here, but Classify still refuses to read any function holding an interior jump
+    // or an own patch through the file.
     bool CompareImage() const {
         const auto& im=image();
-        std::array<std::uint8_t,4096> live{};
-        std::set<std::uint32_t> admitted;
-        for (const auto& section:sections) {
-            std::size_t offset{};
-            while (offset<section.bytes.size()) {
-                const auto n=(std::min)(live.size(),section.bytes.size()-offset);
-                const auto rva=section.rva+static_cast<std::uint32_t>(offset);
-                if (!im.Read(rva,live.data(),n)) {Refuse("unreadable loaded code");return false;}
-                const auto* original=section.bytes.data()+offset;
-                if (!std::memcmp(original,live.data(),n)) {offset+=n;continue;}
-                std::size_t changed{};
-                while (changed<n && original[changed]==live[changed]) ++changed;
-                const auto at=rva+static_cast<std::uint32_t>(changed);
-                auto owner=im.range_owners.upper_bound(at);
-                OriginalFile::Detour detour;
-                if (owner==im.range_owners.begin() ||
-                    Classify(std::prev(owner)->second,detour)!=OriginalFile::Admission::detour ||
-                    at<detour.rva || at-detour.rva>=detour.span) {
-                    char reason[160];std::snprintf(reason,sizeof(reason),"function RVA 0x%08x differs from the file other than by an entry detour",
-                        owner==im.range_owners.begin()?at:std::prev(owner)->second);
-                    Refuse(reason);return false;
-                }
-                admitted.insert(detour.rva);
-                if (admitted.size()>OriginalFile::function_limit) {Refuse("entry detour count bound");return false;}
-                offset=detour.rva+detour.span-section.rva;
-            }
+        std::vector<OriginalFile::CodeSection> code;
+        for (const auto& section:sections) code.push_back({section.rva,section.bytes});
+        Reader file=[&](std::uint64_t at,void* out,std::size_t size) {
+            return at>=im.base && at-im.base<=UINT32_MAX && Read(static_cast<std::uint32_t>(at-im.base),out,size);
+        };
+        Reader live=[](std::uint64_t at,void* out,std::size_t size) {
+            return copy(out,reinterpret_cast<const void*>(static_cast<std::uintptr_t>(at)),size);
+        };
+        const auto result=own_patches.WithPatches([&](auto own) {
+            return OriginalFile::compare_image(im.base,im.size,code,im.range_owners,im.procedures,
+                [&](std::uint32_t rva,void* out,std::size_t size){return im.Read(rva,out,size);},
+                [&](std::uint32_t entry,OriginalFile::Detour& record){return Classify(entry,record);},
+                file,live,instruction_length,detour_target,own);
+        });
+        char message[256];
+        if (result.reason) {
+            std::snprintf(message,sizeof(message),"%s (RVA 0x%08x)",result.reason,result.rva);
+            Refuse(message);return false;
         }
+        std::snprintf(message,sizeof(message),"ShroudForge original call graph: executable file accepted (load delta 0x%llx) "
+            "beside %zu entry detour(s), %zu interior jump(s) and %zu own patch(es); a function holding an interior "
+            "jump or an own patch is never read through it\n",static_cast<unsigned long long>(delta),result.entries,
+            result.interiors,result.owns);
+        file_log('I',message);
         return true;
     }
     FileImage() {
@@ -214,6 +241,10 @@ struct FileImage {
             layout.preferred=nt.OptionalHeader.ImageBase;layout.size=nt.OptionalHeader.SizeOfImage;
             layout.machine=nt.FileHeader.Machine;layout.timestamp=nt.FileHeader.TimeDateStamp;
             layout.checksum=nt.OptionalHeader.CheckSum;layout.count=nt.FileHeader.NumberOfSections;
+            if (nt.OptionalHeader.NumberOfRvaAndSizes>IMAGE_DIRECTORY_ENTRY_BASERELOC) {
+                layout.relocation_rva=nt.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].VirtualAddress;
+                layout.relocation_size=nt.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].Size;
+            }
             // Read the FILE's own table, not raw offsets taken from memory.
             file.seekg(static_cast<std::uint64_t>(dos.e_lfanew)+offsetof(IMAGE_NT_HEADERS64,OptionalHeader)+nt.FileHeader.SizeOfOptionalHeader);
             for (unsigned i=0;i<layout.count;++i) {
@@ -233,23 +264,48 @@ struct FileImage {
                 if (!file.read(reinterpret_cast<char*>(cached.bytes.data()),count)) {Refuse("executable section read");return;}
                 sections.push_back(std::move(cached));
             }
-            if (CompareImage()) usable.store(true);
+            // A relocated (ASLR) image: the loader applied the file's base relocations, so apply them to the cached
+            // code as well. The table is read from the file, located through the file's own section table.
+            delta=static_cast<std::uint64_t>(im.base)-layout.preferred;
+            if (delta) {
+                std::vector<std::uint8_t> table;
+                const auto& directory=nt.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC];
+                if (nt.OptionalHeader.NumberOfRvaAndSizes>IMAGE_DIRECTORY_ENTRY_BASERELOC &&
+                    !(nt.FileHeader.Characteristics & IMAGE_FILE_RELOCS_STRIPPED) && directory.Size) {
+                    if (directory.Size>OriginalFile::relocation_limit) {Refuse("base relocation table bound");return;}
+                    std::uint64_t at{};
+                    if (!OriginalFile::file_offset(layout.sections,directory.VirtualAddress,directory.Size,at)) {
+                        Refuse("base relocation table location");return;
+                    }
+                    table.resize(directory.Size);
+                    file.seekg(static_cast<std::streamoff>(at));
+                    if (!file.read(reinterpret_cast<char*>(table.data()),directory.Size)) {Refuse("base relocation table read");return;}
+                }
+                std::vector<OriginalFile::CodeBytes> code;
+                for (auto& section:sections) code.push_back({section.rva,section.bytes});
+                std::vector<std::uint8_t> loaded_table(table.size());
+                if (!im.Read(im.layout.relocation_rva,loaded_table.data(),loaded_table.size())) {
+                    Refuse("unreadable loaded base relocation table");return;
+                }
+                if (const auto reason=OriginalFile::relocate(table,layout.size,delta,code,loaded_table)) {Refuse(reason);return;}
+            }
+            if (CompareImage()) { matched=true; usable.store(true); }
         } catch (...) {Refuse("exception loading executable sections");}
     }
 };
 const FileImage& file_image() { static const FileImage value;return value; }
 
-// A refused file restores pre-PR live-only resolution. While usable, an unexplained
-// procedure mismatch refuses this read as well as disabling all future file reads.
+// An image that never matched retains pre-PR live-only resolution. Once matched, a procedure mismatch must stay
+// refused on retries, even when it disables future file reads; otherwise a mid hook becomes selectable live.
 OriginalFile::Admission classify(std::uintptr_t entry,OriginalFile::Detour& record) {
     const auto& im=image();const auto& file=file_image();
-    if (!file.usable.load()) return OriginalFile::Admission::live;
+    if (!file.matched) return OriginalFile::Admission::live;
     if (entry<im.base || entry-im.base>=im.size) return OriginalFile::Admission::refuse;
     const auto rva=static_cast<std::uint32_t>(entry-im.base);
     // A call-free leaf has no reliable unwind extent. Read it live first, then
     // compare only its reached instructions, never a window over neighbouring functions.
     if (!im.procedures.contains(rva)) return OriginalFile::Admission::live;
-    const auto result=file.Classify(rva,record);
+    const auto result=OriginalFile::resolution_admission(file.matched,file.usable.load(),file.Classify(rva,record));
     if (result!=OriginalFile::Admission::refuse) return result;
     char reason[160];std::snprintf(reason,sizeof(reason),"function RVA 0x%08x differs from the file other than by an entry detour (or exceeds bounds)",rva);
     file.Refuse(reason);
@@ -600,17 +656,61 @@ bool DetoursUnchanged(const std::vector<OriginalFile::Detour>& evidence) {
     try {
         if (evidence.empty()) return true;
         const auto& file=file_image();
-        if (!file.usable.load()) return false;
-        for (const auto& saved:evidence) {
-            OriginalFile::Detour current;
-            const auto admission=file.Classify(saved.rva,current);
-            if (admission==OriginalFile::Admission::refuse) {
-                char reason[160];std::snprintf(reason,sizeof(reason),"function RVA 0x%08x differs from the file other than by an entry detour during revalidation",saved.rva);
-                file.Refuse(reason);return false;
+        return own_patches.WithPatches([&](auto) {
+            if (!file.usable.load()) return false;
+            for (const auto& saved:evidence) {
+                OriginalFile::Detour current;
+                const auto admission=file.Classify(saved.rva,current);
+                if (admission==OriginalFile::Admission::refuse) {
+                    char reason[160];std::snprintf(reason,sizeof(reason),"function RVA 0x%08x differs from the file other than by an entry detour during revalidation",saved.rva);
+                    file.Refuse(reason);return false;
+                }
+                if (admission!=OriginalFile::Admission::detour || current!=saved) return false;
             }
-            if (admission!=OriginalFile::Admission::detour || current!=saved) return false;
-        }
-        return file.usable.load();
+            return file.usable.load();
+        });
+    } catch (...) { return false; }
+}
+
+namespace {
+bool make_own_patch(std::uintptr_t address, const std::uint8_t* original, const std::uint8_t* replacement,
+    std::size_t size, OriginalFile::OwnPatch& patch) {
+    const auto& im=image();
+    if (!original || !replacement || !size || size>OriginalFile::own_patch_bytes || !im.size || address<im.base ||
+        address-im.base>=im.size || size>im.size-(address-im.base)) return false;
+    patch.rva=static_cast<std::uint32_t>(address-im.base);patch.size=static_cast<std::uint32_t>(size);
+    std::copy_n(original,size,patch.original.begin());std::copy_n(replacement,size,patch.replacement.begin());
+    return true;
+}
+}
+bool RecordOwnPatch(std::uintptr_t address, const std::uint8_t* original, const std::uint8_t* replacement, std::size_t size) {
+    try {
+        OriginalFile::OwnPatch patch;
+        return make_own_patch(address,original,replacement,size,patch) && own_patches.Record(patch);
+    } catch (...) { return false; }
+}
+
+void ForgetOwnPatch(std::uintptr_t address) {
+    try {
+        const auto& im=image();
+        if (address<im.base) return;
+        if (address-im.base<=UINT32_MAX) own_patches.Forget(static_cast<std::uint32_t>(address-im.base));
+    } catch (...) {}
+}
+
+bool ApplyOwnPatch(std::uintptr_t address, const std::uint8_t* original, const std::uint8_t* replacement,
+    std::size_t size, const std::function<bool()>& write) {
+    try {
+        OriginalFile::OwnPatch patch;
+        return write && make_own_patch(address,original,replacement,size,patch) && own_patches.Apply(patch,write);
+    } catch (...) { return false; }
+}
+
+bool RestoreOwnPatch(std::uintptr_t address, const std::function<bool()>& write) {
+    try {
+        const auto& im=image();
+        return write && address>=im.base && address-im.base<im.size &&
+            own_patches.Restore(static_cast<std::uint32_t>(address-im.base),write);
     } catch (...) { return false; }
 }
 
@@ -618,24 +718,29 @@ bool ReadProcedure(std::uintptr_t entry, Procedure& output) { return read_proced
 
 bool ReadOriginalProcedure(std::uintptr_t entry, Procedure& output, bool& foreign) {
     try {
-        OriginalFile::Detour record;
-        const auto admission=classify(entry,record);
-        foreign=admission==OriginalFile::Admission::detour;
-        if (admission==OriginalFile::Admission::refuse || !read_procedure(entry,output,foreign?&file_image():nullptr)) return false;
-        if (!foreign && file_image().usable.load() && !image().procedures.contains(static_cast<std::uint32_t>(entry-image().base))) {
-            std::array<std::uint8_t,15> original{};
-            for (const auto& instruction:output.instructions) {
-                const auto size=instruction.decoded.length;
-                if (!size || size>original.size() ||
-                    !file_image().Read(static_cast<std::uint32_t>(instruction.address-image().base),original.data(),size) ||
-                    !std::equal(original.begin(),original.begin()+size,instruction.bytes.begin())) {
-                    char reason[160];std::snprintf(reason,sizeof(reason),"function RVA 0x%08x differs from the file other than by an entry detour (no unwind extent)",static_cast<unsigned>(entry-image().base));
-                    file_image().Refuse(reason);return false;
+        const auto& file=file_image(); // Initialize before taking the registry lock (CompareImage also takes it).
+        return own_patches.WithPatches([&](auto) {
+            OriginalFile::Detour record;
+            const auto admission=classify(entry,record);
+            foreign=admission==OriginalFile::Admission::detour;
+            if (admission==OriginalFile::Admission::refuse || !read_procedure(entry,output,foreign?&file_image():nullptr)) return false;
+            if (!foreign && file.matched && !image().procedures.contains(static_cast<std::uint32_t>(entry-image().base))) {
+                std::array<std::uint8_t,15> original{};
+                for (const auto& instruction:output.instructions) {
+                    const auto size=instruction.decoded.length;
+                    if (!size || size>original.size() ||
+                        !file_image().Read(static_cast<std::uint32_t>(instruction.address-image().base),original.data(),size) ||
+                        !std::equal(original.begin(),original.begin()+size,instruction.bytes.begin())) {
+                        char reason[160];std::snprintf(reason,sizeof(reason),"function RVA 0x%08x differs from the file other than by an entry detour (no unwind extent)",static_cast<unsigned>(entry-image().base));
+                        file_image().Refuse(reason);return false;
+                    }
                 }
             }
-        }
-        if (foreign) output.entry_detour=record;
-        return true;
+            OriginalFile::Detour repeated;
+            if (classify(entry,repeated)!=admission || (foreign && (repeated!=record || !file.usable.load()))) return false;
+            if (foreign) output.entry_detour=record;
+            return true;
+        });
     } catch (...) { foreign=false;return false; }
 }
 

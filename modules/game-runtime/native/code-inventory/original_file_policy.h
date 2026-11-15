@@ -4,7 +4,12 @@
 #include <array>
 #include <cstdint>
 #include <cstring>
+#include <iterator>
+#include <map>
+#include <mutex>
+#include <set>
 #include <span>
+#include <utility>
 #include <vector>
 namespace OriginalFile {
 constexpr std::size_t function_limit = 4096;
@@ -21,9 +26,17 @@ struct Layout {
     std::uint64_t preferred{}, loaded{};
     std::uint32_t size{}, timestamp{}, checksum{};
     std::uint16_t machine{}, count{};
+    std::uint32_t relocation_rva{}, relocation_size{};
     std::vector<Section> sections;
 };
 struct Range { std::uint32_t begin{}, end{}; };
+struct InstructionStep {
+    std::size_t length{};
+    bool fallthrough{true}, branch{};
+    std::int64_t relative{};
+    InstructionStep(std::size_t n) : length(n) {}
+    operator std::size_t() const { return length; }
+};
 struct Detour {
     std::uint32_t rva{}, span{};
     std::uint64_t target{}, cell{}, cell_value{};
@@ -31,13 +44,21 @@ struct Detour {
     bool operator==(const Detour&) const = default;
 };
 enum class Admission { live, detour, refuse };
+inline Admission resolution_admission(bool matched, bool usable, Admission current) {
+    if (!matched) return Admission::live;
+    return !usable && current==Admission::detour ? Admission::refuse : current;
+}
+// `live.preferred` is the loaded header's ImageBase. A relocated (ASLR) image is this file's image when that names the
+// loaded base (Windows and Wine write it there) or still the file's; its code is compared after relocate() below.
 inline const char* identity(const Layout& live, const Layout& file) {
-    if (live.loaded != live.preferred) return "relocated image";
+    if (live.preferred != live.loaded && live.preferred != file.preferred) return "image base";
     if (!live.size || live.size > image_limit || file.size > image_limit) return "image size bound";
-    if (file.preferred != live.preferred || file.size != live.size) return "image base/size";
+    if (file.size != live.size) return "image size";
     if (file.machine != live.machine) return "machine";
     if (file.timestamp != live.timestamp) return "timestamp";
     if (file.checksum != live.checksum) return "checksum";
+    if (file.relocation_rva!=live.relocation_rva || file.relocation_size!=live.relocation_size)
+        return "base relocation directory";
     if (file.count != live.count || file.sections.size()!=live.count || live.sections.size()!=live.count) return "section count";
     std::size_t total{};
     for (std::size_t i=0;i<live.sections.size();++i) {
@@ -51,6 +72,56 @@ inline const char* identity(const Layout& live, const Layout& file) {
         }
     }
     return nullptr;
+}
+constexpr std::size_t relocation_limit = 16 * 1024 * 1024;
+struct CodeBytes { std::uint32_t rva{}; std::span<std::uint8_t> bytes; };
+// The file's base relocation table (IMAGE_DIRECTORY_ENTRY_BASERELOC) applied to the cached executable sections for
+// the load delta (loaded base minus the file's preferred base, modulo 2^64), as the loader applied it to the loaded
+// image. Every block is checked, also where it touches no cached section. Not relocated: nothing applied or read.
+inline const char* relocate(std::span<const std::uint8_t> table, std::uint32_t image_size, std::uint64_t delta,
+    std::span<const CodeBytes> sections, std::span<const std::uint8_t> loaded_table) {
+    if (!delta) return nullptr;
+    if (table.empty()) return "relocated image without base relocations";
+    if (table.size()>relocation_limit) return "base relocation table bound";
+    if (table.size()!=loaded_table.size() || !std::equal(table.begin(),table.end(),loaded_table.begin()))
+        return "base relocation table differs from the loaded image";
+    for (std::size_t offset{};offset<table.size();) {
+        if (table.size()-offset<8) return "truncated base relocation table";
+        std::uint32_t page{}, size{};
+        std::memcpy(&page,table.data()+offset,4);std::memcpy(&size,table.data()+offset+4,4);
+        if (size<8 || size%2 || size>table.size()-offset) return "malformed base relocation block";
+        if (page>=image_size) return "base relocation block outside the image";
+        for (auto at=offset+8;at<offset+size;at+=2) {
+            std::uint16_t entry{};std::memcpy(&entry,table.data()+at,2);
+            const auto type=entry>>12;
+            if (!type) continue;  // IMAGE_REL_BASED_ABSOLUTE: padding
+            const std::size_t width=type==10?8:type==3?4:0;  // DIR64, HIGHLOW
+            if (!width) return "unsupported base relocation type";
+            const auto field=static_cast<std::uint64_t>(page)+(entry&0xfffu);
+            if (field+width>image_size) return "base relocation outside the image";
+            for (const auto& section:sections) {
+                const std::uint64_t begin=section.rva, end=begin+section.bytes.size();
+                if (field+width<=begin || field>=end) continue;
+                if (field<begin || field+width>end) return "base relocation across the end of a code section";
+                auto* bytes=section.bytes.data()+(field-begin);
+                if (width==8) {std::uint64_t value{};std::memcpy(&value,bytes,8);value+=delta;std::memcpy(bytes,&value,8);}
+                else {std::uint32_t value{};std::memcpy(&value,bytes,4);value+=static_cast<std::uint32_t>(delta);std::memcpy(bytes,&value,4);}
+            }
+        }
+        offset+=size;
+    }
+    return nullptr;
+}
+// Where `size` bytes at `rva` lie in the file: inside one section, within its raw data.
+inline bool file_offset(std::span<const Section> sections, std::uint32_t rva, std::uint32_t size, std::uint64_t& out) {
+    for (const auto& section:sections) {
+        if (rva<section.rva || rva-section.rva>=section.size) continue;
+        const auto at=rva-section.rva;
+        if (size>section.size-at || at>section.raw_size || size>section.raw_size-at) return false;
+        out=static_cast<std::uint64_t>(section.raw)+at;
+        return true;
+    }
+    return false;
 }
 inline bool bounded(std::span<const Range> ranges, std::uint32_t image_size) {
     std::size_t total{};
@@ -73,8 +144,19 @@ inline bool add(std::uint64_t base, std::int64_t displacement, std::uint64_t& re
     }
     return true;
 }
+// Where a detour may lead: committed executable memory of any image or allocation, never a guard page. Hook
+// trampolines and stubs are private allocations and another loader's code is its own image, so the game image's own
+// code is not the test. Values as VirtualQuery reports them (State, Protect).
+inline bool executable_page(std::uint32_t state, std::uint32_t protect) {
+    constexpr std::uint32_t committed=0x1000, guard=0x100;
+    if (state!=committed || (protect & guard)) return false;
+    switch (protect & 0xff) {
+    case 0x10: case 0x20: case 0x40: case 0x80: return true;  // EXECUTE, _READ, _READWRITE, _WRITECOPY
+    default: return false;
+    }
+}
 // No procedure-sized allocation: compare fixed chunks, then inspect at most 64 entry bytes.
-// Decode returns the length of the FILE instruction at a supplied byte buffer.
+// Decode supplies the FILE instruction length; InstructionStep also carries control flow for interior boundaries.
 template<class Read, class Decode, class Executable>
 Admission admit(std::uint64_t base, std::uint32_t entry, std::span<const Range> ranges,
     Read file, Read live, Decode decode, Executable executable, Detour& out) {
@@ -137,13 +219,237 @@ Admission admit(std::uint64_t base, std::uint32_t entry, std::span<const Range> 
         while (opcode<span && (patched[opcode]==0x66 || patched[opcode]==0x2e)) ++opcode;
         const bool nop=opcode<span && (patched[opcode]==0x90 ||
             (span-opcode>=3 && patched[opcode]==0x0f && patched[opcode+1]==0x1f && !(patched[opcode+2]&0x38)));
-        const auto length=nop?decode(patched.data()+i,span-i):0;
+        const std::size_t length=nop?static_cast<std::size_t>(decode(patched.data()+i,span-i)):0;
         if (!length || length>span-i) return Admission::refuse;
         i+=length;
     }
     out.rva=entry;out.span=static_cast<std::uint32_t>(span);out.target=destination;out.cell=cell;out.cell_value=cell_value;
     std::copy_n(patched.begin(),span,out.bytes.begin());
+    // The entry reread and target query must not conceal a body edit made after the first comparison.
+    // Recheck against the exact admitted snapshot, including any indirect pointer cell.
+    for (const auto r:ranges) for (auto at=r.begin;at<r.end;) {
+        const auto n=(std::min)(a.size(),static_cast<std::size_t>(r.end-at));
+        if (!file(base+at,a.data(),n) || !live(base+at,b.data(),n)) return Admission::refuse;
+        for (std::size_t i=0;i<n;++i) {
+            const auto offset=static_cast<std::uint64_t>(at)+i;
+            const auto expected=offset>=entry && offset-entry<span ? patched[offset-entry] : a[i];
+            if (b[i]!=expected) return Admission::refuse;
+        }
+        at+=static_cast<std::uint32_t>(n);
+    }
+    if (cell) {
+        std::uint64_t repeated{};
+        if (!live(cell,&repeated,8) || repeated!=cell_value) return Admission::refuse;
+    }
     return Admission::detour;
+}
+// Whole-image identity only. A procedure containing an interior jump is never read through the file: admit() above
+// still refuses it, so it is never a traversal link and never selected.
+// The jump is one transfer written over whole ORIGINAL instructions, as a detour library's mid hook writes it
+// (safetyhook, Kiln's hook registry): `E9 rel32`, `FF 25 00000000` with the 8-byte absolute target inline, or
+// `FF 25 disp32` through an 8-byte cell outside the span; then 0x90 up to the end of the fewest whole original
+// instructions that hold the transfer, and no further. Its target lies outside this image and is executable.
+constexpr std::size_t interior_span_limit = 32;
+constexpr std::size_t interior_function_limit = 8;
+constexpr std::size_t interior_image_limit = 256;
+constexpr std::size_t boundary_decode_limit = 4 * 1024 * 1024;
+struct Interior { std::uint32_t rva{}, span{}; std::uint64_t target{}, cell{}; };
+// `original` (file) and `patched` (loaded) hold `window` bytes at `site`, an original instruction boundary.
+template<class Read, class Decode, class Executable>
+bool transfer_at(std::uint64_t base, std::uint32_t image_size, std::uint32_t site, std::uint32_t changed,
+    const std::uint8_t* original, const std::uint8_t* patched, std::size_t window,
+    Read live, Decode decode, Executable executable, Interior& out) {
+    const auto address=base+site;
+    std::size_t encoding{};
+    std::uint64_t destination{}, cell{};
+    std::int32_t disp{};
+    if (window>=5 && patched[0]==0xe9) {
+        encoding=5;std::memcpy(&disp,patched+1,4);
+        if (!add(address+5,disp,destination)) return false;
+    } else if (window>=6 && patched[0]==0xff && patched[1]==0x25) {
+        std::memcpy(&disp,patched+2,4);
+        if (!disp) {
+            if (window<14) return false;
+            encoding=14;std::memcpy(&destination,patched+6,8);
+        } else {
+            encoding=6;
+            if (!add(address+6,disp,cell)) return false;
+        }
+    } else return false;
+    std::size_t span{};
+    while (span<encoding) {
+        const auto length=decode(original+span,window-span);
+        if (!length || length>window-span) return false;
+        span+=length;
+    }
+    if (span>interior_span_limit || changed<site || changed-site>=span) return false;
+    for (auto i=encoding;i<span;++i) if (patched[i]!=0x90) return false;
+    if (cell && ((cell>=address && cell-address<span) || (cell<address && address-cell<8))) return false;
+    if (cell && !live(cell,&destination,8)) return false;
+    if (!destination || (destination>=base && destination-base<image_size) || !executable(destination)) return false;
+    out={site,static_cast<std::uint32_t>(span),destination,cell};
+    return true;
+}
+// `changed` is the first differing RVA in the unwind range `part`; every byte from `floor` to it equals the file.
+// Follow original control flow from the unwind start. A linear sweep through skipped data can invent boundaries
+// inside reached instructions, or fail on an unreachable invalid byte. Mark every reached instruction byte and
+// reject overlapping decodes before accepting any boundary.
+template<class Read, class Decode, class Executable>
+bool interior(std::uint64_t base, std::uint32_t image_size, Range part, std::uint32_t floor, std::uint32_t changed,
+    Read file, Read live, Decode decode, Executable executable, Interior& out, std::size_t& decode_budget) {
+    out={};
+    if (part.begin>=part.end || part.end>image_size || changed<part.begin || changed>=part.end || floor>changed ||
+        part.end-part.begin>procedure_limit || base>UINT64_MAX-image_size || !decode_budget) return false;
+    std::array<std::uint8_t,64> original{}, patched{};
+    std::vector<std::uint8_t> boundaries(part.end-part.begin);
+    std::vector<std::uint32_t> pending{part.begin};
+    while (!pending.empty()) {
+        auto site=pending.back(); pending.pop_back();
+        while (site<part.end) {
+            auto& mark=boundaries[site-part.begin];
+            if (mark==1) break;
+            if (mark==2) return false;
+            const auto window=(std::min)(original.size(),static_cast<std::size_t>(part.end-site));
+            if (!file(base+site,original.data(),window)) return false;
+            if (!decode_budget) return false;
+            --decode_budget;
+            const InstructionStep step=decode(original.data(),window);
+            if (!step.length || step.length>window) return false;
+            for (std::size_t i=0;i<step.length;++i) if (boundaries[site-part.begin+i]) return false;
+            std::fill_n(boundaries.begin()+(site-part.begin),step.length,2);
+            mark=1;
+            if (step.branch) {
+                std::uint64_t next{};
+                if (!add(static_cast<std::uint64_t>(site)+step.length,step.relative,next)) return false;
+                if (next>=part.begin && next<part.end) pending.push_back(static_cast<std::uint32_t>(next));
+            }
+            if (!step.fallthrough) break;
+            site+=static_cast<std::uint32_t>(step.length);
+        }
+    }
+    const auto start=(std::max)(floor,changed>=interior_span_limit-1 ? changed-static_cast<std::uint32_t>(interior_span_limit-1) : 0);
+    for (auto site=(std::max)(part.begin,start);site<=changed;++site) {
+        if (boundaries[site-part.begin]!=1) continue;
+        const auto window=(std::min)(original.size(),static_cast<std::size_t>(part.end-site));
+        if (!file(base+site,original.data(),window)) return false;
+        if (!live(base+site,patched.data(),window)) return false;
+        if (transfer_at(base,image_size,site,changed,original.data(),patched.data(),window,live,decode,executable,out)) return true;
+    }
+    out={};
+    return false;
+}
+struct CodeSection { std::uint32_t rva{}; std::span<const std::uint8_t> bytes; };
+struct ImageCheck { const char* reason{}; std::uint32_t rva{}; std::size_t entries{}, interiors{}, owns{}; };
+// ShroudForge's own code patches (the native main menu's call sites), recorded by the patcher before it writes them:
+// the comparison accepts exactly the recorded replacement over exactly the recorded original bytes, and still
+// compares every other byte. Like an interior jump, this is identity only: admit() refuses the holding function.
+constexpr std::size_t own_patch_limit = 16;
+constexpr std::size_t own_patch_bytes = 16;
+struct OwnPatch { std::uint32_t rva{}, size{}; std::array<std::uint8_t,own_patch_bytes> original{}, replacement{}; };
+class OwnPatchRegistry {
+    std::mutex mutex;
+    std::vector<OwnPatch> patches;
+    bool record(const OwnPatch& patch) {
+        if (!patch.size || patch.size>own_patch_bytes || patch.rva>UINT32_MAX-patch.size) return false;
+        for (auto& recorded:patches) {
+            if (recorded.rva!=patch.rva && patch.rva<recorded.rva+recorded.size && recorded.rva<patch.rva+patch.size) return false;
+        }
+        for (auto& recorded:patches) if (recorded.rva==patch.rva) {recorded=patch;return true;}
+        if (patches.size()>=own_patch_limit) return false;
+        patches.push_back(patch); return true;
+    }
+public:
+    bool Record(const OwnPatch& patch) {
+        std::lock_guard lock(mutex);
+        return record(patch);
+    }
+    void Forget(std::uint32_t rva) {
+        std::lock_guard lock(mutex);
+        std::erase_if(patches,[&](const OwnPatch& patch){return patch.rva==rva;});
+    }
+    template<class Write> bool Apply(const OwnPatch& patch,Write write) {
+        std::lock_guard lock(mutex);
+        auto previous=patches;
+        if (!record(patch)) return false;
+        try {
+            if (write()) return true;
+        } catch (...) { patches=std::move(previous); throw; }
+        patches=std::move(previous); return false;
+    }
+    template<class Write> bool Restore(std::uint32_t rva,Write write) {
+        std::lock_guard lock(mutex);
+        if (!write()) return false;
+        std::erase_if(patches,[&](const OwnPatch& patch){return patch.rva==rva;});
+        return true;
+    }
+    template<class Compare> auto WithPatches(Compare compare) {
+        std::lock_guard lock(mutex);
+        return compare(std::span<const OwnPatch>(patches));
+    }
+};
+// The loaded executable sections against the file's, once at first use: every byte equal, or inside an entry detour
+// admitted by `classify` (admit() of the owning procedure), or inside an interior jump (above).
+// `loaded` reads the loaded image by RVA; `file` and `live` read by address, as for admit().
+template<class Loaded, class Classify, class Read, class Decode, class Executable>
+ImageCheck compare_image(std::uint64_t base, std::uint32_t image_size, std::span<const CodeSection> sections,
+    const std::map<std::uint32_t,std::uint32_t>& owners, const std::map<std::uint32_t,std::vector<Range>>& procedures,
+    Loaded loaded, Classify classify, Read file, Read live, Decode decode, Executable executable,
+    std::span<const OwnPatch> own={}) {
+    if (own.size()>own_patch_limit) return {"own patch count bound",0};
+    std::array<std::uint8_t,4096> current{};
+    std::set<std::uint32_t> entries;
+    std::map<std::uint32_t,std::size_t> per_function;
+    std::size_t interiors{}, owns{}, decode_budget=boundary_decode_limit;
+    for (const auto& section:sections) {
+        std::size_t offset{};
+        auto floor=section.rva;
+        while (offset<section.bytes.size()) {
+            const auto n=(std::min)(current.size(),section.bytes.size()-offset);
+            const auto rva=section.rva+static_cast<std::uint32_t>(offset);
+            if (!loaded(rva,current.data(),n)) return {"unreadable loaded code",rva};
+            const auto* original=section.bytes.data()+offset;
+            if (!std::memcmp(original,current.data(),n)) {offset+=n;continue;}
+            std::size_t changed{};
+            while (changed<n && original[changed]==current[changed]) ++changed;
+            const auto at=rva+static_cast<std::uint32_t>(changed);
+            const auto mine=std::find_if(own.begin(),own.end(),[&](const OwnPatch& p) { return p.rva<=at && at-p.rva<p.size; });
+            if (mine!=own.end()) {
+                std::array<std::uint8_t,own_patch_bytes> before{}, after{};
+                if (mine->size>own_patch_bytes || mine->rva<floor || !file(base+mine->rva,before.data(),mine->size) ||
+                    !loaded(mine->rva,after.data(),mine->size) || std::memcmp(before.data(),mine->original.data(),mine->size) ||
+                    std::memcmp(after.data(),mine->replacement.data(),mine->size))
+                    return {"ShroudForge's own code patch differs from its record",mine->rva};
+                ++owns;
+                offset=mine->rva+mine->size-section.rva;
+                floor=mine->rva+mine->size;
+                continue;
+            }
+            const auto owner=owners.upper_bound(at);
+            if (owner==owners.begin()) return {"code outside every function differs from the file",at};
+            const auto root=std::prev(owner)->second;
+            Detour detour;
+            if (classify(root,detour)==Admission::detour && at>=detour.rva && at-detour.rva<detour.span) {
+                entries.insert(detour.rva);
+                if (entries.size()>function_limit) return {"entry detour count bound",root};
+                offset=detour.rva+detour.span-section.rva;
+                floor=detour.rva+detour.span;
+                continue;
+            }
+            const auto found=procedures.find(root);
+            const Range* part{};
+            if (found!=procedures.end() && bounded(found->second,image_size))
+                for (const auto& r:found->second) if (r.begin<=at && at<r.end) part=&r;
+            Interior jump;
+            if (!part || !interior(base,image_size,*part,floor,at,file,live,decode,executable,jump,decode_budget))
+                return {decode_budget ? "function differs from the file other than by an entry detour or an interior jump" :
+                    "interior instruction decode budget",root};
+            if (++per_function[root]>interior_function_limit) return {"interior jump count bound in one function",root};
+            if (++interiors>interior_image_limit) return {"interior jump count bound",root};
+            offset=jump.rva+jump.span-section.rva;
+            floor=jump.rva+jump.span;
+        }
+    }
+    return {nullptr,0,entries.size(),interiors,owns};
 }
 inline bool selectable(Admission a) { return a == Admission::live; }
 }
