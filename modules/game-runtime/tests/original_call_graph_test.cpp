@@ -57,7 +57,11 @@ __declspec(noinline) unsigned mid_hook_fixture(unsigned value) {
     volatile auto third = leaf_b(second + 7u);
     return first + second * 5u + third;
 }
-unsigned (*volatile const patch_fixtures[])(unsigned) = {detour_fixture, mid_hook_fixture};
+__declspec(noinline) unsigned call_site_fixture(unsigned value) {
+    volatile auto first = leaf_a(value + 3u);
+    return first ^ 0x77u;
+}
+unsigned (*volatile const patch_fixtures[])(unsigned) = {detour_fixture, mid_hook_fixture, call_site_fixture};
 
 struct NativeDependency { const char* name; std::uint64_t size; };
 struct NativeDescriptor {
@@ -301,7 +305,19 @@ void check_patched_image() {
     const auto site_span = whole_instructions(site, 5);
     check(site_span >= 5 && site + site_span <= im.base + found->second.front().end);
     mid_hook = prepare_patch(site, kiln_jump(site, site_span, address(stub) + 16));
-    std::vector<Patch> patches{prepare_patch(entry, kiln_jump(entry, entry_span, address(stub))), mid_hook};
+    // ShroudForge's own main-menu kind of patch: one E8 call site redirected to a near thunk, recorded first.
+    const auto caller = code_address(call_site_fixture);
+    auto call = caller;
+    while (*reinterpret_cast<const std::uint8_t*>(call) != 0xe8 || whole_instructions(call, 1) != 5) {
+        const auto step = whole_instructions(call, 1);
+        check(step != 0 && call - caller < 64);
+        call += step;
+    }
+    auto redirected = kiln_jump(call, 5, address(stub) + 32);
+    redirected[0] = 0xe8;
+    const auto own = prepare_patch(call, redirected);
+    check(OriginalCode::RecordOwnPatch(own.at, own.original.data(), own.bytes.data(), own.bytes.size()));
+    std::vector<Patch> patches{prepare_patch(entry, kiln_jump(entry, entry_span, address(stub))), mid_hook, own};
     for (const auto& patch : patches) write_code(patch.at, patch.bytes.data(), patch.bytes.size());
     OriginalCode::Procedure code;
     bool foreign{};
@@ -310,6 +326,7 @@ void check_patched_image() {
     check(OriginalCode::file_image().usable.load());
     check(calls(code, code_address(leaf_a)) && calls(code, code_address(leaf_b)));
     for (auto patch = patches.rbegin(); patch != patches.rend(); ++patch) write_code(patch->at, patch->original.data(), patch->original.size());
+    OriginalCode::ForgetOwnPatch(own.at);
 }
 
 nlohmann::json failure_details(std::uintptr_t entry) {

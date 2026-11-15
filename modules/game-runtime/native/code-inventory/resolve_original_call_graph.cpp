@@ -9,6 +9,7 @@
 #include <set>
 #include <atomic>
 #include <cstdio>
+#include <mutex>
 
 namespace OriginalCode {
 namespace {
@@ -124,6 +125,9 @@ void file_diagnostic(const char* reason) {
     std::snprintf(message,sizeof(message),"ShroudForge original call graph: executable file refused: %s; live-only resolution\n",reason);
     file_log('W',message);
 }
+// ShroudForge's own code patches, recorded by the patcher (RecordOwnPatch) before it writes them.
+std::mutex own_patch_mutex;
+std::vector<OriginalFile::OwnPatch> own_patches;
 // A detour's target (a trampoline, a hook stub, another module's code), not the game image's own code.
 bool detour_target(std::uint64_t at) {
     MEMORY_BASIC_INFORMATION page{};
@@ -172,8 +176,9 @@ struct FileImage {
     }
     // First-use resolution before the caller acquires a Scene gate; never repeated by cached validation.
     // No sparse SizeOfImage allocation.
-    // Identity only (original_file_policy.h compare_image): entry detours and interior jumps are admitted here,
-    // but Classify still refuses to read any function holding an interior jump through the file.
+    // Identity only (original_file_policy.h compare_image): entry detours, interior jumps and ShroudForge's own
+    // recorded patches are admitted here, but Classify still refuses to read any function holding an interior jump
+    // or an own patch through the file.
     bool CompareImage() const {
         const auto& im=image();
         std::vector<OriginalFile::CodeSection> code;
@@ -184,18 +189,21 @@ struct FileImage {
         Reader live=[](std::uint64_t at,void* out,std::size_t size) {
             return copy(out,reinterpret_cast<const void*>(static_cast<std::uintptr_t>(at)),size);
         };
+        std::vector<OriginalFile::OwnPatch> own;
+        { std::lock_guard lock(own_patch_mutex); own=own_patches; }
         const auto result=OriginalFile::compare_image(im.base,im.size,code,im.range_owners,im.procedures,
             [&](std::uint32_t rva,void* out,std::size_t size){return im.Read(rva,out,size);},
             [&](std::uint32_t entry,OriginalFile::Detour& record){return Classify(entry,record);},
-            file,live,instruction_length,detour_target);
+            file,live,instruction_length,detour_target,own);
         char message[256];
         if (result.reason) {
             std::snprintf(message,sizeof(message),"%s (RVA 0x%08x)",result.reason,result.rva);
             Refuse(message);return false;
         }
         std::snprintf(message,sizeof(message),"ShroudForge original call graph: executable file accepted (load delta 0x%llx) "
-            "beside %zu entry detour(s) and %zu interior jump(s); a function holding an interior jump is never read "
-            "through it\n",static_cast<unsigned long long>(delta),result.entries,result.interiors);
+            "beside %zu entry detour(s), %zu interior jump(s) and %zu own patch(es); a function holding an interior "
+            "jump or an own patch is never read through it\n",static_cast<unsigned long long>(delta),result.entries,
+            result.interiors,result.owns);
         file_log('I',message);
         return true;
     }
@@ -639,6 +647,34 @@ bool DetoursUnchanged(const std::vector<OriginalFile::Detour>& evidence) {
         }
         return file.usable.load();
     } catch (...) { return false; }
+}
+
+bool RecordOwnPatch(std::uintptr_t address, const std::uint8_t* original, const std::uint8_t* replacement, std::size_t size) {
+    try {
+        const auto& im=image();
+        if (!original || !replacement || !size || size>OriginalFile::own_patch_bytes || !im.size || address<im.base ||
+            address-im.base>=im.size || size>im.size-(address-im.base)) return false;
+        OriginalFile::OwnPatch patch;
+        patch.rva=static_cast<std::uint32_t>(address-im.base);patch.size=static_cast<std::uint32_t>(size);
+        std::copy_n(original,size,patch.original.begin());std::copy_n(replacement,size,patch.replacement.begin());
+        std::lock_guard lock(own_patch_mutex);
+        for (auto& recorded:own_patches) {
+            if (recorded.rva==patch.rva) {recorded=patch;return true;}
+            if (patch.rva<recorded.rva+recorded.size && recorded.rva<patch.rva+patch.size) return false;
+        }
+        if (own_patches.size()>=OriginalFile::own_patch_limit) return false;
+        own_patches.push_back(patch);
+        return true;
+    } catch (...) { return false; }
+}
+
+void ForgetOwnPatch(std::uintptr_t address) {
+    try {
+        const auto& im=image();
+        if (address<im.base) return;
+        std::lock_guard lock(own_patch_mutex);
+        std::erase_if(own_patches,[&](const OriginalFile::OwnPatch& patch) { return patch.rva==address-im.base; });
+    } catch (...) {}
 }
 
 bool ReadProcedure(std::uintptr_t entry, Procedure& output) { return read_procedure(entry, output, nullptr); }

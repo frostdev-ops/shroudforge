@@ -293,9 +293,10 @@ bool restore_calls() {
     for (auto iterator = installed.rbegin(); iterator != installed.rend(); ++iterator) {
         if (!iterator->call.address) continue;
         if (EngineHooks::ReplaceExecutableBytes(iterator->call.address,
-                iterator->replacement.data(), iterator->call.original.data(), iterator->call.original.size()))
+                iterator->replacement.data(), iterator->call.original.data(), iterator->call.original.size())) {
+            OriginalCode::ForgetOwnPatch(iterator->call.address);
             iterator->call.address = 0;
-        else restored = false;
+        } else restored = false;
     }
     std::erase_if(installed, [](const InstalledCall& call) { return !call.call.address; });
     return restored;
@@ -376,8 +377,12 @@ void Initialize() noexcept {
         original_entry.store(reinterpret_cast<DrawEntry>(binding.original_entry), std::memory_order_release);
         bool published = false;
         for (const auto& call : prepared) {
+            // Recorded first, so the executable-file check never meets this call site unrecorded.
+            OriginalCode::RecordOwnPatch(call.call.address, call.call.original.data(), call.replacement.data(),
+                call.replacement.size());
             if (!EngineHooks::ReplaceExecutableBytes(call.call.address, call.call.original.data(),
                     call.replacement.data(), call.replacement.size())) {
+                OriginalCode::ForgetOwnPatch(call.call.address);
                 restore_calls();
                 if (!published) VirtualFree(allocation, 0, MEM_RELEASE);
                 reason = "menu-call-installation-rejected"; return;

@@ -278,5 +278,60 @@ int main() {
         changed=memory; ++changed[0x1010]; check(!compare(changed),"relocated image: a relocated field holding another value refused");
         check(!compare(disk),"relocated image: relocations the loader did not apply refused");
     }
+    // ShroudForge's own code patches (the native main menu's call sites): accepted exactly as recorded, nothing else.
+    {
+        constexpr std::uint64_t base=0x140000000, thunk=base+0x10000000;
+        constexpr std::uint32_t size=0x4000, text=0x1000, text_size=0x400, site=0x1030, other=0x1230;
+        std::vector<std::uint8_t> disk(size,0xcc);
+        auto fill=[&](std::uint32_t begin,std::uint32_t end) { for (auto at=begin;at+3<=end;at+=3) { disk[at]=0x55; disk[at+1]=0x03; disk[at+2]=0x04; } };
+        fill(0x1000,0x1100); fill(0x1200,0x1300);
+        // An E8 call at an instruction boundary of each function (0x30 = 16 instructions in).
+        auto call=[](std::uint64_t from,std::uint64_t to) {
+            std::array<std::uint8_t,own_patch_bytes> bytes{}; bytes[0]=0xe8;
+            const auto relative=static_cast<std::int32_t>(static_cast<std::int64_t>(to-(from+5))); std::memcpy(bytes.data()+1,&relative,4);
+            return bytes;
+        };
+        const auto original_call=call(base+site,base+0x1200), menu_call=call(base+site,thunk);
+        std::memcpy(disk.data()+site,original_call.data(),5); std::memcpy(disk.data()+other,call(base+other,base+0x1000).data(),5);
+        std::map<std::uint32_t,std::uint32_t> owners{{0x1000,0x1000},{0x1200,0x1200}};
+        std::map<std::uint32_t,std::vector<Range>> procedures{{0x1000,{{0x1000,0x1100}}},{0x1200,{{0x1200,0x1300}}}};
+        auto decode=[](const std::uint8_t* p,std::size_t n) -> std::size_t {
+            const std::size_t length=!n?0:*p==0x55?3:*p==0xe8||*p==0xe9?5:1; return length<=n?length:0; };
+        auto memory=disk;
+        using Reader=std::function<bool(std::uint64_t,void*,std::size_t)>;
+        Reader file=[&](std::uint64_t at,void* p,std::size_t n) { if (at<base||at-base>size||n>size-(at-base)) return false; std::memcpy(p,disk.data()+(at-base),n); return true; };
+        Reader live=[&](std::uint64_t at,void* p,std::size_t n) { if (at<base||at-base>size||n>size-(at-base)) return false; std::memcpy(p,memory.data()+(at-base),n); return true; };
+        auto executable=[](std::uint64_t at) { return at>=thunk && at<thunk+0x1000; };
+        std::vector<OwnPatch> own;
+        auto classify=[&](std::uint32_t root,Detour& d) { return admit(base,root,procedures.at(root),file,live,decode,executable,d); };
+        auto compare=[&] {
+            const std::array<CodeSection,1> code{{{text,std::span<const std::uint8_t>(disk.data()+text,text_size)}}};
+            return compare_image(base,size,code,owners,procedures,[&](std::uint32_t rva,void* p,std::size_t n){return live(base+rva,p,n);},
+                classify,file,live,decode,executable,own);
+        };
+        auto record=[&](std::uint32_t rva,const std::array<std::uint8_t,own_patch_bytes>& before,const std::array<std::uint8_t,own_patch_bytes>& after,std::uint32_t n) {
+            OwnPatch patch; patch.rva=rva; patch.size=n; patch.original=before; patch.replacement=after; own.push_back(patch);
+        };
+        Detour d;
+        std::memcpy(memory.data()+site,menu_call.data(),5);
+        check(compare().reason!=nullptr,"own patch: an unregistered changed E8 refused");
+        record(site,original_call,menu_call,5);
+        auto r=compare(); check(!r.reason && r.owns==1,"own patch: the main menu's recorded call site accepted");
+        check(classify(0x1000,d)==Admission::refuse,"own patch: the function holding it is never read through the file");
+        memory[site+5]^=1; check(compare().reason!=nullptr,"own patch: a byte changed right after it refused");
+        memory[site+5]^=1; memory[0x1250]^=1; check(compare().reason!=nullptr,"own patch: a change elsewhere still refused");
+        memory[0x1250]^=1;
+        own[0].replacement[2]^=1; check(compare().reason!=nullptr,"own patch: loaded bytes other than the recorded replacement refused");
+        own[0].replacement[2]^=1; own[0].original[2]^=1; check(compare().reason!=nullptr,"own patch: file bytes other than the recorded original refused");
+        own[0].original[2]^=1; own[0].size=own_patch_bytes+1; check(compare().reason!=nullptr,"own patch: record over the size bound refused");
+        own[0].size=5;
+        std::memcpy(memory.data()+other,call(base+other,thunk).data(),5);
+        check(compare().reason!=nullptr,"own patch: a second, unrecorded call site refused");
+        memory=disk; check(!compare().reason && compare().owns==0,"own patch: recorded but not written (restored) is fine");
+        std::memcpy(memory.data()+site,menu_call.data(),5);
+        memory[0x1200]=0xe9; const auto hop=static_cast<std::int32_t>(static_cast<std::int64_t>(thunk+0x40-(base+0x1205))); std::memcpy(memory.data()+0x1201,&hop,4);
+        memory[0x1205]=0x90;
+        r=compare(); check(!r.reason && r.owns==1 && r.entries==1,"own patch: beside an entry detour elsewhere");
+    }
     std::printf("%d checks, %d failures\n",checks,failures);return failures?1:0;
 }

@@ -281,18 +281,26 @@ bool interior(std::uint64_t base, std::uint32_t image_size, Range part, std::uin
     return false;
 }
 struct CodeSection { std::uint32_t rva{}; std::span<const std::uint8_t> bytes; };
-struct ImageCheck { const char* reason{}; std::uint32_t rva{}; std::size_t entries{}, interiors{}; };
+struct ImageCheck { const char* reason{}; std::uint32_t rva{}; std::size_t entries{}, interiors{}, owns{}; };
+// ShroudForge's own code patches (the native main menu's call sites), recorded by the patcher before it writes them:
+// the comparison accepts exactly the recorded replacement over exactly the recorded original bytes, and still
+// compares every other byte. Like an interior jump, this is identity only: admit() refuses the holding function.
+constexpr std::size_t own_patch_limit = 16;
+constexpr std::size_t own_patch_bytes = 16;
+struct OwnPatch { std::uint32_t rva{}, size{}; std::array<std::uint8_t,own_patch_bytes> original{}, replacement{}; };
 // The loaded executable sections against the file's, once at first use: every byte equal, or inside an entry detour
 // admitted by `classify` (admit() of the owning procedure), or inside an interior jump (above).
 // `loaded` reads the loaded image by RVA; `file` and `live` read by address, as for admit().
 template<class Loaded, class Classify, class Read, class Decode, class Executable>
 ImageCheck compare_image(std::uint64_t base, std::uint32_t image_size, std::span<const CodeSection> sections,
     const std::map<std::uint32_t,std::uint32_t>& owners, const std::map<std::uint32_t,std::vector<Range>>& procedures,
-    Loaded loaded, Classify classify, Read file, Read live, Decode decode, Executable executable) {
+    Loaded loaded, Classify classify, Read file, Read live, Decode decode, Executable executable,
+    std::span<const OwnPatch> own={}) {
+    if (own.size()>own_patch_limit) return {"own patch count bound",0};
     std::array<std::uint8_t,4096> current{};
     std::set<std::uint32_t> entries;
     std::map<std::uint32_t,std::size_t> per_function;
-    std::size_t interiors{};
+    std::size_t interiors{}, owns{};
     for (const auto& section:sections) {
         std::size_t offset{};
         auto floor=section.rva;
@@ -305,6 +313,18 @@ ImageCheck compare_image(std::uint64_t base, std::uint32_t image_size, std::span
             std::size_t changed{};
             while (changed<n && original[changed]==current[changed]) ++changed;
             const auto at=rva+static_cast<std::uint32_t>(changed);
+            const auto mine=std::find_if(own.begin(),own.end(),[&](const OwnPatch& p) { return p.rva<=at && at-p.rva<p.size; });
+            if (mine!=own.end()) {
+                std::array<std::uint8_t,own_patch_bytes> before{}, after{};
+                if (mine->size>own_patch_bytes || mine->rva<floor || !file(base+mine->rva,before.data(),mine->size) ||
+                    !loaded(mine->rva,after.data(),mine->size) || std::memcmp(before.data(),mine->original.data(),mine->size) ||
+                    std::memcmp(after.data(),mine->replacement.data(),mine->size))
+                    return {"ShroudForge's own code patch differs from its record",mine->rva};
+                ++owns;
+                offset=mine->rva+mine->size-section.rva;
+                floor=mine->rva+mine->size;
+                continue;
+            }
             const auto owner=owners.upper_bound(at);
             if (owner==owners.begin()) return {"code outside every function differs from the file",at};
             const auto root=std::prev(owner)->second;
@@ -329,7 +349,7 @@ ImageCheck compare_image(std::uint64_t base, std::uint32_t image_size, std::span
             floor=jump.rva+jump.span;
         }
     }
-    return {nullptr,0,entries.size(),interiors};
+    return {nullptr,0,entries.size(),interiors,owns};
 }
 inline bool selectable(Admission a) { return a == Admission::live; }
 }

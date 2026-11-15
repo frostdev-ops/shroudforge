@@ -45,6 +45,12 @@ bool AppendEvidence(const Procedure& procedure, CodeEvidence& output);
 bool EvidenceUnchanged(const CodeEvidence& evidence);
 // Exact entry bytes, span, target and indirect cell are rechecked against loaded memory.
 bool DetoursUnchanged(const std::vector<OriginalFile::Detour>& evidence);
+// ShroudForge's own code patches (the native main menu's call sites). The executable-file check accepts exactly the
+// recorded replacement over exactly the recorded original bytes and still compares every other byte; a function
+// holding one is never read through the file. Record before writing the bytes, forget after restoring them.
+// At most OriginalFile::own_patch_limit patches of OriginalFile::own_patch_bytes bytes, inside the game image.
+bool RecordOwnPatch(std::uintptr_t address, const std::uint8_t* original, const std::uint8_t* replacement, std::size_t size);
+void ForgetOwnPatch(std::uintptr_t address);
 
 // Complete chained PE unwind ranges, or a bounded call-free leaf CFG. Never
 // treats E8 bytes inside operands as calls and never scans for byte signatures.
