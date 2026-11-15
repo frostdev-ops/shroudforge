@@ -3,9 +3,30 @@
 #include <functional>
 #include <map>
 #include <string>
+#include <Zydis/Zydis.h>
+#include <atomic>
+#include <chrono>
+#include <future>
+#include <thread>
 using namespace OriginalFile;
 int checks{}, failures{};
 void check(bool ok, const char* name) { ++checks; if(!ok) { ++failures; std::printf("FAIL %s\n",name); } }
+InstructionStep real_decode(const std::uint8_t* p,std::size_t n) {
+    ZydisDecoder decoder;
+    ZydisDecoderInit(&decoder,ZYDIS_MACHINE_MODE_LONG_64,ZYDIS_STACK_WIDTH_64);
+    ZydisDecodedInstruction instruction{};
+    std::array<ZydisDecodedOperand,ZYDIS_MAX_OPERAND_COUNT> operands{};
+    if (!ZYAN_SUCCESS(ZydisDecoderDecodeFull(&decoder,p,n,&instruction,operands.data()))) return {0};
+    InstructionStep step{instruction.length};
+    const auto category=instruction.meta.category;
+    step.fallthrough=category!=ZYDIS_CATEGORY_UNCOND_BR && category!=ZYDIS_CATEGORY_RET &&
+        category!=ZYDIS_CATEGORY_INTERRUPT && instruction.mnemonic!=ZYDIS_MNEMONIC_UD2;
+    if ((category==ZYDIS_CATEGORY_UNCOND_BR || category==ZYDIS_CATEGORY_COND_BR) &&
+        operands[0].type==ZYDIS_OPERAND_TYPE_IMMEDIATE && operands[0].imm.is_relative) {
+        step.branch=true; step.relative=operands[0].imm.value.s;
+    }
+    return step;
+}
 int main() {
     Layout a; a.preferred=a.loaded=0x100000; a.size=4096; a.machine=0x8664; a.count=1;
     a.timestamp=1; a.checksum=2; a.sections.push_back({{},0,256,512,256,0x60000020});
@@ -13,6 +34,8 @@ int main() {
     auto b=a; b.sections[0].raw=1024; check(identity(a,b),"changed section layout");
     b=a; ++b.timestamp; check(identity(a,b),"changed timestamp");
     b=a; ++b.checksum; check(identity(a,b),"changed checksum");
+    b=a; ++b.relocation_rva; check(identity(a,b),"changed relocation directory RVA");
+    b=a; ++b.relocation_size; check(identity(a,b),"changed relocation directory size");
     b=a; ++b.machine; check(identity(a,b),"changed machine");
     b=a; ++b.count; check(identity(a,b),"changed section count");
     // A relocated (ASLR) image is this file's image when the loaded header names the loaded base (Windows and Wine
@@ -61,6 +84,14 @@ int main() {
     check(run(d)==Admission::detour && d.span==6 && d.target==target,"rip pointer in unchanged function data");
     disk.fill(0x90);disk[0]=disk[3]=disk[6]=disk[9]=disk[12]=0x55;memory=disk;
     check(!selectable(Admission::detour),"detoured helper never selected");
+    check(resolution_admission(true,false,Admission::refuse)==Admission::refuse,
+        "function policy: disabling file reads cannot select an interior-patched function on retry");
+    check(resolution_admission(true,false,Admission::detour)==Admission::refuse,
+        "function policy: disabling file reads cannot select an entry-detoured function on retry");
+    check(resolution_admission(false,false,Admission::refuse)==Admission::live,
+        "function policy: an image that never matched retains standalone live fallback");
+    check(resolution_admission(true,false,Admission::live)==Admission::live,
+        "function policy: unchanged standalone functions remain selectable after a refusal elsewhere");
     std::vector<Range> huge{{0,static_cast<std::uint32_t>(procedure_limit+1)}};
     check(!bounded(huge,static_cast<std::uint32_t>(procedure_limit+1)),"oversized range refused before read/allocation");
     unsigned reads{};
@@ -79,6 +110,15 @@ int main() {
     rel(target);check(run(d)==Admission::detour && d==first,"unchanged detour record");
     memory[5]=0x42;check(run(d)==Admission::refuse,"non-padding overwritten suffix");
     memory=disk; memory[80]=0xe9;check(run(d)==Admission::refuse,"non-entry jump not admitted");
+    rel(0x800000);
+    Reader changing=[&](auto at,void* p,auto n) {
+        const auto ok=live(at,p,n);
+        if (n==64) memory[70]^=1; // Body changes after the full comparison, during the entry reread.
+        return ok;
+    };
+    check(admit(a.loaded,0,ranges,file,changing,decode,[](auto){return true;},d)==Admission::refuse,
+        "entry admission: body changed during the entry reread refused");
+    memory=disk;
     memory=disk;rel(0x800000);
     std::vector<Range> short_range{{0,4}};
     check(admit(a.loaded,0,short_range,file,live,decode,[](auto){return true;},d)==Admission::refuse,"truncated entry");
@@ -225,7 +265,7 @@ int main() {
         block(table,0x1000,{0xa010,0x3040,0x0000}); block(table,0x3000,{0xa008});
         auto relocated=[&](std::vector<std::uint8_t>& image,const std::vector<std::uint8_t>& relocations,std::uint64_t by) {
             const std::array<CodeBytes,1> code{{{text,std::span<std::uint8_t>(image.data()+text,text_size)}}};
-            return relocate(relocations,size,by,code);
+            return relocate(relocations,size,by,code,relocations);
         };
         auto copy=disk;
         check(!relocated(copy,table,delta),"relocation table applied");
@@ -240,6 +280,9 @@ int main() {
         copy=disk; check(relocated(copy,{},delta)!=nullptr,"relocated image without base relocations refused");
         auto corrupt=[&](std::vector<std::uint8_t> bad) { auto image=disk; return relocated(image,bad,delta)!=nullptr; };
         auto bad=table; bad.resize(bad.size()+4); check(corrupt(bad),"truncated block header refused");
+        bad.clear(); block(bad,0x1000,{0x3011});
+        const std::array<CodeBytes,1> code{{{text,std::span<std::uint8_t>(copy.data()+text,text_size)}}};
+        check(relocate(bad,size,delta,code,table)!=nullptr,"relocation table: file-only relocation over a code operand refused");
         bad=table; bad.pop_back(); bad.pop_back(); check(corrupt(bad),"truncated block refused");
         bad=table; bad[4]=6; check(corrupt(bad),"block shorter than its header refused");
         bad.clear(); block(bad,0x1000,{0xa010,0xa018}); bad[4]=11; bad.resize(11);
@@ -277,6 +320,20 @@ int main() {
         auto changed=memory; changed[0x1100]^=1; check(!compare(changed),"relocated image: a byte no relocation explains refused");
         changed=memory; ++changed[0x1010]; check(!compare(changed),"relocated image: a relocated field holding another value refused");
         check(!compare(disk),"relocated image: relocations the loader did not apply refused");
+        // A forged relocation inside a hidden original CALL would fabricate its file-backed call edge.
+        // Original CALL at 1010: E8 20 00 00 00. A file-only HIGHLOW at 1011 adds 0x10000 to its rel32.
+        std::vector<std::uint8_t> hidden(32,0x90);
+        hidden[0]=0xe8; const std::uint32_t original_rel=0x20;
+        std::memcpy(hidden.data()+1,&original_rel,4);
+        std::vector<std::uint8_t> forged, trusted;
+        block(forged,0x1000,{0x3011,0}); block(trusted,0x3000,{0xa008,0});
+        const std::array<CodeBytes,1> hidden_code{{{0x1010,hidden}}};
+        const auto reason=relocate(forged,size,0x10000,hidden_code,trusted);
+        if (!reason) {
+            std::uint32_t changed_rel{}; std::memcpy(&changed_rel,hidden.data()+1,4);
+            std::printf("forged relocation changed original CALL rel32: 0x%x -> 0x%x\n",original_rel,changed_rel);
+        }
+        check(reason!=nullptr,"relocation table: a forged CALL relocation hidden by an entry detour refused");
     }
     // ShroudForge's own code patches (the native main menu's call sites): accepted exactly as recorded, nothing else.
     {
@@ -332,6 +389,126 @@ int main() {
         memory[0x1200]=0xe9; const auto hop=static_cast<std::int32_t>(static_cast<std::int64_t>(thunk+0x40-(base+0x1205))); std::memcpy(memory.data()+0x1201,&hop,4);
         memory[0x1205]=0x90;
         r=compare(); check(!r.reason && r.owns==1 && r.entries==1,"own patch: beside an entry detour elsewhere");
+        OwnPatchRegistry registry;
+        check(registry.Record(own[0]),"own registry: initial record");
+        auto adjacent=own[0]; adjacent.rva+=8;
+        check(registry.Record(adjacent),"own registry: disjoint record");
+        auto expanded=own[0]; expanded.size=16;
+        check(!registry.Record(expanded),"own registry: expanding a record across another patch refused");
+        registry.Forget(adjacent.rva); registry.Record(own[0]);
+        memory=disk; std::memcpy(memory.data()+site,menu_call.data(),5);
+        std::promise<void> observed, restored;
+        auto begin=observed.get_future(); auto done=restored.get_future();
+        std::atomic<bool> comparing{}, raced{};
+        std::thread restorer([&] {
+            begin.wait();
+            registry.Restore(site,[&] {
+                raced=comparing.load();
+                std::memcpy(memory.data()+site,original_call.data(),5); return true;
+            });
+            restored.set_value();
+        });
+        const auto concurrent=registry.WithPatches([&](auto patches) {
+            comparing=true;
+            bool first=true;
+            const std::array<CodeSection,1> code{{{text,std::span<const std::uint8_t>(disk.data()+text,text_size)}}};
+            auto result=compare_image(base,size,code,owners,procedures,[&](auto rva,void* p,auto n) {
+                const auto ok=live(base+rva,p,n);
+                if (first) {
+                    first=false; observed.set_value();
+                    // Before the fix, restoration completes here and the saved record no longer matches memory.
+                    // With the transaction lock, restoration waits until the comparison has returned.
+                    done.wait_for(std::chrono::milliseconds(100));
+                }
+                return ok;
+            },classify,file,live,decode,executable,patches);
+            comparing=false;
+            return result;
+        });
+        restorer.join();
+        check(!concurrent.reason && !raced,"own registry: restore cannot race the image comparison");
+        check(!registry.Apply(own[0],[]{return false;}),"own registry: a failed install is reported");
+        check(registry.WithPatches([](auto p){return p.empty();}),"own registry: failed install leaves no stale record");
+        check(registry.Apply(own[0],[]{return true;}),"own registry: successful install is recorded");
+        check(!registry.Restore(site,[]{return false;}),"own registry: a failed restore is reported");
+        check(registry.WithPatches([](auto p){return p.size()==1;}),"own registry: failed restore keeps the active record");
+        check(registry.Restore(site,[]{return true;}) && registry.WithPatches([](auto p){return p.empty();}),
+            "own registry: successful restore removes its record");
+    }
+    // Real x86 control flow: unwind extents can contain unreachable bytes and inline data.
+    {
+        constexpr std::uint64_t base=0x10000000, hook=base+0x10000;
+        constexpr std::uint32_t root=0x10, site=root+7;
+        std::vector<std::uint8_t> disk(128,0x90), memory;
+        std::map<std::uint32_t,std::uint32_t> owners{{root,root}};
+        std::map<std::uint32_t,std::vector<Range>> procedures{{root,{{root,0x60}}}};
+        using Reader=std::function<bool(std::uint64_t,void*,std::size_t)>;
+        Reader file=[&](auto at,void* p,auto n) { if(at<base||at-base>disk.size()||n>disk.size()-(at-base))return false; std::memcpy(p,disk.data()+at-base,n);return true; };
+        Reader live=[&](auto at,void* p,auto n) { if(at<base||at-base>memory.size()||n>memory.size()-(at-base))return false; std::memcpy(p,memory.data()+at-base,n);return true; };
+        auto compare=[&] {
+            const std::array<CodeSection,1> code{{{0,disk}}};
+            return compare_image(base,128,code,owners,procedures,
+                [&](auto rva,void* p,auto n){return live(base+rva,p,n);},
+                [&](auto rva,Detour& d){return admit(base,rva,procedures.at(rva),file,live,real_decode,[](auto){return true;},d);},
+                file,live,real_decode,[](auto){return true;});
+        };
+        auto patch=[&](std::uint32_t at) {
+            memory=disk; memory[at]=0xe9;
+            const auto disp=static_cast<std::int32_t>(hook-base-at-5);
+            std::memcpy(memory.data()+at+1,&disp,4);
+        };
+        // EB 01 skips B8; linear decoding starts MOV eax at +2 and invents a boundary at +7.
+        // The executed instruction is actually MOV rax,imm64 at +3, whose immediate includes +7..+11.
+        disk[root]=0xeb; disk[root+1]=1; disk[root+2]=0xb8;
+        disk[root+3]=0x48; disk[root+4]=0xb8; disk[root+13]=0xc3;
+        patch(site);
+        check(compare().reason!=nullptr,"x86 boundary: jump-shaped edit inside a reached MOV immediate refused");
+        // EB 05 skips an invalid instruction byte (D6 in long mode) and reaches the actual hook.
+        disk.assign(128,0x90); disk[root]=0xeb; disk[root+1]=5; disk[root+2]=0xd6; disk[root+20]=0xc3;
+        patch(site);
+        check(!compare().reason,"x86 boundary: real hook reached across skipped invalid bytes accepted");
+        disk.assign(128,0x90); disk[root+64]=0xc3;
+        const auto at=root+16;
+        patch(at); check(!compare().reason,"x86 forms: E9 over five whole NOPs accepted");
+        memory[at+5]=0xcc; check(compare().reason!=nullptr,"x86 forms: extra filler beyond the minimum span refused");
+        memory=disk; memory[at]=0xff; memory[at+1]=0x25;
+        std::fill(memory.begin()+at+2,memory.begin()+at+6,0);
+        std::memcpy(memory.data()+at+6,&hook,8);
+        check(!compare().reason,"x86 forms: FF 25 with adjacent absolute target accepted");
+        std::memcpy(disk.data()+112,&hook,8); memory=disk;
+        memory[at]=0xff; memory[at+1]=0x25;
+        const std::int32_t cell_disp=112-at-6;
+        std::memcpy(memory.data()+at+2,&cell_disp,4);
+        check(!compare().reason,"x86 forms: FF 25 through an unchanged outside cell accepted");
+        const std::int32_t overlap=-1;
+        std::memcpy(memory.data()+at+2,&overlap,4);
+        check(compare().reason!=nullptr,"x86 forms: pointer cell overlapping the transfer refused");
+    }
+    // A few maximum-sized NOP functions must not cause millions of decoder/reader calls for every hook.
+    {
+        constexpr std::uint64_t base=0x10000000;
+        constexpr std::uint32_t length=procedure_limit, functions=5;
+        std::vector<std::uint8_t> disk(length*functions,0x90), memory=disk;
+        std::map<std::uint32_t,std::uint32_t> owners;
+        std::map<std::uint32_t,std::vector<Range>> procedures;
+        for (std::uint32_t i=0;i<functions;++i) {
+            const auto root=i*length;
+            owners[root]=root; procedures[root]={{root,root+length}};
+            memory[root+length-32]=0xe9; const std::int32_t disp=0x40000000;
+            std::memcpy(memory.data()+root+length-31,&disp,4);
+        }
+        using Reader=std::function<bool(std::uint64_t,void*,std::size_t)>;
+        Reader file=[&](auto at,void* p,auto n){if(at<base||at-base>disk.size()||n>disk.size()-(at-base))return false;std::memcpy(p,disk.data()+at-base,n);return true;};
+        Reader live=[&](auto at,void* p,auto n){if(at<base||at-base>memory.size()||n>memory.size()-(at-base))return false;std::memcpy(p,memory.data()+at-base,n);return true;};
+        std::size_t decoded{};
+        auto decode=[&](const std::uint8_t*,std::size_t n)->std::size_t {++decoded;return n?1:0;};
+        const std::array<CodeSection,1> code{{{0,disk}}};
+        compare_image(base,static_cast<std::uint32_t>(disk.size()),code,owners,procedures,
+            [&](auto rva,void* p,auto n){return live(base+rva,p,n);},
+            [&](auto root,Detour& d){return admit(base,root,procedures.at(root),file,live,decode,[](auto){return true;},d);},
+            file,live,decode,[](auto){return true;});
+        check(decoded<=boundary_decode_limit+interior_image_limit*interior_span_limit,
+            "image work budget: repeated boundary walks stop within the image decoder budget");
     }
     std::printf("%d checks, %d failures\n",checks,failures);return failures?1:0;
 }

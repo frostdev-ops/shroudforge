@@ -512,14 +512,31 @@ int wmain(int argc,wchar_t** argv) {
     check(!OriginalCode::FindUniqueReachable(code_address(directed_root),9,leaf_match,selected));
     check(!OriginalCode::FindUniqueReachable(0,2,leaf_match,selected));
     check(!OriginalCode::FindUniqueReachable(code_address(directed_root),2,{},selected));
-    // Last, as it refuses the file for the rest of the process: a function holding a mid hook is never read
-    // through the file, even though the image check admitted the hook.
-    write_code(mid_hook.at, mid_hook.bytes.data(), mid_hook.bytes.size());
+    // Last: an indirect mid hook can still be decoded live as a terminal edge. Refusing it once must never
+    // turn the next read into live-only admission, or a depth-zero walk can select the patched function.
+    auto* retry_stub=allocate_near(base,nt->OptionalHeader.SizeOfImage);
+    check(retry_stub!=nullptr);
+    const auto retry_span=whole_instructions(mid_hook.at,14);
+    const auto& retry_parts=OriginalCode::image().procedures.at(static_cast<std::uint32_t>(code_address(mid_hook_fixture)-base));
+    check(retry_span>=14 && retry_span<=32 && mid_hook.at+retry_span<=base+retry_parts.front().end);
+    std::vector<std::uint8_t> retry_bytes(retry_span,0x90);
+    retry_bytes[0]=0xff; retry_bytes[1]=0x25;
+    std::fill(retry_bytes.begin()+2,retry_bytes.begin()+6,0);
+    const auto retry_target=address(retry_stub);
+    std::memcpy(retry_bytes.data()+6,&retry_target,8);
+    const auto retry_patch=prepare_patch(mid_hook.at,retry_bytes);
+    write_code(retry_patch.at,retry_patch.bytes.data(),retry_patch.bytes.size());
     {
         OriginalCode::Procedure code;
         bool foreign{true};
         check(!OriginalCode::ReadOriginalProcedure(code_address(mid_hook_fixture), code, foreign) && !foreign);
+        check(OriginalCode::ReadProcedure(code_address(mid_hook_fixture),code));
+        check(!OriginalCode::ReadOriginalProcedure(code_address(mid_hook_fixture), code, foreign) && !foreign);
+        selected=0x12345678;
+        check(!OriginalCode::FindUniqueReachable(code_address(mid_hook_fixture),0,[](const auto&){return true;},selected));
+        check(selected==0x12345678);
     }
-    write_code(mid_hook.at, mid_hook.original.data(), mid_hook.original.size());
+    write_code(retry_patch.at,retry_patch.original.data(),retry_patch.original.size());
+    VirtualFree(retry_stub,0,MEM_RELEASE);
     std::printf("original call graph checks passed: %u\n",checks);
 }

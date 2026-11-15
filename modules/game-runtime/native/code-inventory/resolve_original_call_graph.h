@@ -47,10 +47,15 @@ bool EvidenceUnchanged(const CodeEvidence& evidence);
 bool DetoursUnchanged(const std::vector<OriginalFile::Detour>& evidence);
 // ShroudForge's own code patches (the native main menu's call sites). The executable-file check accepts exactly the
 // recorded replacement over exactly the recorded original bytes and still compares every other byte; a function
-// holding one is never read through the file. Record before writing the bytes, forget after restoring them.
+// holding one is never read through the file. These low-level records require externally serialized writes;
+// production patchers use ApplyOwnPatch / RestoreOwnPatch below.
 // At most OriginalFile::own_patch_limit patches of OriginalFile::own_patch_bytes bytes, inside the game image.
 bool RecordOwnPatch(std::uintptr_t address, const std::uint8_t* original, const std::uint8_t* replacement, std::size_t size);
 void ForgetOwnPatch(std::uintptr_t address);
+// Production patchers serialize the record and the actual write/restore with original-code readers.
+bool ApplyOwnPatch(std::uintptr_t address, const std::uint8_t* original, const std::uint8_t* replacement,
+    std::size_t size, const std::function<bool()>& write);
+bool RestoreOwnPatch(std::uintptr_t address, const std::function<bool()>& write);
 
 // Complete chained PE unwind ranges, or a bounded call-free leaf CFG. Never
 // treats E8 bytes inside operands as calls and never scans for byte signatures.
