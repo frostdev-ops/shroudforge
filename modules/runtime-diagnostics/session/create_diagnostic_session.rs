@@ -25,6 +25,8 @@ pub struct Session {
     pub(crate) job_report: Value,
     pub(crate) job_exports: Option<String>,
     pub(crate) job_last_tick: Instant,
+    /// Kiln layer: the last status this session wrote, without `updatedAt`, and when (see publish).
+    pub(super) published: Option<(Value, Instant)>,
 }
 
 impl Session {
@@ -48,6 +50,7 @@ impl Session {
             job_report: Value::Null,
             job_exports: None,
             job_last_tick: now,
+            published: None,
         };
         session.refresh();
         session.publish();

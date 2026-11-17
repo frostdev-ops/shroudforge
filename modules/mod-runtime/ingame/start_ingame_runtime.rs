@@ -125,6 +125,9 @@ impl IngameRuntime {
             configurations,
             observed: Default::default(),
             next_status: std::time::Instant::now(),
+            // publish_status below is this start's first publication.
+            next_status_publication: std::time::Instant::now()
+                + super::update_ingame_runtime::STATUS_PUBLICATION_INTERVAL,
             processed_reload_request: None,
             publish_on_drop: true,
         };

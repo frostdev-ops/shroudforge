@@ -1,6 +1,19 @@
 use super::IngameRuntime;
 use crate::env::AppState;
 
+/// Kiln layer: how often the running runtime republishes its status (state.json "runtime"). Every
+/// publication is a flushed rewrite of the whole state file, so once a second cost the disk the most
+/// of anything ShroudForge does while playing (dev29 inbox 50 item 7). The readers take the status
+/// as current while `updatedAt` (whole seconds) is at most 5 s old: the modloader UI
+/// (`modloader/ui/host/read_configuration_status.rs`) and the player-name lookup
+/// (`player-name/lib.rs`); Kiln's launcher allows 30 s (`kiln-manage/src/shroudforge.rs`). 3 s plus
+/// the rounding of `updatedAt` and a late frame stays inside the 5 s.
+pub(super) const STATUS_PUBLICATION_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(3);
+/// The tightest reader's limit above, for the test below.
+#[cfg(test)]
+const STRICTEST_READER_STALENESS_SECONDS: u64 = 5;
+
 impl IngameRuntime {
     pub fn update(&mut self, delta_seconds: f64) {
         let mut diagnostic_host = super::run_diagnostic_job::RuntimeDiagnosticHost::new(
@@ -41,12 +54,29 @@ impl IngameRuntime {
                 shroudforge_steam_networking::service_shutdown();
             }
             self.refresh_configuration();
-            self.publish_status(true);
-            self.next_status = std::time::Instant::now() + std::time::Duration::from_secs(1);
+            let now = std::time::Instant::now();
+            if now >= self.next_status_publication {
+                self.publish_status(true);
+                self.next_status_publication = now + STATUS_PUBLICATION_INTERVAL;
+            }
+            self.next_status = now + std::time::Duration::from_secs(1);
         }
         crate::env::shroudforge::dispatch_ui_actions(&self.runner.lua, &self.active_mod_ids());
         self.update_mod_callbacks(delta_seconds);
         let state = self.runner.lua.app_data_ref::<AppState>().unwrap();
         state.advance_loaded_resource_indexes();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn status_publication_stays_fresh_for_the_strictest_reader() {
+        // One second for the whole-second rounding of `updatedAt`, one for a late frame.
+        assert!(
+            super::STATUS_PUBLICATION_INTERVAL.as_secs() + 2
+                <= super::STRICTEST_READER_STALENESS_SECONDS
+        );
+        assert!(super::STATUS_PUBLICATION_INTERVAL.as_secs() >= 3);
     }
 }

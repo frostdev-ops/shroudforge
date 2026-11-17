@@ -42,6 +42,7 @@ pub struct IngameRuntime {
     loaded: serde_json::Map<String, serde_json::Value>,
     errors: serde_json::Map<String, serde_json::Value>,
     next_status: std::time::Instant,
+    next_status_publication: std::time::Instant,
     configurations: Vec<(String, std::path::PathBuf, serde_json::Value)>,
     observed: std::collections::HashMap<std::path::PathBuf, String>,
     runner: LuaModRunner,

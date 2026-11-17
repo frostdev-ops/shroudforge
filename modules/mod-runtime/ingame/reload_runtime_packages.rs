@@ -87,6 +87,10 @@ impl IngameRuntime {
         std::mem::swap(&mut self.loaded, &mut replacement.loaded);
         std::mem::swap(&mut self.errors, &mut replacement.errors);
         std::mem::swap(&mut self.next_status, &mut replacement.next_status);
+        std::mem::swap(
+            &mut self.next_status_publication,
+            &mut replacement.next_status_publication,
+        );
         std::mem::swap(&mut self.configurations, &mut replacement.configurations);
         std::mem::swap(&mut self.observed, &mut replacement.observed);
         std::mem::swap(&mut self.runner, &mut replacement.runner);

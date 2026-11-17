@@ -866,3 +866,48 @@ fn python_adapter_imports_arguments_reports_exit_and_cleans_up_after_stop() {
         );
     }
 }
+
+// Kiln layer (dev29 inbox 50 item 7): the status is written when something other than `updatedAt`
+// changed, or when the last write is UNCHANGED_STATUS_REFRESH old, and not on every tick.
+#[test]
+fn unchanged_status_is_written_only_to_stay_fresh() {
+    let root = tempfile::tempdir().unwrap();
+    let mut session = Session::new(root.path());
+    let state = shroudforge_loader_config::paths::state_file(root.path());
+    let mark = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+    let set_mark = || {
+        std::fs::File::options()
+            .write(true)
+            .open(&state)
+            .unwrap()
+            .set_modified(mark)
+            .unwrap()
+    };
+    let modified = || std::fs::metadata(&state).unwrap().modified().unwrap();
+    assert!(status(root.path())["fresh"].as_bool().unwrap());
+
+    set_mark();
+    session.publish();
+    session.publish();
+    assert_eq!(modified(), mark, "nothing but updatedAt changed: no write");
+
+    session.reason = "stopped";
+    session.publish();
+    assert_ne!(modified(), mark, "a changed reason is written at once");
+    assert_eq!(status(root.path())["reason"], "stopped");
+
+    // updatedAt has whole seconds: the same second would be an unchanged section, skipped as such.
+    std::thread::sleep(Duration::from_millis(1100));
+    set_mark();
+    let (content, _) = session.published.clone().unwrap();
+    session.published = Some((
+        content,
+        Instant::now() - crate::publish_diagnostic_status::UNCHANGED_STATUS_REFRESH,
+    ));
+    session.publish();
+    assert_ne!(modified(), mark, "an unchanged status is refreshed before readers call it stale");
+    assert!(
+        crate::publish_diagnostic_status::UNCHANGED_STATUS_REFRESH.as_secs() * 2 <= 65,
+        "status() allows 65 s"
+    );
+}
