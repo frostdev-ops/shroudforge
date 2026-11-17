@@ -38,7 +38,14 @@ pub(super) fn export_pass_needed(
         }))
 }
 
-pub(super) fn already_applied(game_directory: &Path, file_name: &str) -> Result<bool, LoaderError> {
+/// Kiln layer: `export_pass_needed` no longer forces a pass by itself. A match also needs the
+/// record of the last pass (`shroudforge_game_assets::prepared_stamp`): the game files it left, and
+/// with pregame exporters the export folder, unchanged since.
+pub(super) fn already_applied(
+    game_directory: &Path,
+    file_name: &str,
+    export_pass_needed: bool,
+) -> Result<bool, LoaderError> {
     let game_utf8 = game_directory.to_str().ok_or_else(|| {
         LoaderError::Environment(format!(
             "game directory is not valid UTF-8: {}",
@@ -72,8 +79,26 @@ pub(super) fn already_applied(game_directory: &Path, file_name: &str) -> Result<
         shroudforge_api::API_VERSION,
     )
     .map_err(LoaderError::Pregame)?;
-    Ok(shroudforge_package::prepared::matches(
-        game_directory,
-        &fingerprint,
-    ))
+    if !shroudforge_package::prepared::matches(game_directory, &fingerprint) {
+        return Ok(false);
+    }
+    let exports_enabled = shroudforge_loader_config::config::read_loader(game_directory)
+        .map_err(LoaderError::Pregame)?
+        .pointer("/exports/enabled")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let exports = shroudforge_loader_config::paths::export_dir(game_directory);
+    let inputs = shroudforge_game_assets::prepared_stamp::PassInputs {
+        fingerprint: &fingerprint,
+        exports_enabled,
+        exporters: export_pass_needed.then_some(exports.as_path()),
+    };
+    match shroudforge_game_assets::prepared_stamp::current(game_directory, file_name, &inputs) {
+        Ok(()) => Ok(true),
+        Err(reason) => {
+            tracing::info!(target: "shroudforge::startup", target = file_name, %reason,
+                "Startup asset mods are applied again");
+            Ok(false)
+        }
+    }
 }

@@ -43,10 +43,17 @@ pub fn fingerprint(env: &ModEnvironment, server: bool, api: &str) -> Result<Stri
                     .collect::<Result<Vec<_>, _>>()
                     .map_err(|e| e.to_string())?;
                 files.sort_by_key(|entry| entry.path().to_path_buf());
-                for entry in files
-                    .into_iter()
-                    .filter(|entry| entry.file_type().is_file())
-                {
+                // Kiln layer: a package's own log files are not inputs. Native packages write
+                // theirs into the package folder while the game runs, which made every start's
+                // fingerprint new and every start restore and commit all asset mods again.
+                for entry in files.into_iter().filter(|entry| {
+                    entry.file_type().is_file()
+                        && !entry
+                            .file_name()
+                            .to_string_lossy()
+                            .to_ascii_lowercase()
+                            .ends_with(".log")
+                }) {
                     hash.update(
                         entry
                             .path()
