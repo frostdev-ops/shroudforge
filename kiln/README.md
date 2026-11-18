@@ -112,8 +112,10 @@ search.
 
 - Retried: an error raised by a package's entrypoint while the pass runs it (`LuaModRunner::run` names the package,
   `PregameModError`), such as its own `error(...)` or `assert`, a Lua error, a missing `src/mod.lua`.
-- Not retried, upstream's behaviour unchanged: a text with `(os error N)` or access denied (the system or the game's
-  files), and every failure no package raised: the working baseline (create, restore, set aside), staging, the type
+- Not retried, upstream's behaviour unchanged: an I/O error (`std::io::Error`) anywhere in the error's chain, read from
+  the error itself and so in any language and without an OS code too (`PregameModError::io`); a text with
+  `(os error N)` or access denied, for an I/O error the API or the package put into words (the system or the game's
+  files); and every failure no package raised: the working baseline (create, restore, set aside), staging, the type
   model, the commit and publication, a replaced `.kfc`.
 - A second failure: no startup package loads, as before. The record's `error` is the first failure's.
 

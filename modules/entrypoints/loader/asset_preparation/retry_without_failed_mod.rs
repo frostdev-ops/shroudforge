@@ -6,8 +6,9 @@
 //! player all of them. Now a failure raised by one package's own entrypoint (`PregameModError`) runs
 //! the pass once more, from the clean baseline as every pass does, with that package treated as
 //! switched off (and with it the packages that need it). Once only: no loop, no search. A failure of
-//! the system or of the game's files (an `os error`, access denied) is not one package's, and a
-//! failure no package raised (baseline, staging, commit) names none: both keep upstream's behaviour.
+//! the system or of the game's files (an I/O error in the error's chain, whatever its text, or a
+//! text with `os error` or access denied) is not one package's, and a failure no package raised
+//! (baseline, staging, commit) names none: both keep upstream's behaviour.
 //!
 //! The record of the pass (state.json "assets") gets `skipped` (the package and its error, then the
 //! packages left out with it) and, when the second pass failed too, `retryError`. Its `error` stays
@@ -72,9 +73,15 @@ fn one_line(text: &str) -> String {
     line
 }
 
-/// A failure of the system or of the game's files, not of one package: Rust's I/O errors end in
-/// "(os error N)" in every language, and the access-denied texts of Windows, Wine and Unix.
-fn system_failure(message: &str) -> bool {
+/// A failure of the system or of the game's files, not of one package: an I/O error in the error's
+/// chain (`PregameModError::io`, whatever its text says), or, for one the API or the package put into
+/// words, a text with Rust's "(os error N)" (in every language) or an access-denied text of Windows,
+/// Wine or Unix.
+fn system_failure(error: &shroudforge_api::PregameModError) -> bool {
+    error.io || system_failure_text(&error.message)
+}
+
+fn system_failure_text(message: &str) -> bool {
     let lower = message.to_lowercase();
     [
         "(os error",
@@ -94,7 +101,7 @@ pub(super) fn failed_mod(
     server: bool,
 ) -> Option<FailedMod> {
     let error = error?;
-    if system_failure(&error.message) {
+    if system_failure(error) {
         return None;
     }
     let plan = environment.plan(server, shroudforge_api::API_VERSION);
@@ -225,6 +232,14 @@ mod tests {
         );
     }
 
+    fn raised(message: &str, io: bool) -> shroudforge_api::PregameModError {
+        shroudforge_api::PregameModError {
+            mod_id: "wisp".into(),
+            message: message.into(),
+            io,
+        }
+    }
+
     #[test]
     fn failures_of_the_system_or_the_game_files_are_not_one_packages() {
         for message in [
@@ -234,10 +249,13 @@ mod tests {
             "runtime error: Access denied",
             "runtime error: Permission denied",
         ] {
-            assert!(system_failure(message), "{message}");
+            assert!(system_failure(&raised(message, false)), "{message}");
         }
-        assert!(!system_failure(
-            "runtime error: [string \"wisp\"]:719: Missing base localization: keenglish"
-        ));
+        // an I/O error whose text says none of that (a short read of a replaced archive, in any language)
+        assert!(system_failure(&raised("failed to fill whole buffer", true)));
+        assert!(!system_failure(&raised(
+            "runtime error: [string \"wisp\"]:719: Missing base localization: keenglish",
+            false
+        )));
     }
 }
