@@ -134,7 +134,7 @@ again. Log lines (category `startup-assets`, level W; Kiln copies them into kiln
 `ShroudForge: <name> (<id> <version>) failed in the pregame pass (<error>); running the pass once more without it`, then
 `...; started the game without it, the other N mods loaded` or `ShroudForge: the pregame pass failed again without
 <name> (<error>); the game starts without the mods of the pregame pass`. The in-game Modloader page shows the package
-`failed` and the pass `partial`. Tests: `cargo xwin test -p shroudforge-modloader -p shroudforge-package -p
+`failed`, the packages left out with it `blocked`, and the pass `partial`. Tests: `cargo xwin test -p shroudforge-modloader -p shroudforge-package -p
 shroudforge-modloader-ui --target x86_64-pc-windows-msvc` under Wine (`kiln_retry_tests.rs` runs whole passes on a
 small archive pair with made-up packages).
 

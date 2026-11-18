@@ -399,16 +399,19 @@ pub fn configuration(root: &Path, server: bool, api: &str, game_pid: Option<u32>
                         .unwrap_or("Asset preparation failed. Inspect the startup log.")
                 });
             // Kiln layer: the packages the current applied pass ran without, with their errors
-            // (entrypoints/loader/asset_preparation/retry_without_failed_mod.rs).
-            let skipped_pregame: std::collections::HashMap<&str, &str> = preparation
+            // (entrypoints/loader/asset_preparation/retry_without_failed_mod.rs): the one the pass
+            // failed in first (true), then the ones left out because they need it.
+            let skipped_pregame: std::collections::HashMap<&str, (bool, &str)> = preparation
                 .as_ref()
                 .filter(|value| applied_assets && value["status"] == "applied")
                 .and_then(|value| value["skipped"].as_array())
                 .map(|items| {
                     items
                         .iter()
-                        .filter_map(|item| {
-                            Some((item["id"].as_str()?, item["error"].as_str().unwrap_or("")))
+                        .enumerate()
+                        .filter_map(|(index, item)| {
+                            let error = item["error"].as_str().unwrap_or("");
+                            Some((item["id"].as_str()?, (index == 0, error)))
                         })
                         .collect()
                 })
@@ -464,11 +467,15 @@ pub fn configuration(root: &Path, server: bool, api: &str, game_pid: Option<u32>
                     json!({"state":"disabled","detail":"The mod is disabled."})
                 } else if pregame_mod && preparation_error.is_some() {
                     json!({"state":"failed","code":"asset-preparation-failed","detail":preparation_error.unwrap()})
-                } else if let Some(error) = skipped_pregame
+                } else if let Some((failed_in_it, error)) = skipped_pregame
                     .get(manifest.id.as_str())
                     .filter(|_| pregame_mod)
                 {
-                    json!({"state":"failed","code":"asset-preparation-skipped","detail":format!("The startup preparation pass failed in this mod and ran again without it: {error}")})
+                    if *failed_in_it {
+                        json!({"state":"failed","code":"asset-preparation-skipped","detail":format!("The startup preparation pass failed in this mod and ran again without it: {error}")})
+                    } else {
+                        json!({"state":"blocked","code":"asset-preparation-skipped","detail":format!("The startup preparation pass ran without this mod: {error}")})
+                    }
                 } else if let Some(effect) = native_dll_effect.filter(|effect| {
                     matches!(effect["state"].as_str(), Some("error" | "write-failed"))
                 }) {
@@ -1154,13 +1161,19 @@ mod tests {
     fn a_package_the_pass_ran_without_is_reported_as_failed_and_the_pass_as_partial() {
         let root = tempfile::tempdir().unwrap();
         fs::write(root.path().join("enshrouded.exe"), b"test executable").unwrap();
-        for id in ["asset-test", "wisp"] {
+        // lamp needs wisp: the pass left it out with wisp
+        for (id, needs) in [("asset-test", None), ("wisp", None), ("lamp", Some("wisp"))] {
             let package = root.path().join("mods").join(id);
             fs::create_dir_all(package.join("src")).unwrap();
+            let dependencies: Vec<_> = needs
+                .map(|id| json!({"id": id, "version": "^1.0.0"}))
+                .into_iter()
+                .collect();
             fs::write(
                 package.join("mod.json"),
                 serde_json::to_vec(&json!({
-                    "id":id,"name":id,"version":"1.0.0","capabilities":["patch"]
+                    "id":id,"name":id,"version":"1.0.0","capabilities":["patch"],
+                    "dependencies":dependencies
                 }))
                 .unwrap(),
             )
@@ -1182,7 +1195,8 @@ mod tests {
             &json!({
                 "schemaVersion":1,"status":"applied","target":"enshrouded","phase":"startup",
                 "completedAt":1,"fingerprint":fingerprint,"mods":[{"id":"asset-test","version":"1.0.0"}],
-                "skipped":[{"id":"wisp","name":"wisp","version":"1.0.0","error":"Missing base localization: keenglish"}]
+                "skipped":[{"id":"wisp","name":"wisp","version":"1.0.0","error":"Missing base localization: keenglish"},
+                    {"id":"lamp","name":"lamp","version":"1.0.0","error":"needs wisp, which failed in the pregame pass"}]
             }),
         )
         .unwrap();
@@ -1198,6 +1212,12 @@ mod tests {
                 .unwrap()
                 .ends_with("ran again without it: Missing base localization: keenglish")
         );
+        // the pass did not fail in lamp: it was left out because it needs wisp
+        assert_eq!(status["modStates"]["lamp"]["state"], "blocked", "{status}");
+        assert_eq!(
+            status["modStates"]["lamp"]["detail"],
+            "The startup preparation pass ran without this mod: needs wisp, which failed in the pregame pass"
+        );
         assert_ne!(
             status["modStates"]["asset-test"]["state"], "failed",
             "{status}"
@@ -1207,7 +1227,8 @@ mod tests {
             status["assets"]["detail"]
                 .as_str()
                 .unwrap()
-                .contains("1 left out (wisp)")
+                .contains("2 left out (lamp, wisp)"),
+            "{status}"
         );
     }
 
