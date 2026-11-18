@@ -13,6 +13,8 @@ struct ModEnvironmentInner {
     mods_dir: PathBuf,
 
     registry: ModRegistry,
+    /// Kiln layer: a package this environment treats as switched off (`without`).
+    left_out: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -85,8 +87,26 @@ impl ModEnvironment {
                 cache_dir,
                 mods_dir,
                 registry,
+                left_out: None,
             }),
         })
+    }
+
+    /// Kiln layer: this environment with one package treated as switched off, so that its plan leaves
+    /// it out, and the packages that need it ("disabled dependency"). The startup pass runs once more
+    /// without a package that made it fail (`entrypoints/loader/asset_preparation`).
+    pub fn without(&self, id: &str) -> Self {
+        Self {
+            inner: Arc::new(ModEnvironmentInner {
+                game_dir: self.inner.game_dir.clone(),
+                cache_dir: self.inner.cache_dir.clone(),
+                mods_dir: self.inner.mods_dir.clone(),
+                registry: ModRegistry {
+                    mods: self.inner.registry.mods.clone(),
+                },
+                left_out: Some(id.to_owned()),
+            }),
+        }
     }
 
     pub fn game_dir(&self) -> &Path {
@@ -106,17 +126,18 @@ impl ModEnvironment {
     }
 
     pub fn is_mod_enabled(&self, id: &str) -> bool {
-        self.inner
-            .registry
-            .get(id)
-            .is_some_and(|item| item.info().enabled)
+        self.inner.left_out.as_deref() != Some(id)
+            && self
+                .inner
+                .registry
+                .get(id)
+                .is_some_and(|item| item.info().enabled)
     }
 
     pub fn enabled_mods(&self) -> impl Iterator<Item = &crate::Mod> {
-        self.inner
-            .registry
-            .values()
-            .filter(|r#mod| r#mod.info().enabled)
+        self.inner.registry.values().filter(|r#mod| {
+            r#mod.info().enabled && self.inner.left_out.as_deref() != Some(r#mod.info().id.as_str())
+        })
     }
 
     /// Shared dependency and target plan for asset execution and live mods.
@@ -380,6 +401,64 @@ mod tests {
         assert!(environment.mod_registry().contains_key("mod.example"));
         assert!(!environment.is_mod_enabled("mod.example"));
         assert_eq!(environment.enabled_mods().count(), 0);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Kiln layer: the startup pass runs once more without a package that failed in it.
+    #[test]
+    fn an_environment_without_a_package_plans_neither_it_nor_what_needs_it() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("shroudforge-without-{suffix}"));
+        fs::create_dir_all(shroudforge_loader_config::paths::config_dir(&root)).unwrap();
+        for (id, needs) in [("base", None), ("addon", Some("base")), ("other", None)] {
+            let package = shroudforge_loader_config::paths::mods_dir(&root).join(id);
+            fs::create_dir_all(package.join("src")).unwrap();
+            let dependencies: Vec<_> = needs
+                .map(|id| serde_json::json!({"id": id, "version": "^1.0.0"}))
+                .into_iter()
+                .collect();
+            fs::write(
+                package.join("mod.json"),
+                serde_json::to_vec(&serde_json::json!({
+                    "id": id, "name": id, "version": "1.0.0", "capabilities": ["patch"],
+                    "dependencies": dependencies,
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            fs::write(
+                package.join("extended.mod.json"),
+                br#"{"schemaVersion":1,"enabled":true}"#,
+            )
+            .unwrap();
+            fs::write(package.join("src/mod.lua"), "return {}\n").unwrap();
+        }
+        let environment = ModEnvironment::load(root.to_str().unwrap()).unwrap();
+        let ids = |environment: &ModEnvironment| -> Vec<String> {
+            environment
+                .plan(false, "1.0.0")
+                .iter()
+                .map(|item| item.info().id.clone())
+                .collect()
+        };
+        assert_eq!(ids(&environment), ["base", "addon", "other"]);
+        let without = environment.without("base");
+        assert_eq!(ids(&without), ["other"]);
+        assert!(!without.is_mod_enabled("base") && without.is_mod_enabled("addon"));
+        let (_, issues) = without.plan_report_detailed(false, "1.0.0");
+        assert!(
+            issues
+                .iter()
+                .any(|issue| issue.mod_id == "addon" && issue.code == "dependency-disabled"),
+            "{issues:?}"
+        );
+        // the environment it came from is unchanged
+        assert_eq!(ids(&environment), ["base", "addon", "other"]);
+        assert!(environment.mod_registry().contains_key("base"));
 
         fs::remove_dir_all(root).unwrap();
     }
