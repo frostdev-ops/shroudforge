@@ -98,6 +98,44 @@ With a ShroudForge installation in the game folder nothing changes: its Updater 
 missing Updater is still an error. Tests: `cargo test -p shroudforge-game-assets` (host, also under Wine) and
 `outdated_working_backups_are_replaced_without_an_updater` in `shroudforge-modloader` (Wine).
 
+## One failing startup mod no longer costs the others (dev.29.18)
+
+ShroudForge writes the packages that need the game data changed (a `patch` part, or `export` without a runtime part)
+into the archives in one pass before the game starts. Upstream puts the game data back after a failed pass and starts
+the game with none of those packages. One package whose own check failed (in a player's report, a clash with another
+mod that had changed the localization it looked for) cost every other one.
+
+When the pass fails in one package's own entrypoint, the pass now runs once more without it
+(`asset_preparation/retry_without_failed_mod.rs`): from the clean baseline, as every pass starts, with that package
+treated as switched off (`ModEnvironment::without`), so the packages that need it drop out too. Once only: no loop, no
+search.
+
+- Retried: an error raised by a package's entrypoint while the pass runs it (`LuaModRunner::run` names the package,
+  `PregameModError`), such as its own `error(...)` or `assert`, a Lua error, a missing `src/mod.lua`.
+- Not retried, upstream's behaviour unchanged: a text with `(os error N)` or access denied (the system or the game's
+  files), and every failure no package raised: the working baseline (create, restore, set aside), staging, the type
+  model, the commit and publication, a replaced `.kfc`.
+- A second failure: no startup package loads, as before. The record's `error` is the first failure's.
+
+The record (state.json "assets") gets two optional fields (the schema lists them; readers that do not know them are
+unaffected):
+
+```
+"skipped": [{"id", "name", "version", "error"}, ...]   the failed package and its error on one line, then the packages
+                                                     left out with it ("needs <id>, which failed in the pregame pass")
+"retryError": "pregame phase failed: ..."            the second pass's error, when it failed too
+```
+
+A pass that ran without a package is recorded `applied` with the configuration's own fingerprint: the next start keeps
+the data and the record while nothing changes, and switching the package off (or changing any input) runs the pass
+again. Log lines (category `startup-assets`, level W; Kiln copies them into kiln.log as `[sf]` lines):
+`ShroudForge: <name> (<id> <version>) failed in the pregame pass (<error>); running the pass once more without it`, then
+`...; started the game without it, the other N mods loaded` or `ShroudForge: the pregame pass failed again without
+<name> (<error>); the game starts without the mods of the pregame pass`. The in-game Modloader page shows the package
+`failed` and the pass `partial`. Tests: `cargo xwin test -p shroudforge-modloader -p shroudforge-package -p
+shroudforge-modloader-ui --target x86_64-pc-windows-msvc` under Wine (`kiln_retry_tests.rs` runs whole passes on a
+small archive pair with made-up packages).
+
 ## Merging upstream
 
 ```
