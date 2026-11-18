@@ -47,7 +47,12 @@ pub(super) fn run_inner(
         }),
     )
     .map_err(LoaderError::Pregame)?;
-    let apply_result = (|| -> Result<Vec<serde_json::Value>, LoaderError> {
+    // Kiln layer: one whole pass for an environment, so that a pass that failed in one package runs
+    // once more without it (retry_without_failed_mod.rs); `failed` is the package a failure is pinned on.
+    let server = file_name == "enshrouded_server";
+    let failed = std::cell::RefCell::new(None);
+    let apply = |environment: &shroudforge_package::ModEnvironment| -> Result<Vec<serde_json::Value>, LoaderError> {
+        failed.replace(None);
         shroudforge_game_assets::transaction::recover(game_directory, file_name)
             .map_err(|error| LoaderError::Pregame(error.to_string()))?;
         let resources = game_directory.join(format!("{file_name}.kfc_resources"));
@@ -85,7 +90,7 @@ pub(super) fn run_inner(
         }
         if phase == "startup" {
             shroudforge_api::run_with_local_schema(
-                &environment,
+                environment,
                 shroudforge_api::RunArgs {
                     file_name: file_name.into(),
                     options: shroudforge_api::RunOptions {
@@ -98,11 +103,14 @@ pub(super) fn run_inner(
                     },
                 },
             )
-            .map_err(|error| LoaderError::Pregame(error.to_string()))?;
+            .map_err(|error| {
+                failed.replace(super::failed_mod(error.downcast_ref(), environment, server));
+                LoaderError::Pregame(error.to_string())
+            })?;
         } else {
             let api = super::parse_game_assets::parse_game_assets(game_directory, file_name)?;
             shroudforge_api::run(
-                &environment,
+                environment,
                 api,
                 shroudforge_api::RunArgs {
                     file_name: file_name.into(),
@@ -116,7 +124,10 @@ pub(super) fn run_inner(
                     },
                 },
             )
-            .map_err(|error| LoaderError::Pregame(error.to_string()))?;
+            .map_err(|error| {
+                failed.replace(super::failed_mod(error.downcast_ref(), environment, server));
+                LoaderError::Pregame(error.to_string())
+            })?;
         }
         let mods = environment
             .plan(
@@ -131,18 +142,26 @@ pub(super) fn run_inner(
             .collect::<Result<Vec<_>, String>>()
             .map_err(LoaderError::Pregame)?;
         Ok(mods)
-    })();
+    };
+    let (apply_result, retry) = match (apply(&environment), failed.take()) {
+        (Err(error), Some(failed)) => {
+            super::run_once_more(game_directory, &environment, server, failed, error, &apply)
+        }
+        (result, _) => (result, super::Retry::default()),
+    };
     let mods = match apply_result {
         Ok(mods) => mods,
         Err(error) => {
+            let mut record = serde_json::json!({
+                "schemaVersion": 1, "status": "failed", "phase": phase, "target": file_name,
+                "completedAt": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(),
+                "error": error.to_string()
+            });
+            retry.record_into(&mut record);
             let _ = shroudforge_loader_config::config::write_document(
                 game_directory,
                 shroudforge_game_assets::documents::APPLIED,
-                &serde_json::json!({
-                    "schemaVersion": 1, "status": "failed", "phase": phase, "target": file_name,
-                    "completedAt": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(),
-                    "error": error.to_string()
-                }),
+                &record,
             );
             return Err(error);
         }
@@ -176,11 +195,19 @@ pub(super) fn run_inner(
         tracing::warn!(target: "shroudforge::startup", target = file_name, %error,
             "Could not record the asset pass; the next start applies the asset mods again");
     }
-    shroudforge_loader_config::config::write_document(game_directory, shroudforge_game_assets::documents::APPLIED, &serde_json::json!({
+    let mut record = serde_json::json!({
         "schemaVersion": 1, "status": "applied", "phase": phase, "target": file_name,
         "fingerprint": fingerprint,
         "completedAt": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(),
         "mods": mods
-    })).map_err(LoaderError::Pregame)?;
+    });
+    // Kiln layer: the package the pass ran without, and why
+    retry.record_into(&mut record);
+    shroudforge_loader_config::config::write_document(
+        game_directory,
+        shroudforge_game_assets::documents::APPLIED,
+        &record,
+    )
+    .map_err(LoaderError::Pregame)?;
     Ok(())
 }

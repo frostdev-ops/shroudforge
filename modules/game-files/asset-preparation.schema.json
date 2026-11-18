@@ -10,7 +10,9 @@
     "completedAt": { "type": "integer", "minimum": 0 },
     "error": { "type": "string", "minLength": 1 },
     "fingerprint": {"type":"string","pattern":"^[0-9a-f]{64}$"},
-    "mods": { "type": "array", "items": { "type": "object", "required": ["id", "version"] } }
+    "mods": { "type": "array", "items": { "type": "object", "required": ["id", "version"] } },
+    "skipped": { "type": "array", "items": { "type": "object", "required": ["id", "error"] } },
+    "retryError": { "type": "string", "minLength": 1 }
   },
   "allOf": [
     {

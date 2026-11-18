@@ -7,6 +7,8 @@ mod prepare_game_assets;
 mod prepare_startup_assets;
 mod recover_failed_startup_assets;
 mod require_game_stopped;
+// Kiln layer
+mod retry_without_failed_mod;
 mod select_game_target;
 
 use apply_asset_mods::run_inner;
@@ -17,6 +19,7 @@ pub use prepare_game_assets::run;
 pub(crate) use prepare_startup_assets::run_startup;
 pub(crate) use recover_failed_startup_assets::recover_failed_startup;
 use require_game_stopped::ensure_game_stopped;
+use retry_without_failed_mod::{Retry, failed_mod, run_once_more};
 use select_game_target::{process_target_name, target_name};
 
 fn format_report(report: &shroudforge_package::ModEnvironmentErrorReport) -> String {
@@ -33,3 +36,6 @@ fn format_report(report: &shroudforge_package::ModEnvironmentErrorReport) -> Str
 
 #[cfg(test)]
 mod tests;
+// Kiln layer
+#[cfg(test)]
+mod kiln_retry_tests;

@@ -8,11 +8,31 @@ pub(crate) fn recover_failed_startup(game_directory: &Path, detail: &str) -> boo
         let _lease = startup_asset_lease(&shroudforge_loader_config::paths::startup_asset_lock(
             game_directory,
         ))?;
-        shroudforge_loader_config::config::write_document(game_directory, shroudforge_game_assets::documents::APPLIED, &serde_json::json!({
+        let mut record = serde_json::json!({
             "schemaVersion": 1, "status": "failed", "phase": "startup", "target": target,
             "completedAt": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(),
             "error": detail
-        })).map_err(LoaderError::Pregame)?;
+        });
+        // Kiln layer: what the failed pass recorded about its one retry (retry_without_failed_mod.rs)
+        // stays with its error.
+        if let Ok(previous) = shroudforge_loader_config::config::read_document(
+            game_directory,
+            shroudforge_game_assets::documents::APPLIED,
+        ) && previous["status"] == "failed"
+            && previous["error"].as_str() == Some(detail)
+        {
+            for key in ["skipped", "retryError"] {
+                if let Some(value) = previous.get(key) {
+                    record[key] = value.clone();
+                }
+            }
+        }
+        shroudforge_loader_config::config::write_document(
+            game_directory,
+            shroudforge_game_assets::documents::APPLIED,
+            &record,
+        )
+        .map_err(LoaderError::Pregame)?;
         shroudforge_game_assets::transaction::recover(game_directory, target)
             .map_err(|error| LoaderError::Pregame(error.to_string()))?;
         for extension in ["kfc.bak", "kfc_resources.bak"] {
