@@ -297,3 +297,59 @@ fn a_pass_without_failures_records_no_retry() {
     );
     assert!(!game.log().contains(RETRY));
 }
+
+/// The package's files are inputs of the pass: updated or fixed, the next start runs the pass again
+/// instead of keeping the data of the pass that ran without it.
+#[test]
+fn an_updated_or_fixed_package_runs_the_pass_again() {
+    let game = Game::new("fixed");
+    game.package("alpha", "return {}", &[]);
+    game.broken("broken", "first check failed");
+    run_startup(&game.0).unwrap();
+    let record = game.record();
+    assert_eq!(ids(&record["skipped"]), ["broken"], "{record}");
+    assert!(already_applied(&game.0, "enshrouded", false).unwrap());
+    // an update that still fails: the pass runs again and names the new error
+    game.broken("broken", "the updated check failed");
+    assert!(!already_applied(&game.0, "enshrouded", false).unwrap());
+    run_startup(&game.0).unwrap();
+    let record = game.record();
+    assert_eq!(record["status"], "applied", "{record}");
+    assert!(
+        record["skipped"][0]["error"]
+            .as_str()
+            .is_some_and(|error| error.ends_with("the updated check failed")),
+        "{record}"
+    );
+    // fixed: the pass runs again with it and records no retry
+    game.package("broken", "return {}", &[]);
+    assert!(!already_applied(&game.0, "enshrouded", false).unwrap());
+    run_startup(&game.0).unwrap();
+    let record = game.record();
+    assert_eq!(
+        (record["status"].as_str(), record.get("skipped")),
+        (Some("applied"), None),
+        "{record}"
+    );
+    let mut loaded = ids(&record["mods"]);
+    loaded.sort_unstable();
+    assert_eq!(loaded, ["alpha", "broken"], "{record}");
+}
+
+/// A package that needs the failed one through another drops out with both.
+#[test]
+fn packages_that_need_the_failed_one_through_another_drop_out_too() {
+    let game = Game::new("chain");
+    game.broken("broken", "check failed");
+    game.package("middle", "return {}", &["broken"]);
+    game.package("top", "return {}", &["middle"]);
+    game.package("zeta", "return {}", &[]);
+    run_startup(&game.0).unwrap();
+    let record = game.record();
+    assert_eq!(record["status"], "applied", "{record}");
+    assert_eq!(ids(&record["mods"]), ["zeta"], "{record}");
+    assert_eq!(ids(&record["skipped"])[0], "broken", "{record}");
+    let mut left_out = ids(&record["skipped"])[1..].to_vec();
+    left_out.sort_unstable();
+    assert_eq!(left_out, ["middle", "top"], "{record}");
+}
