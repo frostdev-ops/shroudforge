@@ -40,10 +40,7 @@ fn discovery_waits_for_world(provider: &Value) -> bool {
         })
         && matches!(
             live_error,
-            Some(
-                "live-profile-pointer-out-of-user-range"
-                    | "live-profile-ready-scene-not-unique"
-            )
+            Some("live-profile-pointer-out-of-user-range" | "live-profile-ready-scene-not-unique")
         )
 }
 
@@ -292,7 +289,10 @@ pub fn configuration(root: &Path, server: bool, api: &str, game_pid: Option<u32>
         .map(|value| &value["runtimeProvider"]);
     let discovery_notice = profile_discovery_notice(root, game_pid, runtime_check, now);
     let profile_discovery_pending = discovery_notice.as_ref().is_some_and(|value| {
-        matches!(value["state"].as_str(), Some("searching" | "waiting-for-world"))
+        matches!(
+            value["state"].as_str(),
+            Some("searching" | "waiting-for-world")
+        )
     });
     let runtime_status =
         runtime_compatibility_check(runtime_check, desktop, server, profile_discovery_pending);
@@ -398,6 +398,21 @@ pub fn configuration(root: &Path, server: bool, api: &str, game_pid: Option<u32>
                         .as_str()
                         .unwrap_or("Asset preparation failed. Inspect the startup log.")
                 });
+            // Kiln layer: the packages the current applied pass ran without, with their errors
+            // (entrypoints/loader/asset_preparation/retry_without_failed_mod.rs).
+            let skipped_pregame: std::collections::HashMap<&str, &str> = preparation
+                .as_ref()
+                .filter(|value| applied_assets && value["status"] == "applied")
+                .and_then(|value| value["skipped"].as_array())
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|item| {
+                            Some((item["id"].as_str()?, item["error"].as_str().unwrap_or("")))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
             for item in env.mod_registry().values() {
                 let manifest = item.info();
                 let fingerprint = shroudforge_loader_config::config::revision(
@@ -449,6 +464,11 @@ pub fn configuration(root: &Path, server: bool, api: &str, game_pid: Option<u32>
                     json!({"state":"disabled","detail":"The mod is disabled."})
                 } else if pregame_mod && preparation_error.is_some() {
                     json!({"state":"failed","code":"asset-preparation-failed","detail":preparation_error.unwrap()})
+                } else if let Some(error) = skipped_pregame
+                    .get(manifest.id.as_str())
+                    .filter(|_| pregame_mod)
+                {
+                    json!({"state":"failed","code":"asset-preparation-skipped","detail":format!("The startup preparation pass failed in this mod and ran again without it: {error}")})
                 } else if let Some(effect) = native_dll_effect.filter(|effect| {
                     matches!(effect["state"].as_str(), Some("error" | "write-failed"))
                 }) {
@@ -573,7 +593,11 @@ pub fn configuration(root: &Path, server: bool, api: &str, game_pid: Option<u32>
                     match shroudforge_package::prepared::fingerprint(&env, server, api) {
                         Ok(fingerprint) => {
                             if shroudforge_package::prepared::matches(root, &fingerprint) {
-                                if blocked_pregame > 0 {
+                                if !skipped_pregame.is_empty() {
+                                    let mut ids: Vec<_> = skipped_pregame.keys().copied().collect();
+                                    ids.sort_unstable();
+                                    json!({"state":"partial","detail":format!("Preparation matches the runnable mods. The pass failed in a startup mod and ran again without it: {} left out ({}).", ids.len(), ids.join(", "))})
+                                } else if blocked_pregame > 0 {
                                     json!({"state":"partial","detail":format!("Preparation matches the runnable mods. {blocked_pregame} startup mod(s) were skipped because of compatibility or dependency issues.")})
                                 } else {
                                     json!({"state":"applied","detail":"Preparation record matches the game and current mod configuration."})
@@ -1123,6 +1147,68 @@ mod tests {
         let encoded = serde_json::to_string(&status).unwrap();
         assert!(encoded.contains("asset-preparation-failed"), "{encoded}");
         assert!(!encoded.contains("restart-required"), "{encoded}");
+    }
+
+    /// Kiln layer: a pass that ran again without the package that failed in it.
+    #[test]
+    fn a_package_the_pass_ran_without_is_reported_as_failed_and_the_pass_as_partial() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("enshrouded.exe"), b"test executable").unwrap();
+        for id in ["asset-test", "wisp"] {
+            let package = root.path().join("mods").join(id);
+            fs::create_dir_all(package.join("src")).unwrap();
+            fs::write(
+                package.join("mod.json"),
+                serde_json::to_vec(&json!({
+                    "id":id,"name":id,"version":"1.0.0","capabilities":["patch"]
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            fs::write(
+                package.join("extended.mod.json"),
+                r#"{"schemaVersion":1,"enabled":true}"#,
+            )
+            .unwrap();
+            fs::write(package.join("src/mod.lua"), "return {}").unwrap();
+        }
+        let environment =
+            shroudforge_package::ModEnvironment::load(root.path().to_str().unwrap()).unwrap();
+        let fingerprint =
+            shroudforge_package::prepared::fingerprint(&environment, false, "1.0.0").unwrap();
+        shroudforge_loader_config::config::write_document(
+            root.path(),
+            shroudforge_game_assets::documents::APPLIED,
+            &json!({
+                "schemaVersion":1,"status":"applied","target":"enshrouded","phase":"startup",
+                "completedAt":1,"fingerprint":fingerprint,"mods":[{"id":"asset-test","version":"1.0.0"}],
+                "skipped":[{"id":"wisp","name":"wisp","version":"1.0.0","error":"Missing base localization: keenglish"}]
+            }),
+        )
+        .unwrap();
+        let status = configuration(root.path(), false, "1.0.0", None);
+        assert_eq!(status["modStates"]["wisp"]["state"], "failed", "{status}");
+        assert_eq!(
+            status["modStates"]["wisp"]["code"],
+            "asset-preparation-skipped"
+        );
+        assert!(
+            status["modStates"]["wisp"]["detail"]
+                .as_str()
+                .unwrap()
+                .ends_with("ran again without it: Missing base localization: keenglish")
+        );
+        assert_ne!(
+            status["modStates"]["asset-test"]["state"], "failed",
+            "{status}"
+        );
+        assert_eq!(status["assets"]["state"], "partial", "{status}");
+        assert!(
+            status["assets"]["detail"]
+                .as_str()
+                .unwrap()
+                .contains("1 left out (wisp)")
+        );
     }
 
     #[test]
