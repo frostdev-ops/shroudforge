@@ -40,7 +40,10 @@ fn discovery_waits_for_world(provider: &Value) -> bool {
         })
         && matches!(
             live_error,
-            Some("live-profile-pointer-out-of-user-range" | "live-profile-ready-scene-not-unique")
+            Some(
+                "live-profile-pointer-out-of-user-range"
+                    | "live-profile-ready-scene-not-unique"
+            )
         )
 }
 
@@ -289,10 +292,7 @@ pub fn configuration(root: &Path, server: bool, api: &str, game_pid: Option<u32>
         .map(|value| &value["runtimeProvider"]);
     let discovery_notice = profile_discovery_notice(root, game_pid, runtime_check, now);
     let profile_discovery_pending = discovery_notice.as_ref().is_some_and(|value| {
-        matches!(
-            value["state"].as_str(),
-            Some("searching" | "waiting-for-world")
-        )
+        matches!(value["state"].as_str(), Some("searching" | "waiting-for-world"))
     });
     let runtime_status =
         runtime_compatibility_check(runtime_check, desktop, server, profile_discovery_pending);
