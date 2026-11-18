@@ -46,7 +46,9 @@ impl LuaModRunner {
         Ok(Self { lua, state })
     }
 
-    pub fn run(&self) -> mlua::Result<()> {
+    /// Kiln layer: an error names the package whose entrypoint raised it (`PregameModError`), so the
+    /// loader can run the pass once more without that package. Its text is the Lua error's, as before.
+    pub fn run(&self) -> Result<(), crate::PregameModError> {
         let app_state = self.lua.app_data_ref::<AppState>().unwrap();
 
         for r#mod in self.state.mods().values() {
@@ -70,7 +72,9 @@ impl LuaModRunner {
                 "Running mod",
             );
 
-            self.state.require_mod(&r#mod.info().id, &self.lua)?;
+            self.state
+                .require_mod(&r#mod.info().id, &self.lua)
+                .map_err(|error| crate::PregameModError::new(&r#mod.info().id, error))?;
         }
 
         Ok(())
