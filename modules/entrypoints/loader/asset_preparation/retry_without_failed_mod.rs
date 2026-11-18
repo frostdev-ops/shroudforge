@@ -178,11 +178,11 @@ pub(super) fn run_once_more(
         String::new()
     } else {
         format!(
-            " and the {} that need it ({})",
+            " and {} ({})",
             if dependents.len() == 1 {
-                "mod".to_string()
+                "the mod that needs it".to_string()
             } else {
-                format!("{} mods", dependents.len())
+                format!("the {} mods that need it", dependents.len())
             },
             dependents
                 .iter()

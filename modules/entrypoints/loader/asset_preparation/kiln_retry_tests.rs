@@ -159,7 +159,7 @@ fn one_failing_package_is_left_out_and_the_others_load() {
     assert!(record["fingerprint"].is_string(), "{record}");
     let log = game.log();
     assert!(log.contains("ShroudForge: The broken mod (broken 1.2.3) failed in the pregame pass (runtime error: \
-        [string \"broken\"]:2: Missing base localization: keenglish); started the game without it and the mod that need it \
+        [string \"broken\"]:2: Missing base localization: keenglish); started the game without it and the mod that needs it \
         (needs-broken), the other 2 mods loaded"), "{log}");
     // The data of the pass stand for this configuration: the next start keeps them, and the record.
     assert!(already_applied(&game.0, "enshrouded", false).unwrap());
