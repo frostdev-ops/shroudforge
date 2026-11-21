@@ -1186,9 +1186,9 @@ mod tests {
             fs::write(package.join("src/mod.lua"), "return {}").unwrap();
         }
         let environment =
-            shroudforge_package::ModEnvironment::load(root.path().to_str().unwrap()).unwrap();
+            crate::ModEnvironment::load(root.path().to_str().unwrap()).unwrap();
         let fingerprint =
-            shroudforge_package::prepared::fingerprint(&environment, false, "1.0.0").unwrap();
+            crate::prepared::fingerprint(&environment, false, "1.0.0").unwrap();
         shroudforge_loader_config::config::write_document(
             root.path(),
             shroudforge_game_assets::documents::APPLIED,
