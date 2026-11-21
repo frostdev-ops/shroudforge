@@ -338,8 +338,47 @@ bool interior(std::uint64_t base, std::uint32_t image_size, Range part, std::uin
     out={};
     return false;
 }
+// Kiln layer: an entry detour on a call-free leaf function. Such a function has no unwind entry, so its bytes lie in a
+// gap between two unwind ranges and the whole-image check below took any change there for code of the function before
+// it, and refused the executable file (server 26430253: Kiln's hooks on content/LootItems, rva 0x93d3b0, and
+// assets/KfcContentMap, rva 0xa63780; ShroudForge then fell back to live-only reads for every procedure).
+// The entry must be a function start: 16-byte aligned (as the compiler places functions), an instruction boundary of a
+// linear decode of the gap's FILE bytes from the gap's start (leaves and their int3 padding decode in sequence), and
+// what precedes it is padding (int3 or nop) or an instruction that does not fall through. The detour must then pass
+// admit() over the rest of the gap, which still compares every other byte, and its target must lie outside this
+// image. The leaf itself is never read through the file (classify() reads leaves live).
+constexpr std::size_t leaf_gap_limit = 4096;
+template<class Read, class Decode, class Executable>
+Admission admit_leaf(std::uint64_t base, std::uint32_t image_size, std::uint32_t gap_begin, std::uint32_t entry,
+    std::uint32_t gap_end, Read file, Read live, Decode decode, Executable executable, Detour& out) {
+    out={};
+    if (gap_begin>entry || entry>=gap_end || entry-gap_begin>leaf_gap_limit || gap_end-entry>procedure_limit ||
+        (entry&15) || base>UINT64_MAX-gap_end) return Admission::refuse;
+    if (entry>gap_begin) {
+        std::array<std::uint8_t,leaf_gap_limit+16> gap{};
+        const auto window=(std::min)(static_cast<std::size_t>(gap_end-gap_begin),gap.size());
+        if (!file(base+gap_begin,gap.data(),window)) return Admission::refuse;
+        std::size_t at{}, last{};
+        bool falls{true};
+        while (at<entry-gap_begin) {
+            const InstructionStep step=decode(gap.data()+at,window-at);
+            if (!step.length || step.length>window-at) return Admission::refuse;
+            last=at; falls=step.fallthrough; at+=step.length;
+        }
+        const bool padding=at-last==1 && (gap[last]==0xcc || gap[last]==0x90);
+        if (at!=entry-gap_begin || (falls && !padding)) return Admission::refuse;
+    }
+    const std::array<Range,1> range{{{entry,gap_end}}};
+    const auto admission=admit(base,entry,std::span<const Range>(range),file,live,decode,executable,out);
+    // as an interior jump's: a hook's code lies outside this image
+    if (admission==Admission::detour && out.target>=base && out.target-base<image_size) { out={}; return Admission::refuse; }
+    return admission;
+}
 struct CodeSection { std::uint32_t rva{}; std::span<const std::uint8_t> bytes; };
-struct ImageCheck { const char* reason{}; std::uint32_t rva{}; std::size_t entries{}, interiors{}, owns{}; };
+// held (Kiln layer): the functions holding an admitted interior jump or own patch, sorted, each once. Their reads
+// through the file are refused, and that refusal says nothing about the file (no reason to stop reading others).
+struct ImageCheck { const char* reason{}; std::uint32_t rva{}; std::size_t entries{}, interiors{}, owns{};
+    std::vector<std::uint32_t> held{}; };
 // ShroudForge's own code patches (the native main menu's call sites), recorded by the patcher before it writes them:
 // the comparison accepts exactly the recorded replacement over exactly the recorded original bytes, and still
 // compares every other byte. Like an interior jump, this is identity only: admit() refuses the holding function.
@@ -399,6 +438,7 @@ ImageCheck compare_image(std::uint64_t base, std::uint32_t image_size, std::span
     std::array<std::uint8_t,4096> current{};
     std::set<std::uint32_t> entries;
     std::map<std::uint32_t,std::size_t> per_function;
+    std::set<std::uint32_t> held;
     std::size_t interiors{}, owns{}, decode_budget=boundary_decode_limit;
     for (const auto& section:sections) {
         std::size_t offset{};
@@ -420,6 +460,7 @@ ImageCheck compare_image(std::uint64_t base, std::uint32_t image_size, std::span
                     std::memcmp(after.data(),mine->replacement.data(),mine->size))
                     return {"ShroudForge's own code patch differs from its record",mine->rva};
                 ++owns;
+                if (const auto holder=owners.upper_bound(mine->rva); holder!=owners.begin()) held.insert(std::prev(holder)->second);
                 offset=mine->rva+mine->size-section.rva;
                 floor=mine->rva+mine->size;
                 continue;
@@ -439,17 +480,39 @@ ImageCheck compare_image(std::uint64_t base, std::uint32_t image_size, std::span
             const Range* part{};
             if (found!=procedures.end() && bounded(found->second,image_size))
                 for (const auto& r:found->second) if (r.begin<=at && at<r.end) part=&r;
+            if (!part) {
+                // Kiln layer: past the end of the unwind range before it, a change can be a leaf function's entry
+                // detour (admit_leaf above); anything else there stays refused.
+                const auto previous=std::prev(owner);
+                const Range* before{};
+                if (found!=procedures.end())
+                    for (const auto& r:found->second) if (r.begin==previous->first) before=&r;
+                const auto section_end=section.rva+static_cast<std::uint32_t>(section.bytes.size());
+                const auto gap_end=owner==owners.end() ? section_end : (std::min)(owner->first,section_end);
+                Detour leaf;
+                if (before && before->end<=at && at<gap_end &&
+                    admit_leaf(base,image_size,before->end,at,gap_end,file,live,decode,executable,leaf)==Admission::detour &&
+                    at>=leaf.rva && at-leaf.rva<leaf.span) {
+                    entries.insert(leaf.rva);
+                    if (entries.size()>function_limit) return {"entry detour count bound",leaf.rva};
+                    offset=leaf.rva+leaf.span-section.rva;
+                    floor=leaf.rva+leaf.span;
+                    continue;
+                }
+                return {"function differs from the file other than by an entry detour or an interior jump",root};
+            }
             Interior jump;
-            if (!part || !interior(base,image_size,*part,floor,at,file,live,decode,executable,jump,decode_budget))
+            if (!interior(base,image_size,*part,floor,at,file,live,decode,executable,jump,decode_budget))
                 return {decode_budget ? "function differs from the file other than by an entry detour or an interior jump" :
                     "interior instruction decode budget",root};
             if (++per_function[root]>interior_function_limit) return {"interior jump count bound in one function",root};
             if (++interiors>interior_image_limit) return {"interior jump count bound",root};
+            held.insert(root);
             offset=jump.rva+jump.span-section.rva;
             floor=jump.rva+jump.span;
         }
     }
-    return {nullptr,0,entries.size(),interiors,owns};
+    return {nullptr,0,entries.size(),interiors,owns,std::vector<std::uint32_t>(held.begin(),held.end())};
 }
 inline bool selectable(Admission a) { return a == Admission::live; }
 }

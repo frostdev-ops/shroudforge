@@ -161,6 +161,9 @@ struct FileImage {
     bool matched{}; // Immutable after construction: keep strict function classification even after file reads stop.
     mutable std::atomic<bool> usable{false};
     mutable std::atomic<bool> diagnosed{false};
+    // Kiln layer: the functions the image check found holding an interior jump or own patch (set once, in CompareImage,
+    // before the image is usable). classify() refuses their file reads without refusing the whole file.
+    mutable std::set<std::uint32_t> held;
     void Refuse(const char* reason) const {
         usable.store(false);
         if (!diagnosed.exchange(true)) file_diagnostic(reason);
@@ -218,6 +221,7 @@ struct FileImage {
             "jump or an own patch is never read through it\n",static_cast<unsigned long long>(delta),result.entries,
             result.interiors,result.owns);
         file_log('I',message);
+        held.insert(result.held.begin(),result.held.end());
         return true;
     }
     FileImage() {
@@ -307,6 +311,9 @@ OriginalFile::Admission classify(std::uintptr_t entry,OriginalFile::Detour& reco
     if (!im.procedures.contains(rva)) return OriginalFile::Admission::live;
     const auto result=OriginalFile::resolution_admission(file.matched,file.usable.load(),file.Classify(rva,record));
     if (result!=OriginalFile::Admission::refuse) return result;
+    // Kiln layer: a function the image check admitted with an interior jump or own patch is refused as before, but
+    // the file stays usable for every other function (a detoured call-graph walk still reads entry-detoured ones).
+    if (file.held.contains(rva)) return OriginalFile::Admission::refuse;
     char reason[160];std::snprintf(reason,sizeof(reason),"function RVA 0x%08x differs from the file other than by an entry detour (or exceeds bounds)",rva);
     file.Refuse(reason);
     return OriginalFile::Admission::refuse;

@@ -171,6 +171,11 @@ int main() {
         disk[0x1fff]=0xe9; disk[0x2000]=0x10; disk[0x2001]=disk[0x2002]=disk[0x2003]=0;
         for (std::uint32_t at=0x2004;at<0x2100;at+=3) { disk[at]=0x55; disk[at+1]=disk[at+2]=0x22; }
         for (std::uint32_t k=0;k<300;++k) function(0x3000+0x20*k,{{0x3000+0x20*k,0x3018+0x20*k}});
+        // L: a call-free leaf without unwind data between A and B, after int3 padding (Kiln hooks content/LootItems,
+        // such a leaf)
+        for (std::uint32_t at=0x1110;at<0x111c;at+=3) { disk[at]=0x55; disk[at+1]=static_cast<std::uint8_t>(at); disk[at+2]=0x22; }
+        // code in the gap after B that runs through 0x1420 (an aligned boundary, not a function start)
+        for (std::uint32_t at=0x1411;at<0x1435;at+=3) { disk[at]=0x55; disk[at+1]=static_cast<std::uint8_t>(at); disk[at+2]=0x33; }
         memory=disk;
         std::uint64_t cell_value=hook+0x40;
         using Reader=std::function<bool(std::uint64_t,void*,std::size_t)>;
@@ -214,6 +219,12 @@ int main() {
         e9(0x1000,6); check(accepted(1,0) && classify(0x1000,d)==Admission::detour && d.span==6,"image: entry detour alone, as before");
         memory=disk; e9(0x1230,6);
         check(accepted(0,1),"image: Kiln E9 mid hook at an instruction boundary of an unrelated function");
+        check(compare().held==std::vector<std::uint32_t>{0x1200},"image: the function holding the interior jump is named in held");
+        e9(0x1712,6); e9(0x1260,6);
+        check(compare().held==std::vector<std::uint32_t>({0x1200,0x1500}),"image: held lists each holding function once, sorted (a chained part names its root)");
+        memory=disk; e9(0x1110,6); e9(0x1000,6);
+        check(compare().held.empty(),"image: entry detours alone (functions and gap leaves) hold nothing");
+        memory=disk; e9(0x1230,6);
         check(classify(0x1200,d)==Admission::refuse,"image: the function holding the interior jump is never read through the file");
         check(!selectable(Admission::refuse),"image: and never selected");
         e9(0x1000,6); check(accepted(1,1) && classify(0x1000,d)==Admission::detour && d.span==6,"image: entry detour elsewhere beside an interior jump");
@@ -234,6 +245,24 @@ int main() {
         memory=disk; jump(0x1230,base+0x40200000); memory[0x1235]=0x90; check(refused(),"image: interior jump to non-executable memory refused");
         memory=disk; e9(0x1230,6); memory[0x1300]^=1; check(refused(),"image: body byte changed beside an admitted interior jump refused");
         memory=disk; memory[0x1150]^=1; check(refused(),"image: changed byte between functions refused");
+        memory=disk; e9(0x1110,6);
+        check(accepted(1,0),"image: entry detour on a leaf function in an unwind gap (Kiln's content/LootItems form)");
+        memory=disk; far(0x1110,15); check(accepted(1,0),"image: FF 25 far entry detour on a gap leaf");
+        memory=disk; e9(0x1110,6); memory[0x1115]=0xcc; check(accepted(1,0),"image: gap leaf entry detour with int3 fill");
+        memory=disk; e9(0x1113,6); check(refused(),"image: a jump after code in a gap (no function start) refused");
+        memory=disk; e9(0x1110,6); memory[0x1119]^=1; check(refused(),"image: gap leaf body changed beside its entry detour refused");
+        memory=disk; e9(0x1110,6); memory[0x1180]^=1; check(refused(),"image: a gap byte changed after the detoured leaf refused");
+        memory=disk; jump(0x1110,base+0x5000); memory[0x1115]=0x90; check(refused(),"image: gap leaf jump into this image refused");
+        memory=disk; jump(0x1110,base+0x40200000); memory[0x1115]=0x90;
+        check(refused(),"image: gap leaf jump to non-executable memory refused");
+        disk[0x1104]=0x55; memory=disk; e9(0x1110,6);
+        check(accepted(1,0),"image: another leaf before the detoured one in the same gap, int3 between them");
+        disk[0x1104]=0xcc; memory=disk;
+        memory=disk; jump(0x1420,hook); memory[0x1425]=0x90;
+        check(refused(),"image: an aligned boundary that code falls through into refused");
+        memory=disk; e9(0x1118,6); check(refused(),"image: a gap leaf entry that is not 16-byte aligned refused");
+        memory=disk; e9(0x1110,6); e9(0x1230,6); check(accepted(1,1),"image: gap leaf entry detour beside an interior jump");
+        memory=disk; e9(0x1110,6); e9(0x1000,6); check(accepted(2,0),"image: gap leaf entry detour beside a function's entry detour");
         memory=disk; e9(0x13fe,5); check(refused(),"image: transfer that does not fit its unwind range refused");
         memory=disk; e9(0x1712,6); check(accepted(0,1),"image: interior jump in a chained unwind part");
         memory=disk; jump(0x1fff,hook); memory[0x1fff]=0xe9;
