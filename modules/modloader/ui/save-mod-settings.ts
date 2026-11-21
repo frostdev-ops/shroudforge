@@ -2,6 +2,7 @@ import type { ModInfo } from './mod-types'
 import { postRequest } from '../../transport/ui/send-host-command'
 import { useEffect, useRef, useState } from 'react'
 import type { CommandResult } from '../../notifications/ui/notification-types'
+import { applySettingChange } from './apply-setting-presets'
 
 function settingsValues(mod: ModInfo): Record<string, unknown> {
   return Object.fromEntries(
@@ -112,6 +113,22 @@ export function useModSettings(mod: ModInfo) {
     window.addEventListener('shroudforge-command-result', restoreFailedChange)
     return () => window.removeEventListener('shroudforge-command-result', restoreFailedChange)
   }, [])
+  useEffect(() => {
+    const updateFromServer = (event: Event) => {
+      const remote = (event as CustomEvent<{ mod?: ModInfo }>).detail?.mod
+      if (!remote || remote.id !== modIdRef.current) return
+      latestMod.current = remote
+      revisionRef.current = remote.revision
+      if (!pendingAutoSave.current) {
+        valuesRef.current = settingsValues(remote)
+        setValues(valuesRef.current)
+        setLocalEnabled(remote.enabled)
+      }
+    }
+    window.addEventListener('shroudforge-remote-mod-data', updateFromServer)
+    return () =>
+      window.removeEventListener('shroudforge-remote-mod-data', updateFromServer)
+  }, [])
   const save = () => {
     if (autoSaveTimer.current !== undefined) {
       window.clearTimeout(autoSaveTimer.current)
@@ -125,7 +142,12 @@ export function useModSettings(mod: ModInfo) {
     })
   }
   const updateSetting = (key: string, value: unknown) => {
-    const next = { ...valuesRef.current, [key]: value }
+    const next = applySettingChange(
+      valuesRef.current,
+      latestMod.current.presets,
+      key,
+      value,
+    )
     valuesRef.current = next
     setValues(next)
     pendingAutoSave.current = true

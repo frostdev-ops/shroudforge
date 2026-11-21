@@ -11,6 +11,8 @@ import { useEffect, useRef, useState } from 'react'
 import { Segmented } from '../../ui-resources/choose-segment'
 import { Card } from '../../ui-resources/show-card'
 import { WikiHelp } from '../../wiki/ui/show-wiki-help'
+import { isTargetUiVisible } from '../../loader-config/ui/module-visibility'
+import type { WikiModuleSettings } from '../../wiki/mediawiki-api'
 import type { ModDependencyInfo, ModInfo } from './mod-types'
 import { Hotkeys, hasHotkeyConflicts } from '../../hotkeys/ui/show-hotkeys'
 import {
@@ -25,6 +27,7 @@ export type CompatibilityTab =
   | 'dll-manager'
   | 'hotkeys'
   | 'dependencies'
+  | 'multiplayer-versions'
   | 'engine'
 
 function combinedStatus(statuses: CompatibilityStatus[]): CompatibilityStatus {
@@ -74,19 +77,32 @@ function dependencyStatus(data: Snapshot): CompatibilityStatus {
   return data.configuration ? 'ok' : 'neutral'
 }
 
+function multiplayerVersionsCheck(data: Snapshot) {
+  return data.configuration?.checks.find((check) => check.id === 'networkVersions')
+}
+
+function multiplayerVersionsStatus(data: Snapshot): CompatibilityStatus {
+  return multiplayerVersionsCheck(data)?.state ?? 'neutral'
+}
+
 export function compatibilityNavigationStatus(
   data: Snapshot,
 ): CompatibilityStatus {
+  const vanillaKey = data.mode === 'SERVER' ? 'vanillaServer' : 'vanillaClient'
+  const requested = data.settings.modulePreferences?.modloaderUi?.[vanillaKey] === true
   const configuration = data.configuration
-  if (!configuration) return 'neutral'
+  if (!configuration) return data.vanillaSession != null && data.vanillaSession !== requested ? 'restart-required' : 'neutral'
   const engineStatuses: CompatibilityStatus[] = configuration.checks
     .filter((check) => ['game', 'runtime', 'api', 'parser'].includes(check.id))
     .map((check) => check.state)
   if (configuration.errors.length) engineStatuses.push('error')
   if (configuration.assets) engineStatuses.push(assetCompatibilityStatus(configuration.assets.state))
+  const multiplayerCheck = multiplayerVersionsCheck(data)
   return combinedStatus([
     modDetectionStatus(data), dllManagerStatus(data), dependencyStatus(data),
     hasHotkeyConflicts(data) ? 'warning' : 'ok',
+    ...(multiplayerCheck ? [multiplayerCheck.state] : []),
+    ...(data.vanillaSession != null && data.vanillaSession !== requested ? ['restart-required' as const] : []),
     ...engineStatuses,
   ])
 }
@@ -104,6 +120,8 @@ export type CompatibilityRowData = {
 
 export function Compatibility({
   data,
+  wikiModuleSettings,
+  openWikiCategory,
   news,
   openNews,
   selectMod,
@@ -112,6 +130,8 @@ export function Compatibility({
   setTab,
 }: {
   data: Snapshot
+  wikiModuleSettings?: WikiModuleSettings
+  openWikiCategory(category: string): void
   news: NewsItem[]
   openNews(): void
   selectMod(id: string): void
@@ -120,8 +140,24 @@ export function Compatibility({
   setTab(tab: CompatibilityTab): void
 }) {
   const { t } = useI18n()
+  const target = data.settings.modulePreferences?.modloaderUi?.remoteTarget === 'server'
+    ? 'server'
+    : 'client'
+  const moduleVisible = (module: string) =>
+    isTargetUiVisible('modules', module, target, data.settings.targetUi)
+  const allowedTabs: CompatibilityTab[] = []
+  if (moduleVisible('modDetection')) allowedTabs.push('mod-detection', 'dependencies')
+  if (target === 'server' && moduleVisible('network')) allowedTabs.push('multiplayer-versions')
+  if (moduleVisible('dllManager')) allowedTabs.push('dll-manager')
+  if (moduleVisible('modloaderUi')) allowedTabs.push('hotkeys')
+  if (moduleVisible('runtimeDiagnostics')) allowedTabs.push('engine')
+  const activeTab = allowedTabs.includes(tab) ? tab : allowedTabs[0] ?? null
+  const showWikiHelp = moduleVisible('wiki')
   const [showAllDependencies, setShowAllDependencies] = useState(false)
   const loggedTab = useRef<string | null>(null)
+  useEffect(() => {
+    if (allowedTabs.length && !allowedTabs.includes(tab)) setTab(allowedTabs[0])
+  }, [tab, allowedTabs.join('|'), setTab])
   useEffect(() => {
     if (loggedTab.current === tab) return
     loggedTab.current = tab
@@ -154,6 +190,7 @@ export function Compatibility({
   const tolerateUnknownFields =
     localDetection.tolerateUnknownManifestFields !== false
   const dllStatus = dllManagerStatus(data)
+  const networkVersions = multiplayerVersionsCheck(data)
   const changeDetection = (key: string, value: boolean) => {
     logUiEvent({
       level: 'DEBUG', source: 'compatibility', operation: 'save-setting-requested', subject: 'mod-detection',
@@ -396,29 +433,20 @@ export function Compatibility({
           </>
         }
       />
-      <Segmented
-        value={tab}
+      {data.vanillaSession != null && <p className="hint">
+        {t(data.vanillaSession ? 'vanilla.active' : 'vanilla.modloaderActive')}
+        {data.vanillaSession !== (data.settings.modulePreferences?.modloaderUi?.[data.mode === 'SERVER' ? 'vanillaServer' : 'vanillaClient'] === true) && ` ${t('vanilla.restartRequired')}`}
+      </p>}
+      {allowedTabs.length > 0 && <Segmented
+        value={activeTab!}
         onChange={(value) => setTab(value as CompatibilityTab)}
         items={[
+          ...(moduleVisible('modDetection') ? [
           [
             'mod-detection',
             <CompatibilityTabLabel
               label={t('compatibility.tab.modDetection')}
               status={modDetectionStatus(data)}
-            />,
-          ],
-          [
-            'dll-manager',
-            <CompatibilityTabLabel
-              label={t('compatibility.tab.dllManager')}
-              status={dllStatus}
-            />,
-          ],
-          [
-            'hotkeys',
-            <CompatibilityTabLabel
-              label={t('compatibility.tab.hotkeys')}
-              status={hasHotkeyConflicts(data) ? 'warning' : 'ok'}
             />,
           ],
           [
@@ -428,6 +456,35 @@ export function Compatibility({
               status={dependencyStatus(data)}
             />,
           ],
+          ] : []),
+          ...(moduleVisible('dllManager') ? [
+          [
+            'dll-manager',
+            <CompatibilityTabLabel
+              label={t('compatibility.tab.dllManager')}
+              status={dllStatus}
+            />,
+          ],
+          ] : []),
+          ...(target === 'server' && moduleVisible('network') ? [
+          [
+            'multiplayer-versions',
+            <CompatibilityTabLabel
+              label={t('compatibility.tab.multiplayerVersions')}
+              status={multiplayerVersionsStatus(data)}
+            />,
+          ],
+          ] : []),
+          ...(moduleVisible('modloaderUi') ? [
+          [
+            'hotkeys',
+            <CompatibilityTabLabel
+              label={t('compatibility.tab.hotkeys')}
+              status={hasHotkeyConflicts(data) ? 'warning' : 'ok'}
+            />,
+          ],
+          ] : []),
+          ...(moduleVisible('runtimeDiagnostics') ? [
           [
             'engine',
             <CompatibilityTabLabel
@@ -435,11 +492,12 @@ export function Compatibility({
               status={engineStatus}
             />,
           ],
+          ] : []),
         ]}
-      />
-      {tab === 'mod-detection' && (
+      />}
+      {activeTab === 'mod-detection' && (
         <div className="settings-module-list compatibility-sections">
-          <WikiHelp articleId="mod-detection" />
+          {showWikiHelp && <WikiHelp articleId="mod-detection" moduleSettings={wikiModuleSettings} onOpenCategory={openWikiCategory} />}
           <Card title={t('compatibility.modDetection.title')}>
             <p className="hint settings-module-description">
               {t('compatibility.modDetection.description')}
@@ -492,11 +550,11 @@ export function Compatibility({
           </Card>
         </div>
       )}
-      {tab === 'dll-manager' && <DllManagerPanel data={data} />}
-      {tab === 'hotkeys' && <Hotkeys data={data} />}
-      {tab === 'dependencies' && (
+      {activeTab === 'dll-manager' && <DllManagerPanel data={data} wikiModuleSettings={wikiModuleSettings} openWikiCategory={openWikiCategory} showWikiHelp={showWikiHelp} />}
+      {activeTab === 'hotkeys' && <Hotkeys data={data} wikiModuleSettings={wikiModuleSettings} openWikiCategory={openWikiCategory} />}
+      {activeTab === 'dependencies' && (
         <div className="settings-module-list compatibility-sections">
-          <WikiHelp articleId="dependencies" />
+          {showWikiHelp && <WikiHelp articleId="dependencies" moduleSettings={wikiModuleSettings} onOpenCategory={openWikiCategory} />}
           <section className="settings-module compatibility-section">
             <header>
               <div>
@@ -548,9 +606,99 @@ export function Compatibility({
           </section>
         </div>
       )}
-      {tab === 'engine' && (
+      {activeTab === 'multiplayer-versions' && (
+        <div className="settings-module-list compatibility-sections">
+          <section className="settings-module compatibility-section">
+            <header>
+              <div>
+                <h3>{t('compatibility.section.multiplayerVersions')}</h3>
+                <p className="hint">
+                  {t('compatibility.section.multiplayerVersions.description')}
+                </p>
+                <small>{t('compatibility.multiplayerVersions.loader', {
+                  version: data.version,
+                })}</small>
+              </div>
+              <CompatibilityStatusBadge status={multiplayerVersionsStatus(data)} />
+            </header>
+            {!networkVersions?.clients?.length && (
+              <p className="hint settings-module-description">
+                {t('compatibility.multiplayerVersions.empty')}
+              </p>
+            )}
+            {networkVersions?.clients?.map((client) => {
+              const player = client.playerName?.trim() || client.steamId
+              const status: CompatibilityStatus = client.state === 'warning'
+                ? 'warning' : client.state === 'ok' ? 'ok' : 'neutral'
+              return (
+                <div className={`settings-option ${status}`} key={client.steamId}>
+                  <span className="compatibility-row-copy">
+                    <strong>{player}</strong>
+                    <small>
+                      {client.steamId} · {t('compatibility.multiplayerVersions.loader', {
+                        version: client.loaderVersion ?? '—',
+                      })}
+                    </small>
+                    {client.issues.length ? client.issues.map((issue, index) => {
+                      let detail: string
+                      switch (issue.code) {
+                        case 'report-pending':
+                          detail = t('compatibility.multiplayerVersions.reportPending', { player })
+                          break
+                        case 'report-missing':
+                          detail = t('compatibility.multiplayerVersions.reportMissing', { player })
+                          break
+                        case 'report-stale':
+                          detail = t('compatibility.multiplayerVersions.reportStale', { player })
+                          break
+                        case 'loader-version':
+                          detail = t('compatibility.multiplayerVersions.loaderMismatch', {
+                            player,
+                            clientVersion: issue.clientVersion ?? '—',
+                            serverVersion: issue.serverVersion ?? '—',
+                          })
+                          break
+                        case 'mod-version':
+                          detail = t('compatibility.multiplayerVersions.modMismatch', {
+                            modId: issue.modId ?? 'unknown',
+                            player,
+                            clientVersion: issue.clientVersion ?? '—',
+                            serverVersion: issue.serverVersion ?? '—',
+                          })
+                          break
+                        case 'mod-missing-client':
+                          detail = t('compatibility.multiplayerVersions.modMissingClient', {
+                            modId: issue.modId ?? 'unknown', player,
+                          })
+                          break
+                        case 'mod-missing-server':
+                          detail = t('compatibility.multiplayerVersions.modMissingServer', {
+                            modId: issue.modId ?? 'unknown', player,
+                          })
+                          break
+                        case 'client-problem':
+                          detail = t('compatibility.multiplayerVersions.clientProblem', {
+                            player, detail: issue.detail ?? issue.code,
+                          })
+                          break
+                        default:
+                          detail = `${issue.code}${issue.detail ? `: ${issue.detail}` : ''}`
+                      }
+                      return <small key={`${issue.code}:${issue.modId ?? ''}:${index}`}>{detail}</small>
+                    }) : (
+                      <small>{t('compatibility.multiplayerVersions.clientOk')}</small>
+                    )}
+                  </span>
+                  <CompatibilityStatusBadge status={status} />
+                </div>
+              )
+            })}
+          </section>
+        </div>
+      )}
+      {activeTab === 'engine' && (
         <>
-          <WikiHelp articleId="engine" />
+          {showWikiHelp && <WikiHelp articleId="engine" moduleSettings={wikiModuleSettings} onOpenCategory={openWikiCategory} />}
           <section className={`compatibility-summary ${overall}`}>
             <span className={`compatibility-summary-icon ${overall}`}>
               <Icon
@@ -664,7 +812,12 @@ function normalizedDllNames(names: unknown): string[] {
     : []
 }
 
-function DllManagerPanel({ data }: { data: Snapshot }) {
+function DllManagerPanel({ data, wikiModuleSettings, openWikiCategory, showWikiHelp }: {
+  data: Snapshot
+  wikiModuleSettings?: WikiModuleSettings
+  openWikiCategory(category: string): void
+  showWikiHelp: boolean
+}) {
   const { t } = useI18n()
   const manager = data.settings.modulePreferences?.dllManager || {}
   const [enabled, setEnabled] = useState(manager.enabled !== false)
@@ -724,7 +877,7 @@ function DllManagerPanel({ data }: { data: Snapshot }) {
 
   return (
     <div className="settings-module-list compatibility-sections dll-manager">
-      <WikiHelp articleId="dll-manager" />
+      {showWikiHelp && <WikiHelp articleId="dll-manager" moduleSettings={wikiModuleSettings} onOpenCategory={openWikiCategory} />}
       <Card title={t('compatibility.dllManager.title')}>
         <p className="hint settings-module-description">{t('compatibility.dllManager.description')}</p>
         <ModuleEnabledRow label={t('settings.modules.field.active')} enabled={enabled} onChange={(value) => {

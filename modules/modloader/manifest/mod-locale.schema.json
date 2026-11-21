@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://bonsaibauer.github.io/shroudforge/schemas/mod-locale.schema.json",
+  "$id": "https://shroudforge.net/schemas/1.8.0/mod-locale.schema.json",
   "title": "ShroudForge mod locale catalog",
   "type": "object",
   "additionalProperties": false,
@@ -43,6 +43,12 @@
         "label": { "type": "string", "minLength": 1, "maxLength": 120 },
         "description": { "type": "string", "maxLength": 500 },
         "options": {
+          "type": "object",
+          "propertyNames": { "type": "string" },
+          "additionalProperties": { "type": "string", "minLength": 1, "maxLength": 120 }
+        },
+        "optionGroups": {
+          "description": "Translations for option category labels declared by the setting's options.",
           "type": "object",
           "propertyNames": { "type": "string" },
           "additionalProperties": { "type": "string", "minLength": 1, "maxLength": 120 }

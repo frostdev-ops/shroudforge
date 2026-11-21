@@ -28,7 +28,13 @@ impl IngameRuntime {
             .poll_native_dll_loads();
         self.process_runtime_reload_request();
         if std::time::Instant::now() >= self.next_status {
-            let config = shroudforge_loader_config::config::read_loader(&self.root).ok();
+            let config = shroudforge_loader_config::config::read_loader_in_background(&self.root).ok();
+            let is_server = self
+                .runner
+                .lua
+                .app_data_ref::<AppState>()
+                .unwrap()
+                .is_server();
             if config
                 .as_ref()
                 .and_then(|value| value.pointer("/modules/network/enabled"))
@@ -53,6 +59,7 @@ impl IngameRuntime {
             } else {
                 shroudforge_steam_networking::service_shutdown();
             }
+            shroudforge_steam_networking::service_remote_ui(&self.root, config.as_ref(), is_server);
             self.refresh_configuration();
             let now = std::time::Instant::now();
             if now >= self.next_status_publication {

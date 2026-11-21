@@ -2,6 +2,20 @@
   "schemaVersion": 1,
   "messages": [
     {
+      "id": "shroudforge-wiki-community-1",
+      "kind": "notice.wikiCommunity",
+      "beta": false,
+      "englishOnly": false,
+      "title": "Help build the ShroudForge Wiki",
+      "message": "The Modloader's Wiki tab connects to wiki.shroudforge.net through the MediaWiki API, where you can search guides and help articles. Related Wiki articles also appear alongside relevant Modloader compatibility settings. Register on the Wiki to contribute guides, fixes, troubleshooting tips, mods, or clear mod descriptions.",
+      "level": "info",
+      "actionUrl": "https://wiki.shroudforge.net",
+      "actionLabelKey": "news.notice.wikiCommunity.openWebsite",
+      "actions": [
+        { "id": "open-wiki", "kind": "open-wiki" }
+      ]
+    },
+    {
       "id": "shroudforge-localization-beta-1",
       "kind": "notice.localization",
       "beta": false,
@@ -77,7 +91,7 @@
       "links": [
         { "labelKey": "news.link.firstMod", "url": "https://bonsaibauer.github.io/shroudforge/{locale}/#first" },
         { "labelKey": "news.link.extendedModJson", "url": "https://bonsaibauer.github.io/shroudforge/{locale}/#doc-extended-mod-json-guide" },
-        { "labelKey": "news.link.api", "url": "https://bonsaibauer.github.io/shroudforge/{locale}/#api" }
+        { "labelKey": "news.link.api", "url": "https://shroudforge.net/tools/modding/api-reference/" }
       ]
     },
     {
@@ -100,7 +114,7 @@
       "kind": "notice.multiplayerSupport",
       "beta": false,
       "englishOnly": false,
-      "title": "Multiplayer support for all ShroudForge mods",
+      "title": "Multiplayer support for the five standard ShroudForge mods",
       "message": "All five mods currently included with ShroudForge support multiplayer. See the server guides for setup details.",
       "level": "info"
     },

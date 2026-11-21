@@ -24,16 +24,29 @@ impl Session {
         }
         let content = value.clone();
         value["updatedAt"] = updated_at;
-        match shroudforge_loader_config::config::write_document(
-            &self.root,
-            crate::documents::STATUS,
-            &value,
-        ) {
-            Ok(()) => self.published = Some((content, now)),
-            Err(error) => {
-                // Not recorded as published: the next tick tries again.
-                self.published = None;
-                tracing::error!(target:"shroudforge::diagnostics","Status publication failed: {error}");
+        // Off the mods' loop in game: a write could stall every mod at times.
+        if self.background_io {
+            // Kiln layer: a failed background write is only logged; the status is written again with
+            // the next change, or after UNCHANGED_STATUS_REFRESH, well inside status()'s 65 s.
+            shroudforge_loader_config::config::write_document_in_background(
+                &self.root,
+                crate::documents::STATUS,
+                value,
+                |error| tracing::error!(target:"shroudforge::diagnostics","Status publication failed: {error}"),
+            );
+            self.published = Some((content, now));
+        } else {
+            match shroudforge_loader_config::config::write_document(
+                &self.root,
+                crate::documents::STATUS,
+                &value,
+            ) {
+                Ok(()) => self.published = Some((content, now)),
+                Err(error) => {
+                    // Not recorded as published: the next tick tries again.
+                    self.published = None;
+                    tracing::error!(target:"shroudforge::diagnostics","Status publication failed: {error}");
+                }
             }
         }
     }

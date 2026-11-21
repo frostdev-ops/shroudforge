@@ -13,7 +13,9 @@ import modSupportFeedbackEs from './assets/mod-support-feedback.es.svg'
 import modSupportFeedbackFr from './assets/mod-support-feedback.fr.svg'
 import multiplayerSupportBanner from './assets/multiplayer-support.svg'
 import creativeModeBanner from './assets/creative-mode-banner.png'
+import wikiCommunityBanner from './assets/wiki-community-banner.svg'
 import nexusModsBanner from '../../../assets/nexusmods-enshrouded-banner.jpg'
+import translationsBanner from './assets/translations-fink.svg'
 
 const modSupportFeedbackBanners: Record<string, string> = {
   de: modSupportFeedbackDe,
@@ -87,6 +89,10 @@ export function NoticeCard({
   const modSupportLink = links.find(
     (link) => link.labelKey === 'news.link.modCompatibility',
   )
+  const localizationLink =
+    item.kind === 'notice.localization'
+      ? links.find((link) => link.labelKey === 'news.localization.contribute')
+      : undefined
   const creativeModeDownloadLink =
     item.kind === 'notice.creativeMode'
       ? links.find((link) => link.labelKey === 'news.link.creativeModeDownload')
@@ -136,6 +142,20 @@ export function NoticeCard({
             <img src={item.banner.imageUrl} alt="" loading="lazy" />
           </button>
         )}
+        {!compact && localizationLink?.url && (
+          <button
+            className="notice-banner"
+            type="button"
+            aria-label={cardT('news.localization.contribute')}
+            onClick={() =>
+              postRequest('open-url', {
+                url: localizedUrl(localizationLink.url!),
+              })
+            }
+          >
+            <img src={translationsBanner} alt="" loading="lazy" />
+          </button>
+        )}
         {!compact &&
           item.kind === 'notice.creativeMode' &&
           creativeModeDownloadLink?.url && (
@@ -170,6 +190,18 @@ export function NoticeCard({
             }
           >
             <img src={nexusModsBanner} alt="" loading="lazy" />
+          </button>
+        )}
+        {!compact && item.kind === 'notice.wikiCommunity' && item.actionUrl && (
+          <button
+            className="notice-banner"
+            type="button"
+            aria-label={cardT('news.notice.wikiCommunity.openWebsite')}
+            onClick={() =>
+              postRequest('open-url', { url: localizedUrl(item.actionUrl!) })
+            }
+          >
+            <img src={wikiCommunityBanner} alt="" loading="lazy" />
           </button>
         )}
         {!compact && modSupportLink?.url && (

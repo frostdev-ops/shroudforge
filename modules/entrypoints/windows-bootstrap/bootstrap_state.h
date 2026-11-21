@@ -43,6 +43,7 @@ std::filesystem::path module_directory();
 bool is_dedicated_server_process();
 std::filesystem::path shroudforge_directory(const std::filesystem::path& root);
 void begin_log_session(const std::filesystem::path& root);
+void log_shroudforge_build_identity(const std::filesystem::path& root);
 void log(char level, const std::string& message);
 void log(const std::string& message);
 void log_shroudforge_banner(bool dedicated_server);
@@ -59,7 +60,7 @@ void show_startup_error(const std::filesystem::path& root, const std::string& de
 void clear_runtime_heartbeat(const std::filesystem::path& root);
 void start_debug_console(const std::filesystem::path& root);
 void stop_debug_console();
-void start_modloader_ui(const std::filesystem::path& root);
+void start_modloader_ui(const std::filesystem::path& root, bool vanilla = false);
 void stop_modloader_ui();
 void start_world_editor_ui(const std::filesystem::path& root);
 void stop_world_editor_ui();

@@ -46,9 +46,9 @@ fn channel(options: &Option<Table>) -> mlua::Result<i32> {
         Some(options) => options.raw_get::<Option<i32>>("channel")?.unwrap_or(0),
         None => 0,
     };
-    if !(0..=65_534).contains(&channel) {
+    if !(0..=65_533).contains(&channel) {
         return Err(mlua::Error::runtime(
-            "Channel must be between 0 and 65534. 65535 is reserved for Network health checks",
+            "Channel must be between 0 and 65533. 65534 is reserved for Modloader file mirroring and 65535 for Network health checks",
         ));
     }
     Ok(channel)
@@ -96,7 +96,7 @@ fn mod_channel(id: &str) -> i32 {
     let hash = id.bytes().fold(0x811c9dc5u32, |hash, byte| {
         (hash ^ u32::from(byte)).wrapping_mul(0x01000193)
     });
-    ((hash % 65_534) + 1) as i32
+    ((hash % 65_533) + 1) as i32
 }
 
 pub fn create(lua: &Lua, owner: &Mod, context: RuntimeContext) -> mlua::Result<Table> {
@@ -137,6 +137,14 @@ pub fn create(lua: &Lua, owner: &Mod, context: RuntimeContext) -> mlua::Result<T
             result.raw_set(
                 "remote_dedicated_server_steam_id",
                 native.remote_dedicated_server_steam_id,
+            )?;
+            // The game this client joined, from the game's own session log.
+            result.raw_set(
+                "session_host_steam_id",
+                (reason.is_none() && !(context.is_server)(lua))
+                    .then(|| steam_network::read_session_peers(&(context.root)(lua), false).host())
+                    .flatten()
+                    .map(|id| id.to_string()),
             )?;
             result.raw_set("service_ready", native.service_ready)?;
             let root = (context.root)(lua);
@@ -268,17 +276,22 @@ pub fn create(lua: &Lua, owner: &Mod, context: RuntimeContext) -> mlua::Result<T
             ) {
                 return Ok((None::<Table>, Some(reason)));
             }
-            if !(context.is_server)(lua) {
-                return Ok((
-                    None,
-                    Some(
-                        "connected_peers is available only in the Dedicated Server runtime".into(),
-                    ),
-                ));
-            }
-            let peers = match steam_network::connected_peers() {
-                Ok(peers) => peers,
-                Err(reason) => return Ok((None, Some(reason))),
+            let peers = if (context.is_server)(lua) {
+                match steam_network::connected_peers() {
+                    Ok(peers) => peers,
+                    Err(reason) => return Ok((None, Some(reason))),
+                }
+            } else {
+                // A player's game that hosts: the players of its session.
+                match steam_network::read_session_peers(&(context.root)(lua), false).players() {
+                    Some(players) => players.iter().map(u64::to_string).collect(),
+                    None => {
+                        return Ok((
+                            None,
+                            Some("this game does not host a multiplayer session".into()),
+                        ));
+                    }
+                }
             };
             let allowed = match authorized_client_ids(&(context.root)(lua)) {
                 Ok(allowed) => allowed,
@@ -297,6 +310,43 @@ pub fn create(lua: &Lua, owner: &Mod, context: RuntimeContext) -> mlua::Result<T
                 .enumerate()
             {
                 result.raw_set(index + 1, peer.as_str())?;
+            }
+            Ok((Some(result), None))
+        })?,
+    )?;
+
+    let permissions_owner = owner.clone();
+    network.set(
+        "player_permissions",
+        lua.create_function(move |lua, peer: String| {
+            if let Some(reason) = denied(
+                lua,
+                &permissions_owner,
+                "runtime.network.player_permissions",
+                context,
+            ) {
+                return Ok((None::<Table>, Some(reason)));
+            }
+            let peer = match steam_id(&peer) {
+                Ok(peer) => peer,
+                Err(reason) => return Ok((None, Some(reason))),
+            };
+            // The permissions the player logged in with, from the hosting
+            // game's own log: a Dedicated Server or a player's game.
+            let session =
+                steam_network::read_session_peers(&(context.root)(lua), (context.is_server)(lua));
+            if session.players().is_none() {
+                return Ok((None, Some("this game does not host a multiplayer session".into())));
+            }
+            let Some(names) = session.player_permissions(peer) else {
+                return Ok((
+                    None,
+                    Some("this player is not in this game or has not logged in yet".into()),
+                ));
+            };
+            let result = lua.create_table()?;
+            for name in names {
+                result.raw_set(name.as_str(), true)?;
             }
             Ok((Some(result), None))
         })?,

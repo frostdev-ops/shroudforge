@@ -47,6 +47,16 @@ pub(crate) fn save_settings(root: &Path, settings: &UiSettings) -> Result<(), St
                     &["enabled", "startPage", "toggleKey", "refreshMilliseconds"][..],
                 ),
                 (
+                    "wiki",
+                    &[
+                        "enabled",
+                        "itemsPerPage",
+                        "pageSize",
+                        "maxResultsPerQuery",
+                        "refreshIntervalMinutes",
+                    ][..],
+                ),
+                (
                     "worldEditor",
                     &["enabled", "toggleKey", "refreshMilliseconds"][..],
                 ),
@@ -207,11 +217,7 @@ mod tests {
             )
             .unwrap();
             save_settings(root.path(), &settings(json!({}))).unwrap();
-            save_settings(
-                root.path(),
-                &settings(json!({"gameProfileDiscovery": {}})),
-            )
-            .unwrap();
+            save_settings(root.path(), &settings(json!({"gameProfileDiscovery": {}}))).unwrap();
             let saved = shroudforge_loader_config::config::read_loader(root.path()).unwrap();
             assert_eq!(saved["modules"]["gameProfileDiscovery"]["enabled"], enabled);
         }
@@ -228,11 +234,13 @@ mod tests {
         let path = shroudforge_loader_config::paths::loader_config(root.path());
         let before = std::fs::read(&path).unwrap();
         for invalid in [json!("false"), json!(0), serde_json::Value::Null] {
-            assert!(save_settings(
-                root.path(),
-                &settings(json!({"gameProfileDiscovery": {"enabled": invalid}})),
-            )
-            .is_err());
+            assert!(
+                save_settings(
+                    root.path(),
+                    &settings(json!({"gameProfileDiscovery": {"enabled": invalid}})),
+                )
+                .is_err()
+            );
             assert_eq!(std::fs::read(&path).unwrap(), before);
         }
     }

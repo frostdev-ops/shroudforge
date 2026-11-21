@@ -1,4 +1,26 @@
 use super::*;
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
+
+pub(crate) const MAX_CONTENT_READ_JOBS: usize = 4;
+pub(crate) const MAX_CONTENT_READ_BYTES: u64 = 32 * 1024 * 1024;
+
+#[derive(Clone)]
+pub(crate) struct ContentReadPermit {
+    _inner: Arc<ContentReadPermitInner>,
+}
+
+struct ContentReadPermitInner {
+    in_flight: Arc<AtomicUsize>,
+}
+
+impl Drop for ContentReadPermitInner {
+    fn drop(&mut self) {
+        self.in_flight.fetch_sub(1, Ordering::Release);
+    }
+}
 
 pub struct ResourceInfo {
     pub resource_id: ResourceId,
@@ -105,7 +127,7 @@ impl ResourceInfo {
             .get_or_try_init(|| {
                 let bytes = match self.source {
                     ResourceSource::KfcFile => app_state
-                        .reader()
+                        .reader()?
                         .read_resource(&self.resource_id)?
                         .map(|bytes| Rc::<[u8]>::from(bytes)),
                     ResourceSource::AssetTransaction => None,
@@ -139,18 +161,29 @@ impl ResourceInfo {
 }
 
 impl AppState {
+    pub(crate) fn reserve_content_read(&self) -> Option<ContentReadPermit> {
+        self.content_reads_in_flight
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |in_flight| {
+                (in_flight < MAX_CONTENT_READ_JOBS).then_some(in_flight + 1)
+            })
+            .ok()?;
+
+        Some(ContentReadPermit {
+            _inner: Arc::new(ContentReadPermitInner {
+                in_flight: Arc::clone(&self.content_reads_in_flight),
+            }),
+        })
+    }
+
     #[inline]
     pub fn kfc_file(&self) -> &KFCFile {
         &self.ref_file
     }
 
     #[inline]
-    pub fn reader(&self) -> RefMut<'_, KFCCursor<KFCReader>> {
-        RefMut::map(self.reader.borrow_mut(), |reader| {
-            reader
-                .as_mut()
-                .expect("asset reader is closed after publication")
-        })
+    pub fn reader(&self) -> mlua::Result<RefMut<'_, KFCCursor<KFCReader>>> {
+        RefMut::filter_map(self.reader.borrow_mut(), Option::as_mut)
+            .map_err(|_| LuaError::generic(super::GAME_FILE_HANDLES_RELEASED))
     }
 
     #[inline]
@@ -165,9 +198,10 @@ impl AppState {
         if !self.asset_transaction.get() {
             return Err(LuaError::generic("typed asset transaction is unavailable"));
         }
-        // Resource conversion has finished. KFCCursor retains a live resource
-        // file handle; close it before replacing or recovering that path.
-        drop(self.reader.borrow_mut().take());
+        // Publishing replaces enshrouded.kfc_resources, which the reader keeps
+        // open. Windows replaces open files with POSIX semantics, Wine/Proton
+        // rejects that with "Access denied (os error 5)".
+        self.reader.borrow_mut().take();
         shroudforge_game_assets::transaction::commit(
             self.env.game_dir().as_std_path(),
             &self.asset_stem,
@@ -291,7 +325,7 @@ impl AppState {
             Ok(Some(value.clone()))
         } else {
             // OPTIMIZE: consider using a reader for this
-            Ok(self.reader().read_content(guid)?)
+            Ok(self.reader()?.read_content(guid)?)
         }
     }
 
@@ -377,6 +411,7 @@ mod asset_transaction_tests {
             asset_transaction: Cell::new(true),
             asset_stem: "game".to_owned(),
             new_contents: RefCell::default(),
+            content_reads_in_flight: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             resources: RefCell::default(),
             loaded_resource_indexes: RefCell::default(),
             types: RefCell::default(),

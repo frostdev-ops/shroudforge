@@ -6,6 +6,7 @@ import type {
   BackupManagement,
 } from '../../updater/ui/update-types'
 import type { Settings } from '../../loader-config/ui/loader-settings'
+import { DEFAULT_UI_TARGET_SETTINGS } from '../../loader-config/ui/module-visibility'
 import type { ModInfo } from './mod-types'
 import type { DiagnosticStatus } from '../../runtime-diagnostics/ui/diagnostic-status'
 import type { Notice } from '../../notifications/ui/notification-types'
@@ -18,6 +19,9 @@ export type RuntimeProblemCode =
   | 'runtime-not-ready'
 
 export type Snapshot = {
+  vanillaSession?: boolean | null
+  uiVanilla?: boolean
+  installationTarget?: 'client' | 'server'
   diagnostics?: DiagnosticStatus
   dllCandidates: DllCandidate[]
   dllChainEntries: DllLoadEntry[]
@@ -44,11 +48,26 @@ export type Snapshot = {
       code?: RuntimeProblemCode
       detail: string
       phase?: string
+      clients?: Array<{
+        steamId: string
+        playerName?: string
+        state: 'ok' | 'warning' | 'neutral'
+        loaderVersion?: string
+        issues: Array<{
+          code: string
+          modId?: string
+          clientVersion?: string
+          serverVersion?: string
+          detail?: string
+        }>
+      }>
     }>
     assets: { state: string; detail: string }
     lastUpdate?: { version: string; build: string; installedAt: number }
   }
+  serverRights?: ServerRights
   connected: boolean
+  remoteServerState: 'connecting' | 'connected' | 'disconnected'
   mode: string
   gameVersion: string
   version: string
@@ -65,6 +84,7 @@ export type Snapshot = {
     { title: string; message: string; beta?: boolean; englishOnly?: boolean }
   >
   readNoticeIds: string[]
+  readNoticeIdsServer: string[]
   release: Release
   releaseAnnouncement?: {
     updateAvailable: boolean
@@ -77,6 +97,49 @@ export type Snapshot = {
   settings: Settings
   catalog?: Catalog
   locale: string
+}
+
+export type ServerView = {
+  mode: 'SERVER'
+  gameVersion: string
+  version: string
+  configuration?: Snapshot['configuration']
+  dllCandidates: DllCandidate[]
+  dllChainEntries: DllLoadEntry[]
+  hotkeyConflicts: Snapshot['hotkeyConflicts']
+  notices: Notice[]
+  newsTemplates?: Snapshot['newsTemplates']
+  mods: ModInfo[]
+  serverRights?: ServerRights
+}
+
+export type ServerViewDetails = Omit<ServerView, 'mods'>
+
+export type ServerPermissionValues = {
+  canKickBan: boolean
+  canAccessInventories: boolean
+  canEditWorld: boolean
+  canEditBase: boolean
+  canExtendBase: boolean
+}
+
+export type ServerPermissionGroup = ServerPermissionValues & {
+  name: string
+  isShroudForgeAdmin: boolean
+  syncServerLogs: boolean
+}
+
+export type ServerPermissionPlayer = ServerPermissionValues & {
+  steamId: string
+  playerName?: string
+  groupName?: string
+  permissionsKnown: boolean
+  isShroudForgeAdmin: boolean
+}
+
+export type ServerRights = {
+  groups: ServerPermissionGroup[]
+  players: ServerPermissionPlayer[]
 }
 
 export type DllCandidate = {
@@ -129,6 +192,7 @@ export type PageId =
   | 'recycle-bin'
   | 'compatibility'
   | 'settings'
+  | 'server-management'
   | 'wiki'
 
 export type LinkDefinition = {
@@ -154,6 +218,7 @@ export const empty: Snapshot = {
   dllCandidates: [],
   dllChainEntries: [],
   connected: false,
+  remoteServerState: 'connecting',
   mode: 'DESKTOP',
   gameVersion: '',
   version: '1.0.0',
@@ -162,6 +227,7 @@ export const empty: Snapshot = {
   activity: [],
   notices: [],
   readNoticeIds: [],
+  readNoticeIdsServer: [],
   locale: 'en-GB',
   release: {
     currentVersion: '1.0.0',
@@ -181,6 +247,7 @@ export const empty: Snapshot = {
     restore: { status: 'idle' },
   },
   settings: {
+    targetUi: DEFAULT_UI_TARGET_SETTINGS,
     compactMode: false,
     reducedMotion: false,
     showNativeModMenu: true,

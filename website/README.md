@@ -1,6 +1,8 @@
 # ShroudForge Downloadwebsite
 
-`website/` enthält die statische Downloadwebsite für `https://shroudforge.net` und die öffentliche Devseite `https://dev.shroudforge.net`. Die vorhandene API-Dokumentation unter `docs/website/` und ihr GitHub-Pages-Workflow bleiben eigenständig. Die Downloadwebsite wird nach `build/download-website/` erzeugt und mit Cloudflare Workers Static Assets ausgeliefert. Ein eigener Worker-Entrypoint und ein Anwendungsserver sind nicht erforderlich.
+`website/` enthält die statische Downloadwebsite für `https://shroudforge.net` und die öffentliche Devseite `https://dev.shroudforge.net`. Die alte GitHub-Pages-Dokumentation wurde entfernt. Ihre weiterhin gültigen URLs zeigen jetzt die schlanke Weiterleitungsseite aus dem Stammordner `githubpages/`. Die Downloadwebsite wird nach `build/download-website/` erzeugt und mit Cloudflare Workers Static Assets ausgeliefert. Ein eigener Worker-Entrypoint und ein Anwendungsserver sind nicht erforderlich.
+
+Der API-Katalog und die Spieldaten für die Hauptwebsite werden aus `modules/mod-runtime/lua/` und `website/data/` unter `build/website-data/` erzeugt. Verwende `npm run website:api-check`, um diese Daten zu erstellen und zu prüfen.
 
 ## Releasequelle und lokaler Build
 
@@ -10,6 +12,7 @@ Node.js 24 verwenden. Aus dem Repositoryverzeichnis wird die Website einschließ
 
 ```powershell
 npm ci
+npm ci --prefix modules/modloader/ui
 $env:WEBSITE_ORIGIN = 'https://shroudforge.net'
 $env:GH_TOKEN = gh auth token
 npm run downloads:check
@@ -17,7 +20,7 @@ npm run downloads:check
 
 `GH_TOKEN` ist bei öffentlichen Releases optional, erhöht aber das verfügbare API-Kontingent. Den Token ausschließlich als Umgebungsvariable oder GitHub-Actions-Secret verwenden. Für einen reinen Build ohne anschließende Ausgabeprüfung steht `npm run downloads:build` zur Verfügung. Die Releasequelle und die übrige Websitekonfiguration stehen in `website/config.mjs`.
 
-`npm ci` installiert die im Lockfile festgelegten Buildabhängigkeiten einschließlich der Dev-Abhängigkeiten. `fflate` wird ausschließlich beim Websitebuild zum Lesen der veröffentlichten ZIP-Berichte verwendet. Auf Cloudflare werden anschließend nur die erzeugten statischen Dateien veröffentlicht.
+`npm ci` installiert die Websiteabhängigkeiten. Der zweite Installationsschritt lädt die festgeschriebenen Modloader-UI-Abhängigkeiten, aus denen der aktuelle React-Preview-Build erzeugt wird. `fflate` wird ausschließlich beim Websitebuild zum Lesen der veröffentlichten ZIP-Berichte verwendet. Auf Cloudflare werden anschließend nur die erzeugten statischen Dateien veröffentlicht.
 
 Die fertige Ausgabe kann anschließend ohne weitere Installation lokal geöffnet werden:
 
@@ -30,6 +33,12 @@ Die Vorschau läuft standardmäßig unter `http://127.0.0.1:4173`. Mit `Strg+C` 
 Die Website startet standardmäßig mit weißem Seitenhintergrund. Der Schalter **Light background** im Footer wechselt zwischen weißem und dunklem Seitenhintergrund. Downloadkarten, Versionsleiste, Releasearchiv, Filter und Sicherheitsanzeigen behalten in beiden Varianten ihre dunklen Originalfarben mit deckender Grundfläche. Schrift, Links und Trennlinien direkt auf dem weißen Hintergrund werden für die Lesbarkeit angepasst. Eine gespeicherte Auswahl wird bei späteren Besuchen übernommen und vor dem Laden der Darstellung angewendet. Bei gesperrtem Browserspeicher funktioniert der Schalter für den aktuellen Besuch weiterhin.
 
 Die Webvarianten von Hammer und Favicon unter `public/assets/` sind aus `assets/shroudedit-hammer.png` abgeleitet. Der Hammer wird als 256-Pixel-PNG und das Favicon in 16, 32 und 48 Pixeln ausgeliefert. Die lokale variable Inter-Schrift stammt aus [Inter 4.1](https://github.com/rsms/inter/releases/tag/v4.1), ihre Lizenz liegt unter `public/licenses/Inter-OFL.txt`.
+
+## Versionierte SDK-Schemas
+
+Die aktuellen Modloader-Schemas liegen unter `modules/modloader/manifest/`. Für jede veröffentlichte Modloader-Version wird eine unveränderliche Kopie unter `schema-snapshots/<VERSION>/` eingecheckt. Der Website-Build veröffentlicht diese Dateien unter `/schemas/<VERSION>/` und setzt im veröffentlichten JSON `$id` auf die jeweilige feste Website-URL. Die eingecheckten Schema-Inhalte bleiben dabei unverändert.
+
+Für die aktuelle Repository-Version prüft der Build, dass der Snapshot mit dem kanonischen Schema übereinstimmt, abgesehen von `$id`. Bei einer neuen Modloader-Version werden die drei aktuellen Schema-Dateien in ein neues Versionsverzeichnis kopiert. Bereits veröffentlichte Versionsverzeichnisse bleiben erhalten. Die Seite `/schemas/` listet alle Snapshots und verlinkt außerdem auf den dokumentierten DInput8-Chain-Standard im Modding-Wiki.
 
 ## Veröffentlichung im bestehenden Releaseablauf
 

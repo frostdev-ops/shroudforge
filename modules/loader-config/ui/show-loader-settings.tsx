@@ -3,6 +3,7 @@ import { postRequest } from '../../transport/ui/send-host-command'
 import { useEffect, useState } from 'react'
 import { Locale, TranslationKey, useI18n } from '../../ui-resources/i18n'
 import type { PageId, Snapshot } from '../../modloader/ui/ui-snapshot'
+import type { CommandResult } from '../../notifications/ui/notification-types'
 import { startPageOptions } from '../../modloader/ui/ui-snapshot'
 import { Card } from '../../ui-resources/show-card'
 import { Field, SettingsRow, Toggle } from '../../ui-resources/edit-setting'
@@ -11,17 +12,21 @@ import { PageHeader, usePageZoom } from '../../ui-resources/show-page-header'
 import { Segmented } from '../../ui-resources/choose-segment'
 import { GamefileBackupManagement } from '../../game-files/ui/show-game-file-backups'
 import { StoragePathsEditor } from './show-storage-paths'
-import { ModulePreferencesEditor } from './show-module-settings'
+import { AdvancedSettingsEditor, ModulePreferencesEditor } from './show-module-settings'
 import { GameProfileDiscoverySettings } from '../../game-profile-discovery/ui/settings'
 
 export function SettingsPage({
   data,
   settings,
   setSettings,
+  openWikiCategory,
+  notifyCommandResult,
 }: {
   data: Snapshot
   settings: Settings
   setSettings(v: Settings): void
+  openWikiCategory(category: string): void
+  notifyCommandResult(result: CommandResult): void
 }) {
   const { t, locale, locales, setLocale } = useI18n()
   const { setZoomPercent } = usePageZoom()
@@ -150,6 +155,7 @@ export function SettingsPage({
           ['general', t('settings.general')],
           ['modules', t('settings.modules')],
           ['paths', t('settings.paths.title')],
+          ['advanced', t('settings.advanced')],
         ]}
       />
       {tab === 'general' && (
@@ -314,6 +320,8 @@ export function SettingsPage({
             <GameProfileDiscoverySettings
               enabled={modulePreferences.gameProfileDiscovery?.enabled !== false}
               onChange={changeProfileDiscovery}
+              wikiModuleSettings={data.uiVanilla ? { ...modulePreferences.wiki, enabled: false } : modulePreferences.wiki}
+              openWikiCategory={openWikiCategory}
             />
           </Card>
           <Card title={t('settings.logging.title')}>
@@ -353,9 +361,13 @@ export function SettingsPage({
           data={data}
           settings={settings}
           setSettings={setSettings}
+          notifyCommandResult={notifyCommandResult}
         />
       )}
       {tab === 'paths' && <StoragePathsEditor data={data} />}
+      {tab === 'advanced' && (
+        <AdvancedSettingsEditor settings={settings} setSettings={setSettings} />
+      )}
     </>
   )
 }

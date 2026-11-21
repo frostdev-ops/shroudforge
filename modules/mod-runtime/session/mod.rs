@@ -5,6 +5,7 @@ use std::{
         hash_map::{self, Entry},
     },
     rc::Rc,
+    sync::{Arc, atomic::AtomicUsize},
 };
 
 use bitflags::bitflags;
@@ -31,6 +32,9 @@ use crate::{
     type_aliases::{MappedValue, PathBuf},
 };
 
+pub(crate) const GAME_FILE_HANDLES_RELEASED: &str =
+    "game asset files were released for the asset transaction";
+
 pub struct AppState {
     pub(crate) runtime_configured: Cell<bool>,
     runtime_active_mods: RefCell<HashSet<String>>,
@@ -49,6 +53,9 @@ pub struct AppState {
     inline_field_bytes: Cell<usize>,
 
     ref_file: Rc<KFCFile>,
+    /// Open handles on the game's resource and container files. Released
+    /// before the asset transaction publishes or rolls back, because Wine
+    /// refuses to replace a file name while any handle on it is open.
     reader: RefCell<Option<KFCCursor<KFCReader>>>,
     writer: RefCell<Option<KFCWriter<Rc<KFCFile>, Rc<TypeRegistry>>>>,
     asset_transaction: Cell<bool>,
@@ -56,6 +63,7 @@ pub struct AppState {
 
     // NOTE: the `Vec<u8>` must always be treated as immutable
     new_contents: RefCell<HashMap<ContentHash, Vec<u8>>>,
+    content_reads_in_flight: Arc<AtomicUsize>,
     resources: RefCell<HashMap<ResourceId, Rc<ResourceInfo>>>,
     loaded_resource_indexes: RefCell<loaded_resource_indexes::Indexes>,
     types: RefCell<HashMap<TypeIndex, LuaValue>>,
@@ -124,12 +132,13 @@ impl AppState {
         &self,
     ) -> Result<&crate::lua::ingame::ecs::attributes::Catalog, String> {
         self.attribute_catalog
-            .get_or_init(|| {
-                crate::lua::ingame::ecs::attributes::Catalog::load(
+            .get_or_init(|| match self.reader.borrow_mut().as_mut() {
+                Some(reader) => crate::lua::ingame::ecs::attributes::Catalog::load(
                     &self.type_registry,
                     &self.ref_file,
-                    &mut self.reader(),
-                )
+                    reader,
+                ),
+                None => Err(GAME_FILE_HANDLES_RELEASED.to_owned()),
             })
             .as_ref()
             .map_err(Clone::clone)
@@ -199,10 +208,10 @@ impl AppState {
 impl Drop for AppState {
     fn drop(&mut self) {
         if self.asset_transaction.get() {
-            // Drop runs before fields do. Windows cannot replace live containers
-            // or remove staging files while our cursor/writer still holds them.
-            drop(self.reader.get_mut().take());
-            drop(self.writer.get_mut().take());
+            // Struct fields drop only after this body, so the handles must be
+            // closed explicitly before the rollback replaces any file.
+            self.reader.get_mut().take();
+            self.writer.get_mut().take();
             if let Err(error) = shroudforge_game_assets::transaction::abort(
                 self.env.game_dir().as_std_path(),
                 &self.asset_stem,
@@ -220,5 +229,7 @@ pub(crate) mod loaded_resource_indexes;
 mod loaded_resources;
 mod native_plugins;
 mod record_runtime_state;
+pub(crate) use asset_resources::ContentReadPermit;
 pub use asset_resources::ResourceInfo;
 use asset_resources::ResourceSource;
+pub(crate) use asset_resources::{MAX_CONTENT_READ_BYTES, MAX_CONTENT_READ_JOBS};

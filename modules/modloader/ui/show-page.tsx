@@ -4,6 +4,7 @@ import type {
   NewsItem,
   NoticeAction,
 } from '../../notifications/ui/notification-types'
+import type { CommandResult } from '../../notifications/ui/notification-types'
 import { NewsPage } from '../../notifications/ui/show-news'
 import { Updates } from '../../updater/ui/show-updates'
 import { Discover } from '../../updater/ui/show-mod-catalog'
@@ -15,16 +16,20 @@ import type { CompatibilityTab } from './show-compatibility'
 import { RecycleBin } from '../../updater/ui/show-recycle-bin'
 import type { UpdaterCommand } from '../../updater/ui/update-types'
 import { WikiPage } from '../../wiki/ui/show-wiki'
+import { ServerManagement } from './show-server-management'
 
 export function Page({
   id,
   data,
   settings,
   setSettings,
+  notifyCommandResult,
   news,
   wikiArticleId,
+  wikiCategory,
   selectWikiArticle,
   openWikiArticle,
+  openWikiCategory,
   unread,
   read,
   markRead,
@@ -34,15 +39,19 @@ export function Page({
   onUpdaterCommand,
   compatibilityTab,
   setCompatibilityTab,
+  serverAdminAuthenticated,
 }: {
   id: PageId
   data: Snapshot
   settings: Settings
   setSettings(v: Settings): void
+  notifyCommandResult(result: CommandResult): void
   news: NewsItem[]
   wikiArticleId: string | null
+  wikiCategory: string
   selectWikiArticle(articleId: string | null): void
   openWikiArticle(articleId: string): void
+  openWikiCategory(category: string): void
   unread: NewsItem[]
   read: string[]
   markRead(ids: string[], isRead?: boolean): void
@@ -52,7 +61,10 @@ export function Page({
   onUpdaterCommand: UpdaterCommand
   compatibilityTab: CompatibilityTab
   setCompatibilityTab(tab: CompatibilityTab): void
+  serverAdminAuthenticated: boolean
 }) {
+  const wikiPreferences = settings.modulePreferences?.wiki ?? data.settings.modulePreferences?.wiki
+  const wikiModuleSettings = data.uiVanilla ? { ...wikiPreferences, enabled: false } : wikiPreferences
   if (id === 'activity')
     return <ActivityPage activity={data.activity} mods={data.mods} />
   if (id === 'news')
@@ -110,6 +122,8 @@ export function Page({
     return (
       <Compatibility
         data={data}
+        wikiModuleSettings={wikiModuleSettings}
+        openWikiCategory={openWikiCategory}
         news={news}
         openNews={openNews}
         selectMod={selectMod}
@@ -127,10 +141,23 @@ export function Page({
     return (
       <WikiPage
         selectedArticleId={wikiArticleId}
+        category={wikiCategory}
         onSelectArticle={selectWikiArticle}
+        onOpenCategory={openWikiCategory}
+        moduleSettings={wikiModuleSettings}
+        notifyCommandResult={notifyCommandResult}
+      />
+    )
+  if (id === 'server-management')
+    return (
+      <ServerManagement
+        onCommand={onUpdaterCommand}
+        serverRights={data.serverRights}
+        authenticated={serverAdminAuthenticated}
       />
     )
   return (
-    <SettingsPage data={data} settings={settings} setSettings={setSettings} />
+    <SettingsPage data={data} settings={settings} setSettings={setSettings}
+      openWikiCategory={openWikiCategory} notifyCommandResult={notifyCommandResult} />
   )
 }

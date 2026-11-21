@@ -72,17 +72,25 @@ const inlineBuiltAssets: Plugin = {
 
 export default defineConfig(({ mode }) => {
   const standaloneUpdater = mode === 'updater'
+  const websitePreview = mode === 'website-preview'
   const root = standaloneUpdater
     ? resolve(process.cwd(), '../../updater/ui')
     : process.cwd()
+  const outputDirectory = websitePreview
+    ? resolve(process.cwd(), '../../../build/download-website/tools/modding/mod-settings')
+    : fileURLToPath(
+        new URL(
+          standaloneUpdater ? '../../../build/ui/updater/' : '../../../build/ui/modloader/',
+          import.meta.url,
+        ),
+      )
   return {
-    plugins: [react(), inlineBuiltAssets],
+    plugins: [react(), ...(websitePreview ? [] : [inlineBuiltAssets])],
     resolve: {
       alias: {
         react: resolve(process.cwd(), 'node_modules/react'),
         'react-dom': resolve(process.cwd(), 'node_modules/react-dom'),
-        'react-markdown': resolve(process.cwd(), 'node_modules/react-markdown'),
-        'remark-gfm': resolve(process.cwd(), 'node_modules/remark-gfm'),
+        dompurify: resolve(process.cwd(), 'node_modules/dompurify'),
         '@generated-flags': fileURLToPath(
           new URL(
             '../../../build/ui/modloader-inputs/generated-flags.ts',
@@ -96,23 +104,24 @@ export default defineConfig(({ mode }) => {
     server: { fs: { allow: [resolve(process.cwd(), '../../../')] } },
     base: './',
     build: {
-      outDir: fileURLToPath(
-        new URL(
-          standaloneUpdater ? '../../../build/ui/updater/' : '../../../build/ui/modloader/',
-          import.meta.url,
-        ),
-      ),
-      emptyOutDir: true,
+      outDir: outputDirectory,
+      emptyOutDir: !websitePreview,
       target: 'es2020',
-      assetsInlineLimit: 100000000,
+      assetsInlineLimit: websitePreview ? 0 : 100000000,
       chunkSizeWarningLimit: 100000000,
       assetsDir: '',
       cssCodeSplit: false,
       rollupOptions: {
         input: standaloneUpdater
           ? resolve(root, 'updater.html')
-          : resolve(root, 'index.html'),
-        output: { codeSplitting: false },
+          : resolve(root, websitePreview ? 'preview.html' : 'index.html'),
+        output: websitePreview
+          ? {
+              codeSplitting: false,
+              entryFileNames: 'preview.js',
+              assetFileNames: asset => asset.name?.endsWith('.css') ? 'preview.css' : '[name]-[hash][extname]',
+            }
+          : { codeSplitting: false },
       },
     },
   }

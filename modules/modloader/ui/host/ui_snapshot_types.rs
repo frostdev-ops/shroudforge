@@ -41,9 +41,11 @@ pub(crate) struct ModInfo {
     pub(crate) enabled: bool,
     pub(crate) settings: Vec<serde_json::Value>,
     pub(crate) groups: Vec<serde_json::Value>,
+    pub(crate) presets: serde_json::Value,
     pub(crate) changelog: Vec<String>,
     pub(crate) assets: std::collections::HashMap<String, String>,
     pub(crate) setting_values: serde_json::Value,
+    pub(crate) input_contexts: serde_json::Value,
 }
 
 #[derive(Clone, Serialize)]
@@ -61,12 +63,15 @@ pub(crate) type Activity = shroudforge_logging::ActivityLogEntry;
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Snapshot {
+    pub(crate) vanilla_session: Option<bool>,
+    pub(crate) installation_target: &'static str,
     pub(crate) diagnostics: serde_json::Value,
     pub(crate) dll_candidates: Vec<shroudforge_package::dll_manager::DllCandidate>,
     pub(crate) dll_chain_entries: Vec<shroudforge_package::dll_manager::CandidateLoadEntry>,
     pub(crate) windows: serde_json::Value,
     pub(crate) configuration: serde_json::Value,
     pub(crate) connected: bool,
+    pub(crate) remote_server_state: &'static str,
     pub(crate) mode: &'static str,
     pub(crate) game_version: String,
     pub(crate) version: String,
@@ -76,6 +81,7 @@ pub(crate) struct Snapshot {
     pub(crate) notices: Vec<shroudforge_news::Notice>,
     pub(crate) news_templates: serde_json::Value,
     pub(crate) read_notice_ids: Vec<String>,
+    pub(crate) read_notice_ids_server: Vec<String>,
     pub(crate) release: serde_json::Value,
     pub(crate) release_announcement: serde_json::Value,
     pub(crate) update_queue: serde_json::Value,
@@ -90,6 +96,7 @@ pub(crate) struct Snapshot {
 pub(crate) struct SnapshotSettings {
     pub(crate) config_revision: String,
     pub(crate) module_preferences: serde_json::Value,
+    pub(crate) target_ui: serde_json::Value,
     pub(crate) protected_hotkeys: shroudforge_package::ProtectedHotkeyGroups,
     pub(crate) compact_mode: bool,
     pub(crate) reduced_motion: bool,
