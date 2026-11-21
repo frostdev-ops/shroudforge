@@ -70,6 +70,11 @@ bool ReadOriginalProcedure(std::uintptr_t entry, Procedure& output, bool& foreig
 // The address must be an instruction boundary reached by that owner's CFG.
 bool ReadContainingProcedure(std::uintptr_t address, Procedure& output);
 bool ResolveNamedSystemCode(const char* exact_name, std::uintptr_t& output);
+// Kiln layer: one line into ShroudForge's log through the same sink as the file check's notes ('I', 'W' or 'E';
+// the message ends with a newline).
+void Diagnostic(char level, const char* message);
+// Kiln layer: why ResolveNamedSystemCode last failed on the calling thread (a constant text or a thread-local buffer).
+const char* LastResolveFailure();
 bool FindUniqueReachable(std::uintptr_t root, unsigned maximum_depth,
     const std::function<bool(const Procedure&)>& predicate, std::uintptr_t& output);
 }

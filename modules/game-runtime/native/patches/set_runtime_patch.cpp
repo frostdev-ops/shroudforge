@@ -14,6 +14,8 @@
 #include <nlohmann/json.hpp>
 #include <algorithm>
 #include <charconv>
+#include <cstdarg>
+#include <cstdio>
 #include <cstring>
 #include <limits>
 #include <optional>
@@ -88,6 +90,23 @@ bool branch_to(const OriginalCode::Instruction& ins, std::uintptr_t target) {
         destination == target;
 }
 
+// Kiln layer: why the patch is unavailable, once per process, in ShroudForge's log (the status alone is only in the
+// runtime's diagnostics).
+unsigned long long root_rva(std::uintptr_t at) {
+    const auto base = reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr));
+    return at >= base ? static_cast<unsigned long long>(at - base) : 0;
+}
+__attribute__((format(printf, 1, 2))) void glider_note(const char* format, ...) {
+    char message[384];
+    char line[448];
+    va_list args;
+    va_start(args, format);
+    std::vsnprintf(message, sizeof(message), format, args);
+    va_end(args);
+    std::snprintf(line, sizeof(line), "runtime.patch.glider_pitch unavailable: %s\n", message);
+    OriginalCode::Diagnostic('W', line);
+}
+
 bool resolve_glider_locked() {
     if (glider.attempted) return glider.available;
     // A loaded read-owner profile binds this process to its exact image. It
@@ -100,8 +119,12 @@ bool resolve_glider_locked() {
     glider.attempted = true;
     std::uintptr_t root{};
     OriginalCode::Procedure procedure;
-    if (!OriginalCode::ResolveNamedSystemCode("actor_rotation", root) ||
-        !OriginalCode::ReadProcedure(root, procedure)) {
+    if (!OriginalCode::ResolveNamedSystemCode("actor_rotation", root)) {
+        glider_note("the registered actor_rotation system did not resolve (%s)", OriginalCode::LastResolveFailure());
+        glider.status = "actor-rotation-unavailable"; return false;
+    }
+    if (!OriginalCode::ReadProcedure(root, procedure)) {
+        glider_note("actor_rotation (rva 0x%llx) could not be read", root_rva(root));
         glider.status = "actor-rotation-unavailable"; return false;
     }
     const auto& code = procedure.instructions;
@@ -131,13 +154,23 @@ bool resolve_glider_locked() {
         for (std::size_t j = i; j < i + 8; ++j)
             contiguous &= code[j].address + code[j].decoded.length == code[j+1].address;
         if (!contiguous) continue;
-        if (match) { glider.status = "glider-clamp-ambiguous"; return false; }
+        if (match) {
+            glider_note("the pitch clamp is in actor_rotation's code more than once");
+            glider.status = "glider-clamp-ambiguous"; return false;
+        }
         match = a.address;
         std::copy_n(a.bytes.begin(), glider.original.size(), glider.original.begin());
     }
-    if (!match) { glider.status = "glider-clamp-unavailable"; return false; }
+    if (!match) {
+        std::size_t loads{};
+        for (const auto& ins : code) loads += scalar_reference(ins, ZYDIS_REGISTER_XMM0, 0x3db2b8c2);
+        glider_note("the pitch clamp is not in actor_rotation's code (rva 0x%llx, %zu instructions read, %zu loads of the "
+                    "5 degree limit among them)", root_rva(root), code.size(), loads);
+        glider.status = "glider-clamp-unavailable"; return false;
+    }
     if (!OriginalCode::AppendEvidence(procedure, glider.evidence) ||
         !OriginalCode::EvidenceUnchanged(glider.evidence)) {
+        glider_note("actor_rotation's code changed while it was read, or its entry is detoured");
         glider.status = "actor-rotation-code-changed"; return false;
     }
     // Original MOVSS xmm0,[RIP+disp32] becomes a jump to a local constant.
@@ -145,11 +178,11 @@ bool resolve_glider_locked() {
     std::array<std::uint8_t, 17> payload{0xf3,0x0f,0x10,0x05,0x05,0,0,0,
         0xe9,0,0,0,0,0xc3,0xf5,0xc8,0xbf};
     auto* allocation = static_cast<std::uint8_t*>(EngineHooks::AllocateNearCode(match, payload.size()));
-    if (!allocation) { glider.status = "trampoline-allocation-failed"; return false; }
+    if (!allocation) { glider_note("no memory for the trampoline near the code"); glider.status = "trampoline-allocation-failed"; return false; }
     std::int32_t ret{}, detour{};
     if (!EngineHooks::EncodeRelativeJump(reinterpret_cast<std::uintptr_t>(allocation) + 8, match + 8, ret) ||
         !EngineHooks::EncodeRelativeJump(match, reinterpret_cast<std::uintptr_t>(allocation), detour)) {
-        VirtualFree(allocation, 0, MEM_RELEASE); glider.status = "trampoline-out-of-range"; return false;
+        VirtualFree(allocation, 0, MEM_RELEASE); glider_note("the trampoline is out of jump range"); glider.status = "trampoline-out-of-range"; return false;
     }
     std::memcpy(payload.data() + 9, &ret, sizeof(ret));
     std::memcpy(allocation, payload.data(), payload.size());
@@ -159,6 +192,12 @@ bool resolve_glider_locked() {
     glider.target = match;
     glider.trampoline = allocation;
     glider.status = "resolved";
+    {
+        char line[160];
+        std::snprintf(line, sizeof(line), "runtime.patch.glider_pitch resolved: the pitch clamp at rva 0x%llx in actor_rotation\n",
+                      static_cast<unsigned long long>(root_rva(match)));
+        OriginalCode::Diagnostic('I', line);
+    }
     return glider.available = true;
 }
 

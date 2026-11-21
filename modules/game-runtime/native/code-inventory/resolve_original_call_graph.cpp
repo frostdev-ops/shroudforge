@@ -716,6 +716,10 @@ bool RestoreOwnPatch(std::uintptr_t address, const std::function<bool()>& write)
 
 bool ReadProcedure(std::uintptr_t entry, Procedure& output) { return read_procedure(entry, output, nullptr); }
 
+void Diagnostic(char level, const char* message) {
+    try { if (message) file_log(static_cast<std::uint8_t>(level), message); } catch (...) {}
+}
+
 bool ReadOriginalProcedure(std::uintptr_t entry, Procedure& output, bool& foreign) {
     try {
         const auto& file=file_image(); // Initialize before taking the registry lock (CompareImage also takes it).
@@ -764,8 +768,12 @@ bool ReadContainingProcedure(std::uintptr_t address, Procedure& output) {
     } catch (...) { return false; }
 }
 
+// Kiln layer: why ResolveNamedSystemCode last failed on this thread (LastResolveFailure).
+static thread_local const char* kiln_resolve_failure = "";
+static thread_local char kiln_resolve_detail[160];
 bool ResolveNamedSystemCode(const char* exact_name, std::uintptr_t& output) {
-    if (!exact_name || !*exact_name || std::strlen(exact_name) > 96) return false;
+    kiln_resolve_failure = "";
+    if (!exact_name || !*exact_name || std::strlen(exact_name) > 96) { kiln_resolve_failure = "invalid name"; return false; }
     try {
         // Reuse the canonical original descriptor inventory. Its names and
         // function pointers come from the loaded image, not an RVA catalog.
@@ -775,15 +783,22 @@ bool ResolveNamedSystemCode(const char* exact_name, std::uintptr_t& output) {
             for (const auto& descriptor : function.value("engine_descriptors", nlohmann::json::array()))
                 if (descriptor.at("name") == exact_name) {
                     const auto address = image().base + function.at("rva").get<std::uint32_t>();
-                    if (selected && selected != address) return false;
+                    if (selected && selected != address) { kiln_resolve_failure = "ambiguous descriptors"; return false; }
                     selected = address;
                 }
         Procedure code;
-        if (!selected || !ReadProcedure(selected, code)) return false;
+        if (!selected) { kiln_resolve_failure = "no descriptor of that name"; return false; }
+        if (!ReadProcedure(selected, code)) {
+            std::snprintf(kiln_resolve_detail, sizeof(kiln_resolve_detail),
+                "its code at rva 0x%llx is unreadable, for example a jump out of the image another module placed in it",
+                static_cast<unsigned long long>(selected - image().base));
+            kiln_resolve_failure = kiln_resolve_detail; return false;
+        }
         output = selected;
         return true;
-    } catch (...) { return false; }
+    } catch (...) { kiln_resolve_failure = "exception"; return false; }
 }
+const char* LastResolveFailure() { return kiln_resolve_failure; }
 
 bool FindUniqueReachable(std::uintptr_t root, unsigned maximum_depth,
     const std::function<bool(const Procedure&)>& predicate, std::uintptr_t& output) {
