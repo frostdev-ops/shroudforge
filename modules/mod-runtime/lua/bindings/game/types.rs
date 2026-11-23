@@ -10,7 +10,7 @@ use once_cell::unsync::OnceCell;
 
 use crate::{
     env::{AppState, registration::add_function, value::type_of},
-    lua::{FunctionArgs, LuaValue},
+    lua::{FunctionArgs, LuaValue, StoredLuaValue},
     lua::{ReadOnlyArray, ReadOnlyMap},
     type_aliases::TypeHandle,
 };
@@ -217,9 +217,10 @@ fn get_by_name(lua: &mlua::Lua, name: LookupKey<&str>) -> mlua::Result<Option<Lu
 pub struct Type {
     handle: TypeHandle,
 
-    struct_field_cache: OnceCell<LuaValue>,
-    enum_field_cache: OnceCell<LuaValue>,
-    attribute_cache: OnceCell<LuaValue>,
+    // Kiln layer: in Lua's registry, not as mlua values (lua/stored_lua_value.rs, lua/readonly_collections.rs)
+    struct_field_cache: OnceCell<StoredLuaValue>,
+    enum_field_cache: OnceCell<StoredLuaValue>,
+    attribute_cache: OnceCell<StoredLuaValue>,
 }
 
 impl Type {
@@ -305,20 +306,25 @@ impl UserData for Type {
 
         fields.add_field_method_get("struct_fields", |lua, this| {
             this.struct_field_cache
-                .get_or_try_init(|| struct_fields_to_lua(lua, &lua.app_data_ref().unwrap(), this))
-                .cloned()
+                .get_or_try_init(|| {
+                    let value = struct_fields_to_lua(lua, &lua.app_data_ref().unwrap(), this)?;
+                    StoredLuaValue::new(lua, value)
+                })?
+                .load()
         });
         fields.add_field_method_get("enum_fields", |lua, this| {
             this.enum_field_cache
-                .get_or_try_init(|| enum_fields_to_lua(lua, this))
-                .cloned()
+                .get_or_try_init(|| StoredLuaValue::new(lua, enum_fields_to_lua(lua, this)?))?
+                .load()
         });
         fields.add_field_method_get("attributes", |lua, this| {
             this.attribute_cache
                 .get_or_try_init(|| {
-                    attributes_to_lua(lua, &lua.app_data_ref().unwrap(), &this.attributes)
-                })
-                .cloned()
+                    let value =
+                        attributes_to_lua(lua, &lua.app_data_ref().unwrap(), &this.attributes)?;
+                    StoredLuaValue::new(lua, value)
+                })?
+                .load()
         });
     }
 
@@ -379,13 +385,13 @@ fn struct_fields_to_lua(
     let mut map = IndexMap::with_capacity(this.struct_fields.len());
 
     for (name, field) in &this.struct_fields {
-        let key = lua.create_string(name)?;
+        let key = name.as_bytes().to_vec();
         let value = struct_field_to_lua(lua, context, field)?;
 
         map.insert(key, value);
     }
 
-    ReadOnlyMap::new(map).into_lua(lua)
+    ReadOnlyMap::new(lua, map)?.into_lua(lua)
 }
 
 fn struct_field_to_lua(
@@ -395,10 +401,10 @@ fn struct_field_to_lua(
 ) -> mlua::Result<LuaValue> {
     let mut map = IndexMap::with_capacity(4);
 
-    let name_key = lua.create_string("name")?;
-    let type_key = lua.create_string("type")?;
-    let data_offset_key = lua.create_string("data_offset")?;
-    let attributes_key = lua.create_string("attributes")?;
+    let name_key = b"name".to_vec();
+    let type_key = b"type".to_vec();
+    let data_offset_key = b"data_offset".to_vec();
+    let attributes_key = b"attributes".to_vec();
 
     let name = LuaValue::String(lua.create_string(&field.name)?);
     let r#type = context
@@ -412,7 +418,7 @@ fn struct_field_to_lua(
     map.insert(data_offset_key, data_offset);
     map.insert(attributes_key, attributes);
 
-    ReadOnlyMap::new(map).into_lua(lua)
+    ReadOnlyMap::new(lua, map)?.into_lua(lua)
 }
 
 fn attributes_to_lua(
@@ -423,13 +429,13 @@ fn attributes_to_lua(
     let mut map = IndexMap::with_capacity(attributes.len());
 
     for (name, attribute) in attributes {
-        let key = lua.create_string(name)?;
+        let key = name.as_bytes().to_vec();
         let value = attribute_to_lua(lua, context, attribute)?;
 
         map.insert(key, value);
     }
 
-    ReadOnlyMap::new(map).into_lua(lua)
+    ReadOnlyMap::new(lua, map)?.into_lua(lua)
 }
 
 fn attribute_to_lua(
@@ -439,10 +445,10 @@ fn attribute_to_lua(
 ) -> mlua::Result<LuaValue> {
     let mut map = IndexMap::with_capacity(4);
 
-    let name_key = lua.create_string("name")?;
-    let namespace_key = lua.create_string("namespace")?;
-    let type_key = lua.create_string("type")?;
-    let value_key = lua.create_string("value")?;
+    let name_key = b"name".to_vec();
+    let namespace_key = b"namespace".to_vec();
+    let type_key = b"type".to_vec();
+    let value_key = b"value".to_vec();
 
     let name = LuaValue::String(lua.create_string(&attribute.name)?);
     let namespace = namespace_to_lua(lua, &attribute.namespace)?;
@@ -459,7 +465,7 @@ fn attribute_to_lua(
     map.insert(type_key, r#type);
     map.insert(value_key, value);
 
-    ReadOnlyMap::new(map).into_lua(lua)
+    ReadOnlyMap::new(lua, map)?.into_lua(lua)
 }
 
 fn namespace_to_lua(lua: &mlua::Lua, namespace: &Vec<String>) -> mlua::Result<LuaValue> {
@@ -469,27 +475,27 @@ fn namespace_to_lua(lua: &mlua::Lua, namespace: &Vec<String>) -> mlua::Result<Lu
         array.push(LuaValue::String(lua.create_string(name)?));
     }
 
-    ReadOnlyArray::new(array).into_lua(lua)
+    ReadOnlyArray::new(lua, array)?.into_lua(lua)
 }
 
 fn enum_fields_to_lua(lua: &mlua::Lua, this: &Type) -> mlua::Result<LuaValue> {
     let mut map = IndexMap::with_capacity(this.enum_fields.len());
 
     for (name, field) in &this.enum_fields {
-        let key = lua.create_string(name)?;
+        let key = name.as_bytes().to_vec();
         let value = enum_field_to_lua(lua, field)?;
 
         map.insert(key, value);
     }
 
-    ReadOnlyMap::new(map).into_lua(lua)
+    ReadOnlyMap::new(lua, map)?.into_lua(lua)
 }
 
 fn enum_field_to_lua(lua: &mlua::Lua, field: &EnumFieldMetadata) -> mlua::Result<LuaValue> {
     let mut map = IndexMap::with_capacity(2);
 
-    let name_key = lua.create_string("name")?;
-    let value_key = lua.create_string("value")?;
+    let name_key = b"name".to_vec();
+    let value_key = b"value".to_vec();
 
     let name = LuaValue::String(lua.create_string(&field.name)?);
     let value = LuaValue::Integer(field.value as i64);
@@ -497,9 +503,9 @@ fn enum_field_to_lua(lua: &mlua::Lua, field: &EnumFieldMetadata) -> mlua::Result
     map.insert(name_key, name);
     map.insert(value_key, value);
     map.insert(
-        lua.create_string("value_hex")?,
+        b"value_hex".to_vec(),
         LuaValue::String(lua.create_string(format!("0x{:016x}", field.value))?),
     );
 
-    ReadOnlyMap::new(map).into_lua(lua)
+    ReadOnlyMap::new(lua, map)?.into_lua(lua)
 }

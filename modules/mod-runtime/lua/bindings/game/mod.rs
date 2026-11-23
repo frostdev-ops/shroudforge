@@ -5,6 +5,9 @@ mod content_id_casts;
 mod guid;
 pub(crate) mod resolve_type;
 mod types;
+// Kiln layer: what the type metadata game.types hands out holds
+#[cfg(test)]
+mod kiln_types_tests;
 
 pub(crate) use crate::lua::resource_values as value;
 pub use assets::{Content, Resource};

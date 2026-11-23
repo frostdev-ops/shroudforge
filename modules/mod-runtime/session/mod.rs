@@ -66,7 +66,8 @@ pub struct AppState {
     content_reads_in_flight: Arc<AtomicUsize>,
     resources: RefCell<HashMap<ResourceId, Rc<ResourceInfo>>>,
     loaded_resource_indexes: RefCell<loaded_resource_indexes::Indexes>,
-    types: RefCell<HashMap<TypeIndex, LuaValue>>,
+    // Kiln layer: in Lua's registry, not as mlua values (lua/stored_lua_value.rs)
+    types: RefCell<HashMap<TypeIndex, crate::lua::StoredLuaValue>>,
 }
 
 pub struct AppConfig {
@@ -189,7 +190,7 @@ impl AppState {
         type_index: TypeIndex,
     ) -> mlua::Result<Option<LuaValue>> {
         match self.types.borrow_mut().entry(type_index) {
-            Entry::Occupied(entry) => Ok(Some(entry.get().clone())),
+            Entry::Occupied(entry) => entry.get().load().map(Some),
             Entry::Vacant(entry) => {
                 if self.type_registry.get(type_index).is_none() {
                     return Ok(None);
@@ -198,7 +199,7 @@ impl AppState {
                 let value = Type::new(TypeHandle::new(self.type_registry.clone(), type_index));
                 let value = LuaValue::UserData(lua.create_userdata(value)?);
 
-                entry.insert(value.clone());
+                entry.insert(crate::lua::StoredLuaValue::new(lua, value.clone())?);
                 Ok(Some(value))
             }
         }
@@ -225,6 +226,9 @@ impl Drop for AppState {
 mod asset_resources;
 pub(crate) mod configure_component_contract;
 mod create_mod_session;
+// Kiln layer: an AppState for tests outside this module
+#[cfg(test)]
+mod kiln_test_state;
 pub(crate) mod loaded_resource_indexes;
 mod loaded_resources;
 mod native_plugins;

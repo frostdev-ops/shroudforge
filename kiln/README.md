@@ -155,13 +155,19 @@ recipe records, with no mod code, reproduces the exact count (`used 1000194 slot
 such limit, and loads it as a short-lived `mlua::Value` for each operation: the same Lua object every time, so identity
 (`rawequal`) and edits made through it hold. nil, booleans and numbers stay plain. The entry is freed when its last
 holder drops while the state lives, so a released tree is collected as before; copies share strings and clone userdata
-as `try_clone_lua_value` does. Not changed: the type metadata `game.types` hands out (`session/mod.rs` `types`, the
-caches of `bindings/game/types.rs`) still holds mlua values, bounded by the game's type table rather than by any data.
+as `try_clone_lua_value` does.
+
+The type metadata `game.types` hands out lives as long as the session, so it is held the same way: each type
+(`session/mod.rs` `types`), the caches of `lua/bindings/game/types.rs` (`struct_fields`, `enum_fields`, `attributes`),
+and the read-only maps and arrays they are made of (`lua/readonly_collections.rs`: byte keys, `StoredLuaValue` values).
+Read whole for the game's 12,658 types (39,163 struct fields, 6,119 enum fields, 10,542 type attributes), it held about
+695,000 slots, most of the stack, for the rest of the session.
 
 Tests (host): `lua::resource_values::tests`: a walk over 350,000 game recipes and a mod-made copy of as many (red before
 with the player's panic), the references a walk holds (red before: 3002 for 1,000 recipes, 150002 for 50,000; now
 under 64 whatever the size, and the registry back to its count once the tree is released), identity, edits, copies,
-removal.
+removal. `lua::bindings::game::kiln_types_tests`: all the metadata of 200 and 2,000 struct types read twice (red
+before: 25,437 and 254,037 references; now under 64), and the values, their order and identity (`rawequal`) as before.
 
 ## A panic in the startup pass: one plain line (dev.30.7)
 

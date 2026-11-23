@@ -1,31 +1,40 @@
 use std::rc::Rc;
 
 use indexmap::IndexMap;
-use mlua::{AnyUserData, Function, MetaMethod, String, UserData, UserDataMethods};
+use mlua::{AnyUserData, Function, MetaMethod, UserData, UserDataMethods};
 use ouroboros::self_referencing;
 
-use crate::lua::{FunctionArgs, LuaValue, MethodArgs};
+use crate::lua::{FunctionArgs, LuaValue, MethodArgs, StoredLuaValue};
 
+// Kiln layer: the keys are bytes and the values `StoredLuaValue`s (lua/stored_lua_value.rs), not mlua values: the type
+// metadata game.types hands out lives as long as the session, and an mlua value pins one slot of mlua's auxiliary
+// stack (about a million) while it lives. Read all of it for the game's types and it held about 695,000.
 pub struct ReadOnlyMap {
-    table: Rc<IndexMap<String, LuaValue>>,
+    table: Rc<IndexMap<Vec<u8>, StoredLuaValue>>,
 }
 
 impl ReadOnlyMap {
-    pub fn new(table: IndexMap<String, LuaValue>) -> Self {
-        Self {
+    pub fn new(lua: &mlua::Lua, table: IndexMap<Vec<u8>, LuaValue>) -> mlua::Result<Self> {
+        let table = table
+            .into_iter()
+            .map(|(key, value)| Ok((key, StoredLuaValue::new(lua, value)?)))
+            .collect::<mlua::Result<_>>()?;
+        Ok(Self {
             table: Rc::new(table),
-        }
+        })
     }
 }
 
 impl UserData for ReadOnlyMap {
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
-        methods.add_meta_function(MetaMethod::Index, |lua, args: MethodArgs| {
+        methods.add_meta_function(MetaMethod::Index, |_, args: MethodArgs| {
             let this = args.this::<&Self>()?;
             let key = args.get::<&[u8]>(0)?;
-            let key = lua.create_string(&key)?;
 
-            Ok(this.table.get(&key).cloned().unwrap_or(LuaValue::Nil))
+            match this.table.get(&*key) {
+                Some(value) => value.load(),
+                None => Ok(LuaValue::Nil),
+            }
         });
 
         methods.add_meta_function(MetaMethod::Len, |_, args: MethodArgs| {
@@ -42,10 +51,10 @@ impl UserData for ReadOnlyMap {
 
 #[self_referencing]
 struct ReadOnlyMapIter {
-    table: Rc<IndexMap<String, LuaValue>>,
+    table: Rc<IndexMap<Vec<u8>, StoredLuaValue>>,
     #[borrows(table)]
     #[not_covariant]
-    iter: indexmap::map::Iter<'this, String, LuaValue>,
+    iter: indexmap::map::Iter<'this, Vec<u8>, StoredLuaValue>,
 }
 
 impl ReadOnlyMapIter {
@@ -72,24 +81,25 @@ impl ReadOnlyMapIter {
             None => return Ok((LuaValue::Nil, LuaValue::Nil)),
         };
 
-        Ok((
-            LuaValue::String(lua.create_string(key.as_bytes())?),
-            value.clone(),
-        ))
+        Ok((LuaValue::String(lua.create_string(key)?), value.load()?))
     }
 }
 
 impl UserData for ReadOnlyMapIter {}
 
 pub struct ReadOnlyArray {
-    array: Rc<Vec<LuaValue>>,
+    array: Rc<Vec<StoredLuaValue>>,
 }
 
 impl ReadOnlyArray {
-    pub fn new(array: Vec<LuaValue>) -> Self {
-        Self {
+    pub fn new(lua: &mlua::Lua, array: Vec<LuaValue>) -> mlua::Result<Self> {
+        let array = array
+            .into_iter()
+            .map(|value| StoredLuaValue::new(lua, value))
+            .collect::<mlua::Result<_>>()?;
+        Ok(Self {
             array: Rc::new(array),
-        }
+        })
     }
 }
 
@@ -103,7 +113,10 @@ impl UserData for ReadOnlyArray {
                 return Ok(LuaValue::Nil);
             }
 
-            Ok(this.array.get(key - 1).cloned().unwrap_or(LuaValue::Nil))
+            match this.array.get(key - 1) {
+                Some(value) => value.load(),
+                None => Ok(LuaValue::Nil),
+            }
         });
 
         methods.add_meta_function(MetaMethod::Len, |_, args: MethodArgs| {
@@ -119,7 +132,7 @@ impl UserData for ReadOnlyArray {
 }
 
 struct ReadOnlyArrayIter {
-    array: Rc<Vec<LuaValue>>,
+    array: Rc<Vec<StoredLuaValue>>,
     index: usize,
 }
 
@@ -148,7 +161,7 @@ impl ReadOnlyArrayIter {
         }
 
         let key = self.index;
-        let value = self.array[self.index].clone();
+        let value = self.array[self.index].load()?;
 
         self.index += 1;
 
