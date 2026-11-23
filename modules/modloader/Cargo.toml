@@ -27,8 +27,6 @@ sha2 = "0.10"
 
 tracing = "0.1"
 
-[target.'cfg(windows)'.dependencies]
-
 zip = "9.0.5"
 
 [dev-dependencies]
