@@ -362,13 +362,12 @@ fn a_panic_in_the_pass_leaves_one_readable_reason_and_the_saved_baseline() {
     run_startup(&game.0).unwrap();
     let before = game.log();
     let payload: Box<dyn std::any::Any + Send> = Box::new(shroudforge_api::PregameModPanic {
-        package: "The alpha mod (alpha 1.2.3)".into(),
+        package: "The alpha mod".into(),
         detail: "cannot create a Lua reference, out of auxiliary stack space\n(used 1000194 slots)"
             .into(),
     });
     assert!(report_startup_panic(&game.0, &*payload));
-    let reason = "ShroudForge stopped its startup asset pass on an internal error while running The alpha mod \
-        (alpha 1.2.3): cannot create a Lua reference, out of auxiliary stack space (used 1000194 slots)";
+    let reason = "ShroudForge stopped preparing mod assets because of an internal error while running The alpha mod";
     let log = game.log();
     let added: Vec<&str> = log[before.len()..].lines().collect();
     let errors: Vec<&&str> = added
@@ -380,6 +379,22 @@ fn a_panic_in_the_pass_leaves_one_readable_reason_and_the_saved_baseline() {
         errors[0].ends_with(&format!("[startup-assets] {reason}")),
         "{log}"
     );
+    // the panic's own message: an info line of its own, on one line, after the error line
+    let detail = added
+        .iter()
+        .position(|line| {
+            line.starts_with("[I ")
+                && line.ends_with(
+                    "[startup-assets] Internal error detail, for a bug report: cannot create a Lua reference, out \
+                     of auxiliary stack space (used 1000194 slots)",
+                )
+        })
+        .unwrap_or_else(|| panic!("{log}"));
+    let error = added
+        .iter()
+        .position(|line| line.starts_with("[E "))
+        .unwrap();
+    assert!(error < detail, "{log}");
     assert!(
         added.last().unwrap().ends_with(
             "Asset mods failed; saved baseline restored. Continuing game startup without asset patches."

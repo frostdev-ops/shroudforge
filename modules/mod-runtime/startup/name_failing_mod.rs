@@ -58,37 +58,50 @@ impl std::error::Error for PregameModError {}
 /// package. A panic is ShroudForge's own failure, not an error of the package: nothing runs the pass again without it.
 #[derive(Debug, Clone)]
 pub struct PregameModPanic {
-    /// "Forged and Found (forged-and-found 0.16.1)", or "forged-and-found 0.16.1" when the name is the id.
+    /// The package's name as a player sees it ("Forged and Found"), or its id when it has no name: on one line, without
+    /// control characters, at most 80 characters. Nothing else (no version, path or message).
     pub package: String,
-    /// The panic's own message.
+    /// The panic's own message, for a bug report only: the line a player reads leaves it out.
     pub detail: String,
 }
+
+/// A package's name in a [`PregameModPanic`] is cut to this many characters.
+const MAX_PACKAGE_NAME: usize = 80;
 
 impl PregameModPanic {
     /// Runs a package's entrypoint; a panic in it unwinds on with a [`PregameModPanic`] for that package. mlua carries a
     /// panic in a Rust function the package called through Lua back out as the same panic (unless the package's own
     /// `pcall` caught it: the sandbox keeps mlua's default there).
-    pub(crate) fn name_package<T>(
-        id: &str,
-        name: &str,
-        version: &str,
-        entrypoint: impl FnOnce() -> T,
-    ) -> T {
+    pub(crate) fn name_package<T>(id: &str, name: &str, entrypoint: impl FnOnce() -> T) -> T {
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(entrypoint)) {
             Ok(value) => value,
-            Err(payload) => {
-                let package = if name == id || name.is_empty() {
-                    format!("{id} {version}")
-                } else {
-                    format!("{name} ({id} {version})")
-                };
-                std::panic::resume_unwind(Box::new(Self {
-                    package,
-                    detail: panic_text(&*payload),
-                }))
-            }
+            Err(payload) => std::panic::resume_unwind(Box::new(Self {
+                package: package_name(id, name),
+                detail: panic_text(&*payload),
+            })),
         }
     }
+}
+
+/// The name a player knows the package by (its id when the name is blank), as one plain line: control characters and
+/// runs of white space become one space, and a long name is cut to [`MAX_PACKAGE_NAME`] characters.
+fn package_name(id: &str, name: &str) -> String {
+    let plain = |text: &str| {
+        text.chars()
+            .map(|c| if c.is_control() { ' ' } else { c })
+            .collect::<String>()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let mut package = plain(name);
+    if package.is_empty() {
+        package = plain(id);
+    }
+    if package.chars().count() > MAX_PACKAGE_NAME {
+        package = package.chars().take(MAX_PACKAGE_NAME).collect::<String>() + "...";
+    }
+    package
 }
 
 /// The message of a panic payload (a `&str` or a `String`, as `panic!` makes them).
@@ -181,30 +194,48 @@ mod tests {
             .unwrap();
         lua.globals().set("failing", function).unwrap();
         let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            PregameModPanic::name_package("forged-and-found", "Forged and Found", "0.16.1", || {
-                lua.load("local function walk() failing() end\nwalk()").exec()
+            PregameModPanic::name_package("forged-and-found", "Forged and Found", || {
+                lua.load("local function walk() failing() end\nwalk()")
+                    .exec()
             })
         }))
         .unwrap_err();
         let named = payload.downcast_ref::<PregameModPanic>().unwrap();
-        assert_eq!(named.package, "Forged and Found (forged-and-found 0.16.1)");
+        assert_eq!(named.package, "Forged and Found");
         assert_eq!(
             named.detail,
             "cannot create a Lua reference, out of auxiliary stack space (used 1000194 slots)"
         );
-        // a package named by its id; an entrypoint that does not panic returns as before
+        // a package without a name goes by its id; an entrypoint that does not panic returns as before
         let payload = std::panic::catch_unwind(|| {
-            PregameModPanic::name_package("wisp", "wisp", "1.0.3", || panic!("{}", 7))
+            PregameModPanic::name_package("wisp", " ", || panic!("{}", 7))
         })
         .unwrap_err();
         let named = payload.downcast_ref::<PregameModPanic>().unwrap();
         assert_eq!(
             (named.package.as_str(), named.detail.as_str()),
-            ("wisp 1.0.3", "7")
+            ("wisp", "7")
         );
-        assert_eq!(
-            PregameModPanic::name_package("wisp", "wisp", "1.0.3", || 5),
-            5
-        );
+        assert_eq!(PregameModPanic::name_package("wisp", "Wisp", || 5), 5);
+    }
+
+    #[test]
+    fn the_package_name_is_one_plain_line() {
+        let named = |name: &str| {
+            let payload = std::panic::catch_unwind(|| {
+                PregameModPanic::name_package("the-id", name, || panic!("boom"))
+            })
+            .unwrap_err();
+            payload
+                .downcast_ref::<PregameModPanic>()
+                .unwrap()
+                .package
+                .clone()
+        };
+        assert_eq!(named("Forged\nand\r\n\tFound"), "Forged and Found");
+        assert_eq!(named("Escape\u{1b}[31m red"), "Escape [31m red");
+        assert_eq!(named(""), "the-id");
+        let long = "x".repeat(super::MAX_PACKAGE_NAME + 20);
+        assert_eq!(named(&long), "x".repeat(super::MAX_PACKAGE_NAME) + "...");
     }
 }

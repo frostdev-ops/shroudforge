@@ -75,12 +75,9 @@ impl LuaModRunner {
 
             // a Rust panic in it goes on to the loader with the package's name (`PregameModPanic`)
             let info = r#mod.info();
-            crate::PregameModPanic::name_package(
-                &info.id,
-                &info.name,
-                &info.version.to_string(),
-                || self.state.require_mod(&info.id, &self.lua),
-            )
+            crate::PregameModPanic::name_package(&info.id, &info.name, || {
+                self.state.require_mod(&info.id, &self.lua)
+            })
             .map_err(|error| crate::PregameModError::new(&info.id, error))?;
         }
 
