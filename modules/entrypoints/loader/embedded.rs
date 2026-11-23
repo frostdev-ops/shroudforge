@@ -385,22 +385,8 @@ pub unsafe extern "C" fn shroudforge_prepare_startup(game: *const u16) -> bool {
         Err(payload) => {
             if let Some(game) = path(game) {
                 let _ = shroudforge_logging::initialize(&game, false);
-                let _ = shroudforge_logging::append(
-                    &game,
-                    'E',
-                    "startup-assets",
-                    &format!(
-                        "Rust panic during startup asset preparation: {}",
-                        panic_detail(&*payload)
-                    ),
-                );
-                let assets_ready = pregame::recover_failed_startup(
-                    &game,
-                    &format!(
-                        "Rust panic during startup asset preparation: {}",
-                        panic_detail(&*payload)
-                    ),
-                );
+                // Kiln layer: one line a player can read, naming the package that ran (report_startup_panic.rs)
+                let assets_ready = pregame::report_startup_panic(&game, &*payload);
                 return assets_ready && prepare_native_dlls_before_game_entry(&game);
             }
             false

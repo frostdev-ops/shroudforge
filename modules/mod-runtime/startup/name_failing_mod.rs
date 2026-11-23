@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 //! Kiln layer: a startup pass that failed in one package's own entrypoint names that package.
 
+use std::any::Any;
+
 /// The error a package's pregame entrypoint raised (`LuaModRunner::run`), with the package's id. It
 /// reads as the error alone, as before, so the pass's recorded error and its log line are unchanged.
 /// The loader takes the id to run the pass once more without that package
@@ -51,9 +53,60 @@ impl std::fmt::Display for PregameModError {
 
 impl std::error::Error for PregameModError {}
 
+/// A Rust panic while a package's pregame entrypoint ran (`LuaModRunner::run`). The panic goes on with this as its
+/// payload, so the loader's report of it (`entrypoints/loader/asset_preparation/report_startup_panic.rs`) can name the
+/// package. A panic is ShroudForge's own failure, not an error of the package: nothing runs the pass again without it.
+#[derive(Debug, Clone)]
+pub struct PregameModPanic {
+    /// "Forged and Found (forged-and-found 0.16.1)", or "forged-and-found 0.16.1" when the name is the id.
+    pub package: String,
+    /// The panic's own message.
+    pub detail: String,
+}
+
+impl PregameModPanic {
+    /// Runs a package's entrypoint; a panic in it unwinds on with a [`PregameModPanic`] for that package. mlua carries a
+    /// panic in a Rust function the package called through Lua back out as the same panic (unless the package's own
+    /// `pcall` caught it: the sandbox keeps mlua's default there).
+    pub(crate) fn name_package<T>(
+        id: &str,
+        name: &str,
+        version: &str,
+        entrypoint: impl FnOnce() -> T,
+    ) -> T {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(entrypoint)) {
+            Ok(value) => value,
+            Err(payload) => {
+                let package = if name == id || name.is_empty() {
+                    format!("{id} {version}")
+                } else {
+                    format!("{name} ({id} {version})")
+                };
+                std::panic::resume_unwind(Box::new(Self {
+                    package,
+                    detail: panic_text(&*payload),
+                }))
+            }
+        }
+    }
+}
+
+/// The message of a panic payload (a `&str` or a `String`, as `panic!` makes them).
+fn panic_text(payload: &(dyn Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_owned()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else if let Some(named) = payload.downcast_ref::<PregameModPanic>() {
+        named.detail.clone()
+    } else {
+        "panic payload was not a string".to_owned()
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::PregameModError;
+    use super::{PregameModError, PregameModPanic};
     use std::io::{Error, ErrorKind};
 
     /// What a package's entrypoint raises when it calls `failing` (a Rust function of the API).
@@ -115,6 +168,43 @@ mod tests {
         assert!(
             !error.io && error.message.contains("(os error 5)"),
             "{error:?}"
+        );
+    }
+
+    #[test]
+    fn a_panic_in_a_function_the_package_called_names_the_package() {
+        let lua = mlua::Lua::new();
+        let function = lua
+            .create_function(|_, ()| -> mlua::Result<()> {
+                panic!("cannot create a Lua reference, out of auxiliary stack space (used 1000194 slots)")
+            })
+            .unwrap();
+        lua.globals().set("failing", function).unwrap();
+        let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            PregameModPanic::name_package("forged-and-found", "Forged and Found", "0.16.1", || {
+                lua.load("local function walk() failing() end\nwalk()").exec()
+            })
+        }))
+        .unwrap_err();
+        let named = payload.downcast_ref::<PregameModPanic>().unwrap();
+        assert_eq!(named.package, "Forged and Found (forged-and-found 0.16.1)");
+        assert_eq!(
+            named.detail,
+            "cannot create a Lua reference, out of auxiliary stack space (used 1000194 slots)"
+        );
+        // a package named by its id; an entrypoint that does not panic returns as before
+        let payload = std::panic::catch_unwind(|| {
+            PregameModPanic::name_package("wisp", "wisp", "1.0.3", || panic!("{}", 7))
+        })
+        .unwrap_err();
+        let named = payload.downcast_ref::<PregameModPanic>().unwrap();
+        assert_eq!(
+            (named.package.as_str(), named.detail.as_str()),
+            ("wisp 1.0.3", "7")
+        );
+        assert_eq!(
+            PregameModPanic::name_package("wisp", "wisp", "1.0.3", || 5),
+            5
         );
     }
 }

@@ -48,6 +48,7 @@ impl LuaModRunner {
 
     /// Kiln layer: an error names the package whose entrypoint raised it (`PregameModError`), so the
     /// loader can run the pass once more without that package. Its text is the Lua error's, as before.
+    /// A panic in an entrypoint goes on, naming the package (`PregameModPanic`).
     pub fn run(&self) -> Result<(), crate::PregameModError> {
         let app_state = self.lua.app_data_ref::<AppState>().unwrap();
 
@@ -72,9 +73,15 @@ impl LuaModRunner {
                 "Running mod",
             );
 
-            self.state
-                .require_mod(&r#mod.info().id, &self.lua)
-                .map_err(|error| crate::PregameModError::new(&r#mod.info().id, error))?;
+            // a Rust panic in it goes on to the loader with the package's name (`PregameModPanic`)
+            let info = r#mod.info();
+            crate::PregameModPanic::name_package(
+                &info.id,
+                &info.name,
+                &info.version.to_string(),
+                || self.state.require_mod(&info.id, &self.lua),
+            )
+            .map_err(|error| crate::PregameModError::new(&info.id, error))?;
         }
 
         Ok(())

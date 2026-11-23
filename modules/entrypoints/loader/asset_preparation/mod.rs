@@ -6,6 +6,8 @@ mod parse_game_assets;
 mod prepare_game_assets;
 mod prepare_startup_assets;
 mod recover_failed_startup_assets;
+// Kiln layer
+mod report_startup_panic;
 mod require_game_stopped;
 // Kiln layer
 mod retry_without_failed_mod;
@@ -18,6 +20,7 @@ use lock_startup_assets::startup_asset_lease;
 pub use prepare_game_assets::run;
 pub(crate) use prepare_startup_assets::{prepare_vanilla, run_startup};
 pub(crate) use recover_failed_startup_assets::recover_failed_startup;
+pub(crate) use report_startup_panic::report_startup_panic;
 use require_game_stopped::ensure_game_stopped;
 use retry_without_failed_mod::{Retry, failed_mod, run_once_more};
 use select_game_target::{process_target_name, target_name};

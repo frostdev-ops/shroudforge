@@ -64,7 +64,7 @@ impl Retry {
 
 /// The error on one line: the Lua stack traceback cut off, white space collapsed, at most
 /// [`MAX_ERROR`] characters.
-fn one_line(text: &str) -> String {
+pub(super) fn one_line(text: &str) -> String {
     let text = text.split("stack traceback:").next().unwrap_or(text);
     let line = text.split_whitespace().collect::<Vec<_>>().join(" ");
     if line.chars().count() > MAX_ERROR {
