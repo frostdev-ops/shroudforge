@@ -44,13 +44,16 @@ pub(crate) fn startup_panic_detail(payload: &(dyn Any + Send)) -> String {
 fn short_paths(text: &str) -> String {
     let c: Vec<char> = text.chars().collect();
     let separator = |at: usize| c.get(at).is_some_and(|&ch| ch == '\\' || ch == '/');
-    let boundary = |at: usize| at == 0 || c[at - 1].is_whitespace() || "([{<\"'`=,;".contains(c[at - 1]);
+    let boundary =
+        |at: usize| at == 0 || c[at - 1].is_whitespace() || "([{<\"'`=,;".contains(c[at - 1]);
     let starts = |at: usize| {
         boundary(at)
             && match c[at] {
                 '\\' => c.get(at + 1) == Some(&'\\'),
                 '/' => c.get(at + 1).is_some_and(|next| !next.is_whitespace()),
-                drive => drive.is_ascii_alphabetic() && c.get(at + 1) == Some(&':') && separator(at + 2),
+                drive => {
+                    drive.is_ascii_alphabetic() && c.get(at + 1) == Some(&':') && separator(at + 2)
+                }
             }
     };
     let ends = |at: usize| {
@@ -84,7 +87,11 @@ fn short_paths(text: &str) -> String {
                 i += 1;
             }
         }
-        let keep = if runs.len() >= 2 { runs[runs.len() - 2] } else { at };
+        let keep = if runs.len() >= 2 {
+            runs[runs.len() - 2]
+        } else {
+            at
+        };
         out.extend(&c[keep..end]);
         at = end;
     }
@@ -169,7 +176,10 @@ mod tests {
             detail("\\\\?\\C:\\Users\\player\\Enshrouded\\shroudforge\\state.json"),
             said("shroudforge\\state.json")
         );
-        assert_eq!(detail("D:/Games/Enshrouded/mods/x/mod.lua"), said("x/mod.lua"));
+        assert_eq!(
+            detail("D:/Games/Enshrouded/mods/x/mod.lua"),
+            said("x/mod.lua")
+        );
         assert_eq!(
             detail("left: \"C:\\\\Users\\\\player\\\\game\\\\b.kfc\", right: 2"),
             said("left: \"game\\\\b.kfc\", right: 2")
