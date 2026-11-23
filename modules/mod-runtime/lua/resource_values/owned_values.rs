@@ -12,15 +12,15 @@ use crate::{
     env::value::{
         converter::{Converter, LuaConversionErrorKind},
         name_of, validate_and_clone_lua_value,
-        validator::try_clone_lua_value,
+        validator::try_clone_stored_value,
     },
-    lua::{FunctionArgs, LuaError, LuaValue, MethodArgs},
+    lua::{FunctionArgs, LuaError, LuaValue, MethodArgs, StoredLuaValue},
     type_aliases::TypeHandle,
 };
 
 pub struct StructValue {
     r#type: TypeHandle,
-    fields: Rc<RefCell<HashMap<String, LuaValue>>>,
+    fields: Rc<RefCell<HashMap<String, StoredLuaValue>>>,
 }
 
 impl StructValue {
@@ -31,7 +31,10 @@ impl StructValue {
     /// The provided `data` must adhere to the type's structure,
     /// otherwise it will lead to unexpected behavior.
     #[inline]
-    pub fn new_with_data(r#type: TypeHandle, map: HashMap<String, LuaValue>) -> mlua::Result<Self> {
+    pub fn new_with_data(
+        r#type: TypeHandle,
+        map: HashMap<String, StoredLuaValue>,
+    ) -> mlua::Result<Self> {
         Ok(Self {
             r#type,
             fields: Rc::new(RefCell::new(map)),
@@ -54,7 +57,7 @@ impl StructValue {
                 .r#type
                 .get_field_type(key)
                 .expect("field type must be present");
-            let converted_value = converter.process(value, &field_type)?;
+            let converted_value = converter.process(&value.load()?, &field_type)?;
 
             result.insert(key.clone(), converted_value);
 
@@ -69,7 +72,7 @@ impl StructValue {
         let mut fields = HashMap::with_capacity(table.len());
 
         for (key, value) in table.iter() {
-            fields.insert(key.clone(), try_clone_lua_value(value, lua)?);
+            fields.insert(key.clone(), try_clone_stored_value(value, lua)?);
         }
 
         Ok(Self {
@@ -83,12 +86,10 @@ impl StructValue {
     }
 
     pub fn get(&self, key: String) -> mlua::Result<LuaValue> {
-        Ok(self
-            .fields
-            .borrow()
-            .get(&key)
-            .cloned()
-            .unwrap_or(LuaValue::Nil))
+        match self.fields.borrow().get(&key) {
+            Some(value) => value.load(),
+            None => Ok(LuaValue::Nil),
+        }
     }
 
     pub fn set(&self, key: String, value: &LuaValue, lua: &mlua::Lua) -> mlua::Result<()> {
@@ -105,6 +106,7 @@ impl StructValue {
         // the field's type, as MappedStructValue::set checks it (not the struct's own type)
         let value =
             validate_and_clone_lua_value(value, &field_type, lua).map_err(LuaError::external)?;
+        let value = StoredLuaValue::new(lua, value)?;
 
         self.fields.borrow_mut().insert(key, value);
 
@@ -155,6 +157,7 @@ impl UserData for StructValue {
                     result.push(',');
                 }
 
+                let value = value.load()?;
                 result.push('"');
                 result.push_str(key);
                 result.push_str("\":");
@@ -178,7 +181,7 @@ impl UserData for StructValue {
 #[self_referencing]
 struct StructValueIter {
     r#type: TypeHandle,
-    fields: Rc<RefCell<HashMap<String, LuaValue>>>,
+    fields: Rc<RefCell<HashMap<String, StoredLuaValue>>>,
     #[borrows(r#type)]
     #[not_covariant]
     keys: RefCell<Box<dyn Iterator<Item = &'this str> + 'this>>,
@@ -212,8 +215,10 @@ impl StructValueIter {
             None => return Ok((LuaValue::Nil, LuaValue::Nil)),
         };
 
-        let value =
-            self.with_fields(|fields| fields.borrow().get(key).cloned().unwrap_or(LuaValue::Nil));
+        let value = self.with_fields(|fields| match fields.borrow().get(key) {
+            Some(value) => value.load(),
+            None => Ok(LuaValue::Nil),
+        })?;
 
         Ok((LuaValue::String(lua.create_string(key)?), value))
     }
@@ -224,7 +229,7 @@ impl UserData for StructValueIter {}
 pub struct ArrayValue {
     r#type: TypeHandle,
     inner_type: TypeHandle,
-    values: Rc<RefCell<Vec<LuaValue>>>,
+    values: Rc<RefCell<Vec<StoredLuaValue>>>,
 }
 
 impl ArrayValue {
@@ -235,7 +240,7 @@ impl ArrayValue {
     /// The provided `data` must adhere to the type's structure,
     /// otherwise it will lead to unexpected behavior.
     #[inline]
-    pub fn new_with_data(r#type: TypeHandle, data: Vec<LuaValue>) -> mlua::Result<Self> {
+    pub fn new_with_data(r#type: TypeHandle, data: Vec<StoredLuaValue>) -> mlua::Result<Self> {
         Ok(Self {
             inner_type: r#type
                 .inner_type()
@@ -262,7 +267,7 @@ impl ArrayValue {
         for (i, value) in values.iter().enumerate() {
             converter.path.push_index(i);
 
-            let converted_value = converter.process(value, &field_type)?;
+            let converted_value = converter.process(&value.load()?, &field_type)?;
             result.push(converted_value);
 
             converter.path.pop();
@@ -276,7 +281,7 @@ impl ArrayValue {
         let mut result = Vec::with_capacity(values.len());
 
         for value in values.iter() {
-            result.push(try_clone_lua_value(value, lua)?);
+            result.push(try_clone_stored_value(value, lua)?);
         }
 
         Ok(Self {
@@ -299,14 +304,10 @@ impl ArrayValue {
             return Ok(LuaValue::Nil);
         }
 
-        let value = self
-            .values
-            .borrow()
-            .get(index - 1)
-            .cloned()
-            .unwrap_or(LuaValue::Nil);
-
-        Ok(value)
+        match self.values.borrow().get(index - 1) {
+            Some(value) => value.load(),
+            None => Ok(LuaValue::Nil),
+        }
     }
 
     pub fn set(&self, index: usize, value: &LuaValue, lua: &mlua::Lua) -> mlua::Result<()> {
@@ -316,7 +317,7 @@ impl ArrayValue {
         let value = validate_and_clone_lua_value(value, &self.inner_type, lua)
             .map_err(LuaError::external)?;
 
-        self.values.borrow_mut()[index] = value;
+        self.values.borrow_mut()[index] = StoredLuaValue::new(lua, value)?;
 
         Ok(())
     }
@@ -328,7 +329,9 @@ impl ArrayValue {
         let value = validate_and_clone_lua_value(value, &self.inner_type, lua)
             .map_err(LuaError::external)?;
 
-        self.values.borrow_mut().insert(index, value);
+        self.values
+            .borrow_mut()
+            .insert(index, StoredLuaValue::new(lua, value)?);
 
         Ok(())
     }
@@ -345,7 +348,9 @@ impl ArrayValue {
             return Ok(None);
         }
 
-        Ok(Some(self.values.borrow_mut().remove(index)))
+        let removed = self.values.borrow_mut().remove(index);
+
+        removed.load().map(Some)
     }
 
     pub fn clear(&mut self) -> mlua::Result<()> {
@@ -416,6 +421,7 @@ impl UserData for ArrayValue {
                     result.push(',');
                 }
 
+                let value = value.load()?;
                 // Add quotes to value if it is a string
                 if value.is_string() {
                     result.push('"');
@@ -434,7 +440,7 @@ impl UserData for ArrayValue {
 }
 
 struct ArrayValueIter {
-    values: Rc<RefCell<Vec<LuaValue>>>,
+    values: Rc<RefCell<Vec<StoredLuaValue>>>,
     index: usize,
 }
 
@@ -463,7 +469,7 @@ impl ArrayValueIter {
         }
 
         let key = self.index;
-        let value = self.values.borrow()[key].clone();
+        let value = self.values.borrow()[key].load()?;
 
         self.index += 1;
 
@@ -476,7 +482,7 @@ impl UserData for ArrayValueIter {}
 pub struct VariantValue {
     r#type: TypeHandle,
     variant_type: TypeHandle,
-    value: LuaValue,
+    value: StoredLuaValue,
 }
 
 impl VariantValue {
@@ -490,7 +496,7 @@ impl VariantValue {
     pub fn new_with_data(
         r#type: TypeHandle,
         variant_type: TypeHandle,
-        value: LuaValue,
+        value: StoredLuaValue,
     ) -> mlua::Result<Self> {
         Ok(Self {
             r#type,
@@ -511,7 +517,7 @@ impl VariantValue {
 
     pub fn convert(&self, converter: &mut Converter) -> Result<Value, LuaConversionErrorKind> {
         let value = converter
-            .process(&self.value, &self.variant_type)?
+            .process(&self.value.load()?, &self.variant_type)?
             .into_struct()
             .expect("variant value must be convertible to struct");
 
@@ -526,7 +532,7 @@ impl VariantValue {
         Ok(Self {
             r#type: self.r#type.clone(),
             variant_type: self.variant_type.clone(),
-            value: try_clone_lua_value(&self.value, lua)?,
+            value: try_clone_stored_value(&self.value, lua)?,
         })
     }
 
@@ -544,11 +550,12 @@ impl UserData for VariantValue {
         fields.add_field_method_get("type", |_, this| {
             Ok(this.variant_type().qualified_name.clone())
         });
-        fields.add_field_method_get("value", |_, this| Ok(this.value.clone()));
+        fields.add_field_method_get("value", |_, this| this.value.load());
 
         fields.add_field_method_set("value", |lua, this, value: LuaValue| {
-            this.value = validate_and_clone_lua_value(&value, &this.variant_type, lua)
+            let value = validate_and_clone_lua_value(&value, &this.variant_type, lua)
                 .map_err(LuaError::external)?;
+            this.value = StoredLuaValue::new(lua, value)?;
 
             Ok(())
         });

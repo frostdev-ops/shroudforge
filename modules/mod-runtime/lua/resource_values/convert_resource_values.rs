@@ -16,7 +16,7 @@ use crate::{
         simple::{ArrayValue, StructValue, VariantValue},
         tree_path::TreePath,
     },
-    lua::{LuaError, LuaValue},
+    lua::{LuaError, LuaValue, StoredLuaValue},
     type_aliases::{MappedValue, TypeHandle},
 };
 
@@ -515,11 +515,12 @@ pub fn value_to_lua(value: &MappedValue, lua: &mlua::Lua) -> mlua::Result<LuaVal
             let wrapper = ArrayValue::new_with_data(
                 v.r#type().clone(),
                 v.iter()
-                    .map(|bit| match bit.name() {
-                        Some(name) => lua.create_string(name).map(LuaValue::String),
-                        None => lua
-                            .create_string(bit.value().to_string())
-                            .map(LuaValue::String),
+                    .map(|bit| {
+                        let name = match bit.name() {
+                            Some(name) => lua.create_string(name)?,
+                            None => lua.create_string(bit.value().to_string())?,
+                        };
+                        StoredLuaValue::new(lua, LuaValue::String(name))
                     })
                     .collect::<mlua::Result<Vec<_>>>()?,
             )?;

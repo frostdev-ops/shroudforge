@@ -5,6 +5,9 @@ mod errors;
 mod format_type_name;
 mod parse_require_path;
 mod readonly_collections;
+// Kiln layer: values Rust keeps between calls live in Lua's registry.
+mod stored_lua_value;
+pub(crate) use stored_lua_value::StoredLuaValue;
 pub use arguments::*;
 pub use cast_values::*;
 pub use create_sandbox::LuaVM;

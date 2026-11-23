@@ -19,10 +19,10 @@ use crate::{
         value::{
             converter::{Converter, LuaConversionErrorKind, value_to_lua},
             name_of, validate_and_clone_lua_value,
-            validator::try_clone_lua_value,
+            validator::try_clone_stored_value,
         },
     },
-    lua::{FunctionArgs, LuaError, LuaValue, MethodArgs},
+    lua::{FunctionArgs, LuaError, LuaValue, MethodArgs, StoredLuaValue},
     type_aliases::{MappedArray, MappedStruct, MappedVariant, TypeHandle},
 };
 
@@ -30,7 +30,7 @@ use crate::{
 
 pub struct MappedStructValue {
     data: MappedStruct,
-    cache: Rc<RefCell<HashMap<String, LuaValue>>>,
+    cache: Rc<RefCell<HashMap<String, StoredLuaValue>>>,
     dirty: Cell<bool>,
 }
 
@@ -74,7 +74,7 @@ impl MappedStructValue {
                         .get_field_type(key)
                         .expect("expected a valid field in struct");
 
-                    converter.process(value, &field_type)?
+                    converter.process(&value.load()?, &field_type)?
                 }
                 None => {
                     let value = self
@@ -98,8 +98,7 @@ impl MappedStructValue {
         let mut cache = HashMap::with_capacity(self.cache.borrow().len());
 
         for (key, value) in self.cache.borrow().iter() {
-            let cloned_value = try_clone_lua_value(value, lua)?;
-            cache.insert(key.clone(), cloned_value);
+            cache.insert(key.clone(), try_clone_stored_value(value, lua)?);
         }
 
         Ok(Self {
@@ -130,6 +129,7 @@ impl MappedStructValue {
 
         let value =
             validate_and_clone_lua_value(value, &field_type, lua).map_err(LuaError::external)?;
+        let value = StoredLuaValue::new(lua, value)?;
 
         if let Some(entry) = self.cache.borrow_mut().get_mut(key) {
             *entry = value;
@@ -148,7 +148,7 @@ impl MappedStructValue {
         }
 
         for value in self.cache.borrow().values() {
-            if is_dirty_lua_value(value)? {
+            if is_dirty_lua_value(&value.load()?)? {
                 return Ok(true);
             }
         }
@@ -158,12 +158,12 @@ impl MappedStructValue {
 
     fn get_field(
         data: &MappedStruct,
-        cache: &mut HashMap<String, LuaValue>,
+        cache: &mut HashMap<String, StoredLuaValue>,
         lua: &mlua::Lua,
         key: &str,
     ) -> mlua::Result<LuaValue> {
         if let Some(value) = cache.get(key) {
-            return Ok(value.clone());
+            return value.load();
         }
 
         // NOTE: won't cause an error if not mapped and the field is not present
@@ -189,7 +189,7 @@ impl MappedStructValue {
                 LuaValue::Other(_) => {
                     cache.insert(
                         key.to_string(),
-                        lua_value.clone()
+                        StoredLuaValue::new(lua, lua_value.clone())?
                     );
                 },
             }
@@ -242,7 +242,7 @@ impl UserData for MappedStructValue {
 
                 let key = field.name.as_str();
                 let value = match cache.get(key) {
-                    Some(value) => value,
+                    Some(value) => &value.load()?,
                     None => {
                         let field_value = this.data.get(key).map_err(LuaError::external)?;
 
@@ -276,7 +276,7 @@ impl UserData for MappedStructValue {
 #[self_referencing]
 struct MappedStructValueIter {
     data: MappedStruct,
-    cache: Rc<RefCell<HashMap<String, LuaValue>>>,
+    cache: Rc<RefCell<HashMap<String, StoredLuaValue>>>,
     #[borrows(data)]
     #[not_covariant]
     keys: RefCell<Box<dyn Iterator<Item = &'this str> + 'this>>,
@@ -329,7 +329,7 @@ pub struct MappedArrayValue {
 
 #[derive(Debug, Clone)]
 enum MappedArrayValueEntry {
-    Value(LuaValue),
+    Value(StoredLuaValue),
     Uninitialized(usize),
 }
 
@@ -371,7 +371,7 @@ impl MappedArrayValue {
                 }
                 MappedArrayValueEntry::Value(lua_value) => {
                     let value = converter
-                        .process(lua_value, self.data.element_type())
+                        .process(&lua_value.load()?, self.data.element_type())
                         .expect("failed to convert modified value");
 
                     result.push(value);
@@ -392,7 +392,7 @@ impl MappedArrayValue {
                     cloned_cache.push(MappedArrayValueEntry::Uninitialized(*i));
                 }
                 MappedArrayValueEntry::Value(lua_value) => {
-                    let cloned_value = try_clone_lua_value(lua_value, lua)?;
+                    let cloned_value = try_clone_stored_value(lua_value, lua)?;
                     cloned_cache.push(MappedArrayValueEntry::Value(cloned_value));
                 }
             }
@@ -427,7 +427,8 @@ impl MappedArrayValue {
         let value = validate_and_clone_lua_value(value, self.element_type(), lua)
             .map_err(LuaError::external)?;
 
-        self.values.borrow_mut()[index] = MappedArrayValueEntry::Value(value);
+        self.values.borrow_mut()[index] =
+            MappedArrayValueEntry::Value(StoredLuaValue::new(lua, value)?);
         self.dirty.set(true);
 
         Ok(())
@@ -439,6 +440,8 @@ impl MappedArrayValue {
 
         let value = validate_and_clone_lua_value(value, self.element_type(), lua)
             .map_err(LuaError::external)?;
+
+        let value = StoredLuaValue::new(lua, value)?;
 
         self.values
             .borrow_mut()
@@ -486,7 +489,7 @@ impl MappedArrayValue {
             match value {
                 MappedArrayValueEntry::Uninitialized(_) => {}
                 MappedArrayValueEntry::Value(lua_value) => {
-                    if is_dirty_lua_value(lua_value)? {
+                    if is_dirty_lua_value(&lua_value.load()?)? {
                         return Ok(true);
                     }
                 }
@@ -518,11 +521,11 @@ impl MappedArrayValue {
 
                 let lua_value = value_to_lua(&value, lua)?;
 
-                *entry = MappedArrayValueEntry::Value(lua_value.clone());
+                *entry = MappedArrayValueEntry::Value(StoredLuaValue::new(lua, lua_value.clone())?);
 
                 Ok(lua_value)
             }
-            MappedArrayValueEntry::Value(lua_value) => Ok(lua_value.clone()),
+            MappedArrayValueEntry::Value(lua_value) => lua_value.load(),
         }
     }
 
@@ -591,7 +594,7 @@ impl UserData for MappedArrayValue {
                             None => panic!("expected a valid field in struct"),
                         }
                     }
-                    MappedArrayValueEntry::Value(lua_value) => lua_value,
+                    MappedArrayValueEntry::Value(lua_value) => &lua_value.load()?,
                 };
                 // Add quotes to value if it is a string
                 if value.is_string() {
@@ -655,7 +658,7 @@ impl UserData for MappedArrayValueIter {}
 
 pub struct MappedVariantValue {
     data: MappedVariant,
-    value: RefCell<Option<LuaValue>>,
+    value: RefCell<Option<StoredLuaValue>>,
     dirty: Cell<bool>,
 }
 
@@ -683,7 +686,7 @@ impl MappedVariantValue {
             Some(value) => {
                 let variant_type = self.variant_type();
                 let value = converter
-                    .process(value, variant_type)?
+                    .process(&value.load()?, variant_type)?
                     .into_struct()
                     .expect("variant value must be convertible to struct");
 
@@ -701,7 +704,7 @@ impl MappedVariantValue {
         Ok(Self {
             data: self.data.clone(),
             value: match self.value.borrow().as_ref() {
-                Some(value) => RefCell::new(Some(try_clone_lua_value(value, lua)?)),
+                Some(value) => RefCell::new(Some(try_clone_stored_value(value, lua)?)),
                 None => RefCell::new(None),
             },
             dirty: self.dirty.clone(),
@@ -718,7 +721,7 @@ impl MappedVariantValue {
         }
 
         if let Some(value) = self.value.borrow().as_ref() {
-            return is_dirty_lua_value(value);
+            return is_dirty_lua_value(&value.load()?);
         }
 
         Ok(false)
@@ -734,11 +737,11 @@ impl UserData for MappedVariantValue {
             let mut value_slot = this.value.borrow_mut();
 
             match value_slot.as_ref() {
-                Some(value) => Ok(value.clone()),
+                Some(value) => value.load(),
                 None => {
                     let value = value_to_lua(&this.data.value().clone().into(), lua)?;
 
-                    *value_slot = Some(value.clone());
+                    *value_slot = Some(StoredLuaValue::new(lua, value.clone())?);
 
                     Ok(value)
                 }
@@ -749,7 +752,7 @@ impl UserData for MappedVariantValue {
             let value = validate_and_clone_lua_value(&value, this.variant_type(), lua)
                 .map_err(LuaError::external)?;
 
-            this.value.replace(Some(value));
+            this.value.replace(Some(StoredLuaValue::new(lua, value)?));
             this.dirty.set(true);
 
             Ok(())

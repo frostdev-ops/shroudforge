@@ -1,4 +1,5 @@
 use super::*;
+use crate::lua::StoredLuaValue;
 use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
@@ -30,7 +31,8 @@ pub struct ResourceInfo {
     pub(super) runtime_write_fault: RefCell<Option<String>>,
 
     pub(super) original_value: OnceCell<Option<MappedValue>>,
-    pub(super) value: RefCell<Option<LuaValue>>,
+    // Kiln layer: in Lua's registry, not as an mlua value (lua/stored_lua_value.rs)
+    pub(super) value: RefCell<Option<StoredLuaValue>>,
     pub(super) is_dirty: Cell<bool>,
 }
 
@@ -52,7 +54,7 @@ impl ResourceInfo {
 
     pub fn get_lua_value(&self, lua: &mlua::Lua) -> mlua::Result<LuaValue> {
         if let Some(value) = self.value.borrow().as_ref() {
-            return Ok(value.clone());
+            return value.load();
         }
 
         let value = match self.get_mapped_value(lua)? {
@@ -60,7 +62,8 @@ impl ResourceInfo {
             None => LuaValue::Nil,
         };
 
-        self.value.replace(Some(value.clone()));
+        self.value
+            .replace(Some(StoredLuaValue::new(lua, value.clone())?));
 
         Ok(value)
     }
@@ -85,7 +88,8 @@ impl ResourceInfo {
         )
         .map_err(LuaError::external)?;
 
-        self.value.replace(Some(lua_value));
+        self.value
+            .replace(Some(StoredLuaValue::new(lua, lua_value)?));
         self.is_dirty.replace(true);
 
         Ok(())
@@ -98,11 +102,11 @@ impl ResourceInfo {
         let app_state = lua.app_data_ref::<AppState>().unwrap();
         let type_registry = app_state.type_registry();
 
-        let lua_value = self.value.borrow();
-        let lua_value = match lua_value.as_ref() {
-            Some(value) => value,
+        let lua_value = match self.value.borrow().as_ref() {
+            Some(value) => value.load()?,
             None => return Ok(None),
         };
+        let lua_value = &lua_value;
 
         if !self.is_dirty.get() && !is_dirty_lua_value(lua_value)? {
             return Ok(None);
@@ -277,7 +281,7 @@ impl AppState {
             runtime_snapshot: OnceCell::new(),
             runtime_write_fault: RefCell::new(None),
             original_value: OnceCell::new(),
-            value: RefCell::new(Some(value)),
+            value: RefCell::new(Some(StoredLuaValue::new(lua, value)?)),
             is_dirty: Cell::new(true),
         });
 

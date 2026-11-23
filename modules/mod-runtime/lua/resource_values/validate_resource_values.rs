@@ -18,7 +18,7 @@ use crate::{
             tree_path::TreePath,
         },
     },
-    lua::{CastLuaExt, LuaValue},
+    lua::{CastLuaExt, LuaValue, StoredLuaValue},
     type_aliases::TypeHandle,
 };
 
@@ -327,7 +327,10 @@ impl Validator {
 
             let field_value = self.process(&field_value, &field_type)?;
 
-            fields.insert(field.name.clone(), field_value);
+            fields.insert(
+                field.name.clone(),
+                StoredLuaValue::new(&self.lua, field_value)?,
+            );
 
             self.path.pop();
         }
@@ -419,6 +422,7 @@ impl Validator {
 
                 self.path.pop();
 
+                let result = StoredLuaValue::new(&self.lua, result)?;
                 let variant_value =
                     VariantValue::new_with_data(r#type.clone(), variant_type, result)?;
                 let ud = self.lua.create_userdata(variant_value)?;
@@ -506,7 +510,7 @@ impl Validator {
                     let value = entry?;
                     let value = self.process(&value, &inner_type)?;
 
-                    result.push(value);
+                    result.push(StoredLuaValue::new(&self.lua, value)?);
 
                     self.path.pop();
                 }
@@ -731,5 +735,19 @@ pub fn try_clone_lua_value(lua_value: &LuaValue, lua: &mlua::Lua) -> mlua::Resul
             }
         }
         _ => Ok(lua_value.clone()),
+    }
+}
+
+/// [`try_clone_lua_value`] for a kept value: a value without its own copy (a string, a number) is shared, not stored
+/// again.
+pub(crate) fn try_clone_stored_value(
+    value: &StoredLuaValue,
+    lua: &mlua::Lua,
+) -> mlua::Result<StoredLuaValue> {
+    match value.load()? {
+        user_data @ LuaValue::UserData(_) => {
+            StoredLuaValue::new(lua, try_clone_lua_value(&user_data, lua)?)
+        }
+        _ => Ok(value.clone()),
     }
 }

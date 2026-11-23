@@ -253,3 +253,224 @@ fn a_struct_field_write_error_names_the_field_type() {
         "{err}"
     );
 }
+
+// Kiln layer: the values of an asset tree, and those a mod makes, must not pin one slot of mlua's auxiliary stack
+// (about a million slots) per value they keep. Player report (Forged and Found 0.16.1 on a Steam Deck, Kiln 30.5):
+// "Rust panic during startup asset preparation: cannot create a Lua reference, out of auxiliary stack space (used
+// 1000194 slots)".
+
+/// Occupied slots of mlua's auxiliary stack. These states run no coroutine, so the one thread in Lua's registry besides
+/// the running one is mlua's reference thread; a slot a dropped value freed is nil again.
+fn auxiliary_references(lua: &mlua::Lua) -> usize {
+    registry_scan(lua).0
+}
+
+/// Userdata held directly by Lua's registry.
+fn registry_userdata(lua: &mlua::Lua) -> usize {
+    registry_scan(lua).1
+}
+
+fn registry_scan(lua: &mlua::Lua) -> (usize, usize) {
+    let (mut references, mut userdata) = (0, 0);
+    unsafe {
+        lua.exec_raw::<()>((), |state| {
+            use mlua::ffi;
+            ffi::lua_pushnil(state);
+            while ffi::lua_next(state, ffi::LUA_REGISTRYINDEX) != 0 {
+                if ffi::lua_type(state, -1) == ffi::LUA_TUSERDATA {
+                    userdata += 1;
+                }
+                let thread = ffi::lua_tothread(state, -1);
+                if !thread.is_null() && thread != state {
+                    for index in 1..=ffi::lua_gettop(thread) {
+                        if ffi::lua_type(thread, index) != ffi::LUA_TNIL {
+                            references += 1;
+                        }
+                    }
+                }
+                ffi::lua_pop(state, 1);
+            }
+        })
+        .unwrap();
+    }
+    (references, userdata)
+}
+
+/// [`lua_with_registry`] with `count` game recipes; recipe i (from 0) has knowledgeOrQueryId.value i, compareValue 0.
+fn lua_with_recipes(count: usize) -> (mlua::Lua, Rc<TypeRegistry>) {
+    let (lua, registry) = lua_with_registry();
+    let mut bytes = vec![0u8; 8 + count * 8];
+    bytes[0..4].copy_from_slice(&8u32.to_le_bytes());
+    bytes[4..8].copy_from_slice(&(count as u32).to_le_bytes());
+    for i in 0..count {
+        bytes[8 + i * 8..12 + i * 8].copy_from_slice(&(i as u32).to_le_bytes());
+    }
+    let bytes: Rc<[u8]> = bytes.into();
+    let mapped = MappedValue::from_bytes(
+        &registry,
+        registry.get(TypeIndex::new(REGISTRY)).unwrap(),
+        &bytes,
+    )
+    .unwrap();
+    lua.globals()
+        .set("game", convert_value_to_lua(&mapped, &lua).unwrap())
+        .unwrap();
+    (lua, registry)
+}
+
+/// Visits every recipe, by `pairs` and by index, and edits a nested field of each.
+const WALK: &str = r#"
+    local count = 0
+    for i, recipe in pairs(game.recipes) do
+        local requirement = recipe.knowledgeRequirement
+        assert(requirement.knowledgeOrQueryId.value == i - 1, "recipe " .. i)
+        requirement.compareValue = 7
+        count = count + 1
+    end
+    assert(count == #game.recipes)
+    for i = 1, #game.recipes do
+        assert(game.recipes[i].knowledgeRequirement.compareValue == 7, "recipe " .. i)
+    end
+"#;
+
+/// (knowledgeOrQueryId.value, compareValue) of every recipe of the global `global`, converted back to game data.
+fn converted_recipes(
+    lua: &mlua::Lua,
+    registry: &Rc<TypeRegistry>,
+    global: &str,
+) -> Vec<(u64, u64)> {
+    let data: LuaValue = lua.globals().get(global).unwrap();
+    let value = convert_lua_to_value(&data, &handle(registry, REGISTRY)).unwrap();
+    let recipes = value.as_struct().unwrap().get("recipes").unwrap();
+    recipes
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|recipe| {
+            let requirement = recipe.as_struct().unwrap()["knowledgeRequirement"]
+                .as_struct()
+                .unwrap();
+            let id = requirement["knowledgeOrQueryId"].as_struct().unwrap()["value"]
+                .as_u64()
+                .unwrap();
+            (id, requirement["compareValue"].as_u64().unwrap())
+        })
+        .collect()
+}
+
+#[test]
+fn a_walk_over_350000_game_recipes_leaves_mluas_reference_stack_free() {
+    // plain recipe records and no mod code: what the player's startup pass panicked on
+    let (lua, registry) = lua_with_recipes(350_000);
+    lua.load(WALK).exec().unwrap();
+    let recipes = converted_recipes(&lua, &registry, "game");
+    assert_eq!(recipes.len(), 350_000);
+    assert!(
+        recipes
+            .iter()
+            .enumerate()
+            .all(|(i, recipe)| *recipe == (i as u64, 7)),
+        "every edit is in the converted data"
+    );
+}
+
+#[test]
+fn the_values_a_walk_visited_hold_no_lua_reference_each() {
+    let mut held = Vec::new();
+    for count in [1_000, 50_000] {
+        let (lua, _) = lua_with_recipes(count);
+        let before = registry_userdata(&lua);
+        lua.load(WALK).exec().unwrap();
+        lua.gc_collect().unwrap();
+        held.push(auxiliary_references(&lua));
+        // released, the whole tree is collected: no registry entry outlives the value that kept it
+        lua.globals().set("game", LuaValue::Nil).unwrap();
+        for _ in 0..8 {
+            lua.gc_collect().unwrap();
+        }
+        assert_eq!(registry_userdata(&lua), before, "{count} recipes");
+    }
+    assert!(
+        held[0] < 64 && held[1] <= held[0],
+        "references held after walking 1000 and 50000 recipes: {held:?}"
+    );
+}
+
+#[test]
+fn a_mod_made_copy_of_350000_recipes_leaves_mluas_reference_stack_free() {
+    let (lua, registry) = lua_with_registry();
+    lua.load(
+        r#"
+        local data = { recipes = {} }
+        for i = 1, 350000 do data.recipes[i] = new_recipe(i) end
+        owned = own(data)
+        data = nil
+        assert(#owned.recipes == 350000)
+        assert(owned.recipes[350000].knowledgeRequirement.knowledgeOrQueryId.value == 350000)
+        owned.recipes[350000].knowledgeRequirement.compareValue = 7
+        "#,
+    )
+    .exec()
+    .unwrap();
+    lua.gc_collect().unwrap();
+    let references = auxiliary_references(&lua);
+    assert!(
+        references < 64,
+        "the copy holds {references} Lua references"
+    );
+    let recipes = converted_recipes(&lua, &registry, "owned");
+    assert_eq!(recipes.len(), 350_000);
+    assert_eq!(recipes[0], (1, 0));
+    assert_eq!(recipes[349_999], (350_000, 7));
+}
+
+#[test]
+fn kept_values_stay_the_same_object_keep_their_edits_and_copy_apart() {
+    let (lua, registry) = lua_with_registry();
+    // table.remove's path for resource arrays
+    let pop_fn = lua
+        .create_function(|lua, list: AnyUserData| Ok(pop(&list, lua)?.0))
+        .unwrap();
+    lua.globals().set("pop", pop_fn).unwrap();
+    let game: LuaValue = lua.globals().get("game").unwrap();
+    assert!(!is_dirty_lua_value(&game).unwrap());
+    lua.load(
+        r#"
+        local first = game.recipes[1]
+        assert(rawequal(first, game.recipes[1]))
+        for _, recipe in pairs(game.recipes) do assert(rawequal(recipe, first)) end
+        assert(rawequal(first.knowledgeRequirement, game.recipes[1].knowledgeRequirement))
+        first.knowledgeRequirement.compareValue = 5
+        first = nil
+        collectgarbage()
+        collectgarbage()
+        -- the edit stays with no Lua reference left to the edited value
+        assert(game.recipes[1].knowledgeRequirement.compareValue == 5)
+        -- a copy (resource.data = data) is its own tree, and so is a copy of a copy
+        copy = own(game)
+        assert(copy.recipes[1].knowledgeRequirement.compareValue == 5)
+        copy.recipes[1].knowledgeRequirement.compareValue = 6
+        game.recipes[1].knowledgeRequirement.knowledgeOrQueryId.value = 42
+        assert(game.recipes[1].knowledgeRequirement.compareValue == 5)
+        assert(copy.recipes[1].knowledgeRequirement.knowledgeOrQueryId.value == 100)
+        assert(rawequal(copy.recipes[1], copy.recipes[1]))
+        again = own(copy)
+        again.recipes[1].knowledgeRequirement.compareValue = 9
+        assert(copy.recipes[1].knowledgeRequirement.compareValue == 6)
+        -- a removed element comes back whole, from the game's tree and from a copy
+        for _, data in ipairs({ game, again }) do
+            push(data.recipes, new_recipe(11))
+            local removed = pop(data.recipes)
+            collectgarbage()
+            assert(removed.knowledgeRequirement.knowledgeOrQueryId.value == 11)
+            assert(#data.recipes == 1)
+        end
+        "#,
+    )
+    .exec()
+    .unwrap();
+    assert!(is_dirty_lua_value(&game).unwrap());
+    assert_eq!(converted_recipes(&lua, &registry, "game"), [(42, 5)]);
+    assert_eq!(converted_recipes(&lua, &registry, "copy"), [(100, 6)]);
+    assert_eq!(converted_recipes(&lua, &registry, "again"), [(100, 9)]);
+}
