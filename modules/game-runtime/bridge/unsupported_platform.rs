@@ -89,6 +89,15 @@ pub fn world_context_kind() -> u32 {
 pub fn world_entity_context_ready() -> bool {
     false
 }
+pub fn world_entity_query_props_ready() -> bool {
+    false
+}
+
+#[cfg(test)]
+#[test]
+fn prop_queries_are_not_ready_without_the_native_runtime() {
+    assert!(!world_entity_query_props_ready());
+}
 pub fn world_cursor_read() -> Option<(Vec<u8>, u64)> {
     None
 }
