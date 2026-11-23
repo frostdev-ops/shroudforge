@@ -283,7 +283,8 @@ impl Catalog {
         descriptor: &Value,
         component: &Value,
     ) -> Result<Value, String> {
-        let count = self.root_entries(uint(&descriptor["root_hash"])?)?.len();
+        let root = uint(&descriptor["root_hash"])?;
+        let count = self.root_entries(root)?.len();
         if component["storage_size"].as_u64() != Some(count as u64 * 4) {
             return Err("attribute component storage count differs from KFC root".into());
         }
@@ -292,7 +293,10 @@ impl Catalog {
         let exact = scalar.is_some() && scalar == storage;
         let integer = matches!(scalar, Some("keen::sint32" | "keen::uint32"))
             && matches!(storage, Some("keen::sint32" | "keen::uint32"));
-        let calculation = exact || (integer && descriptor["calculation_sign_independent"] == true);
+        // Kiln: the one admitted signedness conflict, calculated as the resource's sint32 (engine_signed_root).
+        let engine_signed = engine_signed_root(root, scalar, storage);
+        let calculation = exact
+            || (integer && (descriptor["calculation_sign_independent"] == true || engine_signed));
         let mut result = descriptor.clone();
         result["components"] = json!([component]);
         result["storage_writable"] = json!(exact || integer);
@@ -313,7 +317,11 @@ impl Catalog {
             json!("signedness-dependent program with conflicting resource/storage scalar types")
         };
         if calculation {
-            result["calculation_scalar_type"] = component["storage_scalar_type"].clone();
+            result["calculation_scalar_type"] = if engine_signed {
+                json!(scalar)
+            } else {
+                component["storage_scalar_type"].clone()
+            };
         }
         Ok(result)
     }
@@ -480,6 +488,13 @@ impl Catalog {
                 components.len() == 1 && components[0]["scalar_type_matches"] == true;
             let common_integer =
                 components.len() == 1 && components[0]["integer_representation_compatible"] == true;
+            // Kiln: the one admitted signedness conflict, calculated as the resource's sint32 (engine_signed_root).
+            let engine_signed = components.len() == 1
+                && engine_signed_root(
+                    root,
+                    scalar.map(|t| t.qualified_name.as_str()),
+                    components[0]["storage_scalar_type"].as_str(),
+                );
             // These instructions operate on the same 32-bit representation
             // for signed/unsigned interpreters, including wrapping arithmetic.
             // Ordering, division and rescaling are intentionally excluded.
@@ -523,7 +538,7 @@ impl Catalog {
                     "name_source":"kfc-debugNames","root_hash":root,"index":index,"resource_ids":resource_ids,
                     "container_ids":container_ids,"scalar_type_hash":scalar_hash,
                     "scalar_type":scalar.map(|t| t.qualified_name.as_str()),"components":components,
-                    "calculation_scalar_type":if components.len() == 1 && (scalar_matches || (common_integer && sign_independent)) {
+                    "calculation_scalar_type":if components.len() == 1 && !engine_signed && (scalar_matches || (common_integer && sign_independent)) {
                         components[0]["storage_scalar_type"].clone()
                     } else {json!(scalar.map(|t| t.qualified_name.as_str()))},
                     "structure":structure[index],"calculation_words":words,
@@ -536,9 +551,9 @@ impl Catalog {
                     "effect_scope":"local process, network authority and publication remain engine-managed",
                     "storage_writable":scalar_matches || common_integer,
                     "write_value_domain":if !scalar_matches && common_integer {"integer-common-range-0-to-2147483647"} else {"declared-scalar"},
-                    "calculation_writable":scalar_matches || (common_integer && sign_independent),
+                    "calculation_writable":scalar_matches || (common_integer && (sign_independent || engine_signed)),
                     "calculation_reason":if components.is_empty() {Some("calculation storage type requires an initialized entity root match")}
-                        else if !scalar_matches && !sign_independent {Some("signedness-dependent program with conflicting resource/storage scalar types")} else {None},
+                        else if !scalar_matches && !sign_independent && !engine_signed {Some("signedness-dependent program with conflicting resource/storage scalar types")} else {None},
                     "storage_reason":if components.is_empty() {Some("no proven component/root association. Compact headers without a reflected definition GUID require an independently observed initialized root ID")}
                         else if !scalar_matches && !common_integer {Some("KFC scalar type differs from reflected storage")}
                         else if components.len() != 1 {Some("ambiguous component ownership")} else {None}});
@@ -602,6 +617,30 @@ impl Catalog {
         }
         Ok((result, trace))
     }
+}
+
+/// Kiln: the roots whose calculation is admitted although their resource and
+/// storage scalar types differ in signedness and their programs depend on it:
+/// BodyHeat (0xC7AEAF1D) alone. The attribute resource types the root sint32;
+/// its component, keen::ecs::BodyHeat, is a keen::ecs::UInt32Attribute whose
+/// storage is keen::uint32; BodyHeat runs Clamp and BodyHeat_Max runs
+/// ScaleToNewMax. The engine evaluates this root with its signed interpreter
+/// only (client exe 5d9ef2f1, Steam build 26430625; server exe f0d824be): its
+/// attribute dispatcher picks the interpreter by the registry's resource type
+/// (sint32: the signed one), and the BodyHeat recharge and depletion code and
+/// attrAdd recompute the root through the signed recalculation (Kiln's
+/// docs/re/combat.md, "BodyHeat runs"). So the root is calculated as the
+/// resource's sint32 (what `recalculate` runs) with the common-range write
+/// domain of every conflicting integer pair; every other conflicting root stays
+/// refused. The same rule as Kiln's kiln-sfi and kiln-eml catalogs.
+pub(crate) const ENGINE_SIGNED_ROOTS: [u32; 1] = [0xC7AE_AF1D];
+
+/// Kiln: whether `root` is one of `ENGINE_SIGNED_ROOTS` with exactly the pair
+/// proven for it, the resource's keen::sint32 over keen::uint32 storage.
+pub(crate) fn engine_signed_root(root: u32, scalar: Option<&str>, storage: Option<&str>) -> bool {
+    scalar == Some("keen::sint32")
+        && storage == Some("keen::uint32")
+        && ENGINE_SIGNED_ROOTS.contains(&root)
 }
 
 /// Engine Guid -> HashKey32 (client 0x1e4600, server 0x2f080).
@@ -812,5 +851,184 @@ pub(crate) mod tests {
                 "incomplete attribute root"
             );
         }
+    }
+
+    // Kiln: the one admitted signedness conflict (ENGINE_SIGNED_ROOTS). The
+    // BodyHeat root, typed sint32 by the resource and stored as uint32 by its
+    // component, with the game's sign-dependent programs, is calculated as the
+    // resource's sint32; the reverse pair, the same pair on another root and a
+    // float storage keep the refusal.
+    const BODY_HEAT_ROOT: u32 = 0xC7AE_AF1D;
+    /// Definition GUID bytes whose FNV-1a is BODY_HEAT_ROOT (a preimage made
+    /// for this test).
+    const BODY_HEAT_GUID: [u8; 16] = [
+        75, 105, 108, 110, 66, 111, 100, 121, 72, 101, 97, 2, 111, 25, 151, 3,
+    ];
+
+    /// The KFC3 header fixture with sint32 (10), float32 (11) and the verified
+    /// AttributeOps (12), its component's storage of `element`'s type and its
+    /// reflected definition `guid`.
+    fn body_heat_types(element: u64, guid: [u8; 16]) -> TypeRegistry {
+        let mut fixture = serde_json::to_value(header_fixture(false)).unwrap();
+        let types = fixture["types"].as_array_mut().unwrap();
+        for (index, name, kind) in [(10, "sint32", "SINT32"), (11, "float32", "FLOAT32")] {
+            let qualified = format!("keen::{name}");
+            types.push(json!({"index":index,"name":name,"qualifiedName":qualified,"impactName":name,
+                "size":4,"alignment":4,"elementAlignment":4,"fieldCount":0,"primitiveType":kind,
+                "flags":"","nameHash":kfc::hash::fnv(name),"qualifiedHash":kfc::hash::fnv(&qualified),
+                "impactHash":kfc::hash::fnv(name),"internalHash":index}));
+        }
+        let ops = [
+            ("Load0", 1),
+            ("Load", 2),
+            ("LoadRef", 3),
+            ("Push", 5),
+            ("Add", 6),
+            ("Substract", 7),
+            ("Multiply", 8),
+            ("Clamp", 12),
+            ("ScaleToNewMax", 13),
+            ("Max", 15),
+        ];
+        let fields: serde_json::Map<String, Value> = ops
+            .iter()
+            .map(|(name, value)| (name.to_string(), json!({"name":name,"value":value})))
+            .collect();
+        types.push(json!({"index":12,"name":"AttributeOps","qualifiedName":"keen::AttributeOps",
+            "impactName":"AttributeOps","size":4,"alignment":4,"elementAlignment":4,
+            "fieldCount":ops.len(),"primitiveType":"ENUM","innerType":2,"flags":"",
+            "nameHash":kfc::hash::fnv("AttributeOps"),"qualifiedHash":kfc::hash::fnv("keen::AttributeOps"),
+            "impactHash":kfc::hash::fnv("AttributeOps"),"internalHash":12,"enumFields":fields}));
+        types[7]["innerType"] = json!(element);
+        let mut default = vec![0u8; 36 + 32];
+        default[20..36].copy_from_slice(&guid);
+        types[8]["defaultValue"] = json!(default);
+        serde_json::from_value(fixture).unwrap()
+    }
+
+    /// The BodyHeat definition (the game's names and programs, in a container
+    /// resource) under `root`, typed by the scalar with internal hash `scalar`.
+    fn body_heat_definition(root: u32, scalar: u32, programs: bool) -> Value {
+        let names = [
+            "BodyHeat",
+            "BodyHeat_Max",
+            "BodyHeat_Max_Adder",
+            "BodyHeat_Max_Base",
+            "BodyHeat_RechargeRampup",
+            "BodyHeat_RechargeTimeout",
+            "BodyHeat_Recharge",
+            "BodyHeat_Min",
+        ];
+        let structure: Vec<Value> = (0..8u32)
+            .map(|i| {
+                let calculation = match (programs, i) {
+                    (true, 0) => json!([0x20000, 0x20007, 0x20001, 0xcffff]),
+                    (true, 1) => {
+                        json!([
+                            0x30000, 0x10000, 0x20001, 0x20003, 0x20002, 0x6ffff, 0xdffff
+                        ])
+                    }
+                    _ => json!([]),
+                };
+                json!({"parentIndex":if i == 0 {65535} else {0},
+                    "childIndex":if i == 0 {1} else {65535},
+                    "siblingIndex":if i == 0 || i == 7 {65535} else {i + 1},
+                    "calculation":calculation})
+            })
+            .collect();
+        let value = json!({"ids":(0..8u32).map(|i| json!({"value":root.wrapping_add(i)})).collect::<Vec<_>>(),
+            "debugNames":names,"structure":structure,"type":{"value":scalar}});
+        json!({"id":"8f1fd455-a5bf-4184-a77c-7123955d6e04","type":"keen::AttributeContainerResource",
+            "value":{"attributes":[value]}})
+    }
+
+    fn body_heat_min(
+        types: TypeRegistry,
+        root: u32,
+        scalar: u32,
+        programs: bool,
+    ) -> (Catalog, Value) {
+        let catalog =
+            Catalog::from_resources(&types, &[body_heat_definition(root, scalar, programs)])
+                .unwrap();
+        let min = catalog.by_name("BodyHeat_Min").unwrap().clone();
+        assert_eq!(min["components"].as_array().unwrap().len(), 1);
+        (catalog, min)
+    }
+
+    #[test]
+    fn body_heat_is_calculated_as_the_resources_sint32() {
+        assert_eq!(definition_root(&BODY_HEAT_GUID), BODY_HEAT_ROOT);
+        let (catalog, min) =
+            body_heat_min(body_heat_types(2, BODY_HEAT_GUID), BODY_HEAT_ROOT, 10, true);
+        assert_eq!(min["components"][0]["storage_scalar_type"], "keen::uint32");
+        assert_eq!(min["scalar_type"], "keen::sint32");
+        assert_eq!(min["calculation_sign_independent"], false);
+        assert_eq!(min["calculation_writable"], true);
+        assert_eq!(min["calculation_reason"], Value::Null);
+        assert_eq!(min["calculation_scalar_type"], "keen::sint32");
+        assert_eq!(min["storage_writable"], true);
+        assert_eq!(
+            min["write_value_domain"],
+            "integer-common-range-0-to-2147483647"
+        );
+        // bound to its component the same way
+        let bound = catalog.bind_storage(&min, &min["components"][0]).unwrap();
+        assert_eq!(bound["calculation_writable"], true);
+        assert_eq!(bound["calculation_scalar_type"], "keen::sint32");
+        // the recalculation runs signed: Min raised to Max clamps BodyHeat up to
+        // it, and an all-ones Min is the signed -1, a lower bound
+        let (values, _) = catalog
+            .recalculate(BODY_HEAT_ROOT, &[4000, 10000, 0, 10000, 0, 0, 0, 10000])
+            .unwrap();
+        assert_eq!(values, [10000, 10000, 0, 10000, 0, 0, 0, 10000]);
+        let (values, _) = catalog
+            .recalculate(BODY_HEAT_ROOT, &[4000, 10000, 0, 10000, 0, 0, 0, u32::MAX])
+            .unwrap();
+        assert_eq!(values[0], 4000);
+    }
+
+    #[test]
+    fn other_signedness_conflicts_keep_the_refusal() {
+        let refused = |types: TypeRegistry, root: u32, scalar: u32| {
+            let (catalog, min) = body_heat_min(types, root, scalar, true);
+            for descriptor in [
+                min.clone(),
+                catalog.bind_storage(&min, &min["components"][0]).unwrap(),
+            ] {
+                assert_eq!(descriptor["calculation_writable"], false);
+                assert_eq!(
+                    descriptor["calculation_reason"],
+                    "signedness-dependent program with conflicting resource/storage scalar types"
+                );
+            }
+            min
+        };
+        // the reverse pair on the BodyHeat root: uint32 resource over sint32 storage
+        let min = refused(body_heat_types(10, BODY_HEAT_GUID), BODY_HEAT_ROOT, 2);
+        assert_eq!(min["calculation_scalar_type"], "keen::uint32");
+        // the proven pair on another root
+        let mut other = BODY_HEAT_GUID;
+        other[15] ^= 1;
+        let root = definition_root(&other);
+        assert_ne!(root, BODY_HEAT_ROOT);
+        refused(body_heat_types(2, other), root, 10);
+        // a float storage under the BodyHeat root
+        let min = refused(body_heat_types(11, BODY_HEAT_GUID), BODY_HEAT_ROOT, 10);
+        assert_eq!(min["storage_writable"], false);
+        // a sign-independent conflict keeps the storage-typed calculation
+        let (_, min) = body_heat_min(body_heat_types(2, other), root, 10, false);
+        assert_eq!(min["calculation_writable"], true);
+        assert_eq!(min["calculation_scalar_type"], "keen::uint32");
+        assert!(!engine_signed_root(
+            BODY_HEAT_ROOT,
+            Some("keen::uint32"),
+            Some("keen::sint32")
+        ));
+        assert!(engine_signed_root(
+            BODY_HEAT_ROOT,
+            Some("keen::sint32"),
+            Some("keen::uint32")
+        ));
     }
 }

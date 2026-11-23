@@ -809,3 +809,137 @@ fn program_literals_are_not_misreported_as_opcodes() {
         false
     );
 }
+
+// Kiln: the one admitted signedness conflict (ENGINE_SIGNED_ROOTS), on the
+// live write path that refused SF Survival's Infinite Frost Timer. A KFC4
+// BodyHeat component (compact header, no definition GUID): the resource types
+// the root sint32, the component stores uint32, the programs are the game's.
+fn body_heat_update_fixture(
+    root: u32,
+    resource: &str,
+    storage: &str,
+    words: [u32; 8],
+) -> (Catalog, Vec<u8>) {
+    let registry = header_fixture(true);
+    let header = header_layout(&registry, TypeIndex::new(8)).unwrap();
+    let names = [
+        "BodyHeat",
+        "BodyHeat_Max",
+        "BodyHeat_Max_Adder",
+        "BodyHeat_Max_Base",
+        "BodyHeat_RechargeRampup",
+        "BodyHeat_RechargeTimeout",
+        "BodyHeat_Recharge",
+        "BodyHeat_Min",
+    ];
+    let mut catalog = Catalog::default();
+    for (index, name) in names.into_iter().enumerate() {
+        let words = match index {
+            0 => vec![0x20000, 0x20007, 0x20001, 0xcffff],
+            1 => vec![
+                0x30000, 0x10000, 0x20001, 0x20003, 0x20002, 0x6ffff, 0xdffff,
+            ],
+            _ => Vec::new(),
+        };
+        catalog.entries.insert(
+            root.wrapping_add(index as u32),
+            json!({
+                "name":name,"hash":root.wrapping_add(index as u32),"root_hash":root,"index":index,
+                "scalar_type":resource,"calculation_scalar_type":resource,
+                "calculation_sign_independent":false,"calculation_encoding_verified":true,
+                "calculation":{"decoded":true},"calculation_words":words
+            }),
+        );
+    }
+    catalog.layouts.push(
+        json!({"qualified_name":"keen::ecs::BodyHeat","size":40,"header":header,
+        "storage_offset":8,"storage_size":32,"storage_scalar_type":storage}),
+    );
+    let mut bytes = vec![0; 40];
+    bytes[..4].copy_from_slice(&root.to_le_bytes());
+    bytes[4..6].copy_from_slice(&8u16.to_le_bytes());
+    bytes[6] = 1;
+    bytes[7] = 8;
+    for (index, word) in words.into_iter().enumerate() {
+        bytes[8 + index * 4..12 + index * 4].copy_from_slice(&word.to_le_bytes());
+    }
+    (catalog, bytes)
+}
+
+/// BodyHeat_Min (slot 7) set to `min` on `before`, through the bound update.
+fn body_heat_min_update(catalog: &Catalog, before: &[u8], min: u32) -> Result<Vec<u8>, String> {
+    let mut after = before.to_vec();
+    let mut mask = vec![0; before.len()];
+    after[36..40].copy_from_slice(&min.to_le_bytes());
+    mask[36..40].fill(1);
+    recalculate_bound_component_update(
+        catalog,
+        "keen::ecs::BodyHeat",
+        before,
+        &mut after,
+        &mut mask,
+        "attribute-command-v1",
+    )?;
+    Ok(after)
+}
+
+fn words(bytes: &[u8]) -> Vec<u32> {
+    bytes[8..40]
+        .chunks_exact(4)
+        .map(|word| u32::from_le_bytes(word.try_into().unwrap()))
+        .collect()
+}
+
+#[test]
+fn body_heat_min_takes_its_maximum_on_the_signed_calculation() {
+    let root = 0xC7AE_AF1D;
+    let (catalog, before) = body_heat_update_fixture(
+        root,
+        "keen::sint32",
+        "keen::uint32",
+        [4000, 10000, 0, 10000, 0, 0, 0, 0],
+    );
+    let after = body_heat_min_update(&catalog, &before, 10000).unwrap();
+    assert_eq!(words(&after), [10000, 10000, 0, 10000, 0, 0, 0, 10000]);
+    // every word stays in the common range: one outside it before or after refuses
+    let (catalog, before) = body_heat_update_fixture(
+        root,
+        "keen::sint32",
+        "keen::uint32",
+        [4000, 10000, 0x8000_0000, 10000, 0, 0, 0, 0],
+    );
+    assert!(
+        body_heat_min_update(&catalog, &before, 10000)
+            .unwrap_err()
+            .contains("common integer range")
+    );
+    let (catalog, before) = body_heat_update_fixture(
+        root,
+        "keen::sint32",
+        "keen::uint32",
+        [4000, 10000, 0, 10000, 0, 0, 0, 0],
+    );
+    assert!(
+        body_heat_min_update(&catalog, &before, u32::MAX)
+            .unwrap_err()
+            .contains("common integer range")
+    );
+}
+
+#[test]
+fn other_signedness_conflicts_refuse_the_bound_update() {
+    let words_before = [4000, 10000, 0, 10000, 0, 0, 0, 0];
+    for (root, resource, storage) in [
+        (0xC7AE_AF1Du32, "keen::uint32", "keen::sint32"),
+        (0x04b6_aa8b, "keen::sint32", "keen::uint32"),
+        (0xC7AE_AF1E, "keen::sint32", "keen::uint32"),
+    ] {
+        let (catalog, before) = body_heat_update_fixture(root, resource, storage, words_before);
+        assert!(
+            body_heat_min_update(&catalog, &before, 10000)
+                .unwrap_err()
+                .contains("signedness-dependent"),
+            "{root:#010x} {resource} over {storage}"
+        );
+    }
+}
