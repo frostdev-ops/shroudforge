@@ -277,12 +277,25 @@ pub fn restore(game_dir: impl AsRef<Path>, file_name: &str) -> bool {
 
 /// Kiln layer: `restore` without the check, for a caller that has just made it.
 pub fn restore_checked(game_dir: impl AsRef<Path>, file_name: &str) -> bool {
-    let kfc_path = game_dir.as_ref().join(format!("{file_name}.kfc"));
-    if crate::startup::manage_asset_baseline::restore_backup(&kfc_path).is_err() {
+    let game = game_dir.as_ref().as_std_path();
+    let result = (|| -> std::io::Result<()> {
+        let stage = shroudforge_game_assets::transaction::begin(game, file_name)?;
+        // Copy and flush the whole pair before publishing either file. The existing transaction publishes the header
+        // last and retains rollback copies if a replacement fails or the process ends during publication.
+        for extension in ["kfc", "kfc_resources"] {
+            let name = format!("{file_name}.{extension}");
+            std::fs::copy(game.join(format!("{name}.bak")), stage.join(name))?;
+        }
+        shroudforge_game_assets::transaction::commit(game, file_name)
+    })();
+    if let Err(error) = result {
+        error!(stem = file_name, error = %error, "Failed to restore the complete asset baseline");
+        if let Err(error) = shroudforge_game_assets::transaction::abort(game, file_name) {
+            error!(stem = file_name, error = %error, "Baseline rollback remains pending for the next start");
+        }
         return false;
     }
-    let resources = game_dir.as_ref().join(format!("{file_name}.kfc_resources"));
-    crate::startup::manage_asset_baseline::restore_companion_backup(resources).is_ok()
+    true
 }
 
 pub fn backup_companion_file(path: impl AsRef<std::path::Path>) -> bool {

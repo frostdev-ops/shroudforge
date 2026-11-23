@@ -120,3 +120,23 @@ fn a_backup_that_does_not_fit_its_companion_never_goes_over_modded_files() {
     assert!(read(&game, "enshrouded.kfc_resources") == resources, "the game's resource file is untouched");
     assert!(read(&game, "enshrouded.kfc_resources.bak").is_empty(), "and the backups too");
 }
+
+#[test]
+fn refusing_a_baseline_keeps_the_last_output_proof_for_the_next_start() {
+    let game = Game::new("repeat-refusal");
+    game.package("alpha", "return {}", &[]);
+    run_startup(&game.0).unwrap();
+    let replacement = game.0.join("unrelated-backup");
+    archive(&replacement, b"another archive of the same version");
+    for extension in ["kfc", "kfc_resources"] {
+        fs::copy(replacement.join(format!("enshrouded.{extension}")),
+            game.0.join(format!("enshrouded.{extension}.bak"))).unwrap();
+    }
+    let header = read(&game, "enshrouded.kfc");
+    for _ in 0..2 {
+        let error = run_startup(&game.0).unwrap_err().to_string();
+        assert!(error.contains("Verify the game files in Steam"), "{error}");
+        assert!(shroudforge_game_assets::prepared_stamp::left_live_header(&game.0, "enshrouded"));
+        assert_eq!(read(&game, "enshrouded.kfc"), header);
+    }
+}

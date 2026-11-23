@@ -39,8 +39,7 @@ fn backups(stem: &str) -> [(&'static str, String); 2] {
 /// What the record says about the backups in the game folder now.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Recorded {
-    /// No record, one this runtime cannot read, or both backups were replaced since it was written (another program
-    /// made a new pair): it proves nothing about the backups.
+    /// No record, or one this runtime cannot read: it proves nothing about the backups.
     Unrecorded,
     /// Both backups are the pair the record describes, byte for byte.
     Whole,
@@ -91,43 +90,32 @@ fn read(root: &Path, stem: &str) -> Option<Value> {
     (value["scheme"] == SCHEME && value["target"] == stem).then_some(value)
 }
 
-/// Compares the backups with the record. A backup whose size and last-write time are still the recorded ones is read
-/// in full and compared by its SHA-256; one whose size or time changed was replaced. `Err` only when a backup that
-/// has to be read cannot be.
+/// Compares both backups by size and SHA-256, regardless of last-write times. A copy/touch can change both times
+/// without changing the pair, but must never discard its recorded hashes. `Err` means a backup cannot be read.
 pub fn check(root: &Path, stem: &str) -> Result<Recorded, String> {
     let Some(record) = read(root, stem) else {
         return Ok(Recorded::Unrecorded);
     };
-    let mut kept = Vec::new();
-    let mut replaced = Vec::new();
-    for (key, name) in backups(stem) {
+    let pair = backups(stem);
+    for (index, (key, name)) in pair.iter().enumerate() {
+        let other = &pair[1 - index].1;
         let then = &record["files"][key];
-        let now = crate::prepared_stamp::identity(&root.join(&name))?;
-        if !now.is_null() && then["size"] == now["size"] && then["modified"] == now["modified"] {
-            kept.push((key, name));
-        } else {
-            replaced.push((name, now.is_null()));
+        let now = crate::prepared_stamp::identity(&root.join(name))?;
+        if now.is_null() {
+            return Ok(Recorded::Broken(format!("{name}, made together with {other}, is missing")));
+        }
+        let unchanged = then["size"] == now["size"] && then["sha256"].is_string()
+            && crate::prepared_stamp::with_hash(&root.join(name), None)?["sha256"] == then["sha256"];
+        if !unchanged {
+            let why = if then["size"] == now["size"] && then["modified"] == now["modified"] {
+                format!("{name} changed since it was made (its content differs from the record, its size and time do not)")
+            } else {
+                format!("{name} was replaced since it was made together with {other}")
+            };
+            return Ok(Recorded::Broken(why));
         }
     }
-    match (kept.as_slice(), replaced.as_slice()) {
-        ([], _) => Ok(Recorded::Unrecorded),
-        ([(_, kept)], [(other, missing)]) => Ok(Recorded::Broken(if *missing {
-            format!("{other}, made together with {kept}, is missing")
-        } else {
-            format!("{other} was replaced since it was made together with {kept}")
-        })),
-        _ => {
-            for (key, name) in kept {
-                let now = crate::prepared_stamp::with_hash(&root.join(&name), None)?;
-                if now["sha256"] != record["files"][key]["sha256"] {
-                    return Ok(Recorded::Broken(format!(
-                        "{name} changed since it was made (its content differs from the record, its size and time do not)"
-                    )));
-                }
-            }
-            Ok(Recorded::Whole)
-        }
-    }
+    Ok(Recorded::Whole)
 }
 
 #[cfg(test)]
@@ -191,17 +179,32 @@ mod tests {
     }
 
     #[test]
-    fn a_pair_another_program_made_anew_is_unrecorded_and_other_targets_are_not_read() {
+    fn changing_both_timestamps_does_not_discard_the_recorded_hashes() {
+        let game = folder();
+        record(&game.0, "enshrouded").unwrap();
+        for name in ["enshrouded.kfc.bak", "enshrouded.kfc_resources.bak"] {
+            fs::File::options().write(true).open(game.0.join(name)).unwrap()
+                .set_modified(UNIX_EPOCH).unwrap();
+        }
+        assert_eq!(check(&game.0, "enshrouded").unwrap(), Recorded::Whole, "timestamps alone do not change identity");
+        fs::write(game.0.join("enshrouded.kfc_resources.bak"), b"other resources").unwrap();
+        assert!(matches!(check(&game.0, "enshrouded").unwrap(), Recorded::Broken(_)));
+    }
+
+    #[test]
+    fn replacing_both_backups_breaks_the_record_and_other_targets_are_not_read() {
         let game = folder();
         let root = &game.0;
         record(root, "enshrouded").unwrap();
         fs::write(root.join("enshrouded.kfc.bak"), b"a new header backup").unwrap();
         fs::write(root.join("enshrouded.kfc_resources.bak"), b"a new resources backup").unwrap();
-        assert_eq!(check(root, "enshrouded").unwrap(), Recorded::Unrecorded);
+        assert!(matches!(check(root, "enshrouded").unwrap(), Recorded::Broken(_)));
 
         // A record of the other target, or of another scheme, is no record of this pair.
         fs::rename(record_path(root, "enshrouded"), record_path(root, "enshrouded_server")).unwrap();
-        fs::copy(record_path(root, "enshrouded_server"), record_path(root, "enshrouded")).unwrap();
+        let mut other: Value = serde_json::from_slice(&fs::read(record_path(root, "enshrouded_server")).unwrap()).unwrap();
+        other["target"] = json!("enshrouded_server");
+        fs::write(record_path(root, "enshrouded"), serde_json::to_vec(&other).unwrap()).unwrap();
         assert_eq!(check(root, "enshrouded").unwrap(), Recorded::Unrecorded, "the record names the other target");
         fs::write(record_path(root, "enshrouded"), br#"{"scheme":"other","target":"enshrouded"}"#).unwrap();
         assert_eq!(check(root, "enshrouded").unwrap(), Recorded::Unrecorded);

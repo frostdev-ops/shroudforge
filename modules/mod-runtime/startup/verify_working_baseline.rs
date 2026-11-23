@@ -55,7 +55,16 @@ pub fn check_working_baseline(
     let resources_bak = game.join(format!("{stem}.kfc_resources.bak"));
     let (bak_name, resources_bak_name) = (format!("{stem}.kfc.bak"), format!("{stem}.kfc_resources.bak"));
     match fs::symlink_metadata(&bak) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Baseline::Missing,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let live = KFCFile::from_path(&kfc, false).ok();
+            return match live {
+                Some(live) => match replacement(&resources, &live, stem, live_is_last_output, format!("{bak_name} is missing")) {
+                    Baseline::Retake(_) => Baseline::Missing,
+                    other => other,
+                },
+                None => Baseline::Refuse(refusal(stem, &format!("{bak_name} is missing"), "cannot be read")),
+            };
+        }
         Err(error) => return Baseline::Refuse(format!("{bak_name} cannot be read: {error}")),
         Ok(metadata) if !metadata.is_file() => {
             return Baseline::Refuse(format!("{bak_name} is not a file; move it out of the game folder"));
@@ -71,7 +80,7 @@ pub fn check_working_baseline(
         _ => false,
     };
     if live.is_some() && incompatible {
-        return Baseline::Retake(match (&base, &live) {
+        let why = match (&base, &live) {
             (None, _) => format!("{bak_name} is not a readable game archive"),
             (Some(base), Some(live)) if base.game_version() != live.game_version() => format!(
                 "it is of game version {}, the game's files are of {}",
@@ -79,11 +88,11 @@ pub fn check_working_baseline(
                 live.game_version()
             ),
             _ => "it is in another archive format than the game's files".into(),
-        });
+        };
+        return replacement(&resources, live.as_ref().unwrap(), stem, live_is_last_output, why);
     }
     let Some(base) = base else {
-        // Neither header reads: upstream restores, and so does this.
-        return Baseline::Restore { recorded: false };
+        return Baseline::Refuse(refusal(stem, &format!("{bak_name} is not a readable game archive"), "cannot be read"));
     };
 
     // Is the pair whole?
@@ -100,11 +109,7 @@ pub fn check_working_baseline(
                 (Some(have), _) if end > have => Some(format!(
                     "{bak_name} lists resource data up to byte {end}, {resources_bak_name} has {have} bytes"
                 )),
-                (None, live_length) if end > live_length.unwrap_or(0) => Some(format!(
-                    "{bak_name} lists resource data up to byte {end}, there is no {resources_bak_name} and the game's \
-                     {stem}.kfc_resources has {} bytes",
-                    live_length.unwrap_or(0)
-                )),
+                (None, _) => Some(format!("{resources_bak_name} is missing or is not a regular file")),
                 _ => None,
             }
         }
@@ -137,10 +142,17 @@ pub fn check_working_baseline(
         }
         None => "the game's files were not built from it".into(),
     };
+    replacement(&resources, &live, stem, live_is_last_output, why)
+}
+
+/// Every path that takes a new baseline must prove the same facts, including missing/incompatible backups.
+fn replacement(resources: &Path, live: &KFCFile, stem: &str, live_is_last_output: bool, why: String) -> Baseline {
     if live_is_last_output {
         return Baseline::Refuse(refusal(stem, &why, "are what ShroudForge's last start prepared"));
     }
-    let live_length = length(&resources).unwrap_or(0);
+    let Some(live_length) = length(resources) else {
+        return Baseline::Refuse(refusal(stem, &why, "have no regular companion resource file"));
+    };
     if chunks_end(&live) > live_length {
         return Baseline::Refuse(format!(
             "{why}; and the game's own {stem}.kfc lists resource data up to byte {}, its {stem}.kfc_resources has {} \
@@ -367,6 +379,57 @@ mod tests {
         install(&update.0, &game.0);
         assert!(matches!(check_working_baseline(&game.0, STEM, false),
             Baseline::Retake(why) if why == "it is of game version game 1, the game's files are of game 2"));
+    }
+
+    #[test]
+    fn a_missing_companion_is_not_borrowed_from_modded_live_files() {
+        let game = folder("missing-companion");
+        archive(&game.0, "game 1", b"vanilla content");
+        back_up(&game.0);
+        mod_over(&game.0, b"modded content");
+        fs::remove_file(game.0.join(format!("{STEM}.kfc_resources.bak"))).unwrap();
+        assert!(matches!(check_working_baseline(&game.0, STEM, true), Baseline::Refuse(_)));
+    }
+
+    #[test]
+    fn an_incompatible_backup_does_not_make_damaged_live_files_clean() {
+        let game = folder("incompatible-damaged");
+        let update = folder("incompatible-update");
+        archive(&game.0, "game 1", b"old content");
+        back_up(&game.0);
+        archive(&update.0, "game 2", b"new content");
+        install(&update.0, &game.0);
+        fs::remove_file(game.0.join(format!("{STEM}.kfc_resources"))).unwrap();
+        assert!(matches!(check_working_baseline(&game.0, STEM, false), Baseline::Refuse(_)));
+    }
+
+    #[test]
+    fn losing_the_header_backup_does_not_make_the_last_output_clean() {
+        let game = folder("lost-header");
+        archive(&game.0, "game 1", b"vanilla content");
+        back_up(&game.0);
+        mod_over(&game.0, b"modded content");
+        fs::remove_file(game.0.join(format!("{STEM}.kfc.bak"))).unwrap();
+        assert!(matches!(check_working_baseline(&game.0, STEM, true), Baseline::Refuse(_)));
+    }
+
+    #[test]
+    fn a_companion_copy_failure_does_not_publish_only_the_baseline_header() {
+        let game = folder("restore-copy-failure");
+        archive(&game.0, "game 1", b"vanilla content");
+        back_up(&game.0);
+        baseline_record::record(&game.0, STEM).unwrap();
+        mod_over(&game.0, b"modded content");
+        let header = fs::read(game.0.join(format!("{STEM}.kfc"))).unwrap();
+        assert_eq!(check_working_baseline(&game.0, STEM, true), Baseline::Restore { recorded: true });
+        // A source becomes unavailable after validation, before the second copy (also possible with locks or I/O errors).
+        let backup = game.0.join(format!("{STEM}.kfc_resources.bak"));
+        fs::remove_file(&backup).unwrap();
+        fs::create_dir(&backup).unwrap();
+        assert!(!super::super::manage_asset_baseline::restore_checked(
+            camino::Utf8Path::from_path(&game.0).unwrap(), STEM));
+        assert!(fs::read(game.0.join(format!("{STEM}.kfc"))).unwrap() == header,
+            "a failed pair restore must leave the previous live header in place");
     }
 
     #[test]

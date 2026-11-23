@@ -39,9 +39,6 @@ pub(super) fn run_inner(
     // are never taken for a clean copy (verify_working_baseline.rs).
     let live_is_last_output =
         shroudforge_game_assets::prepared_stamp::left_live_header(game_directory, file_name);
-    // Kiln layer: the record of the last pass goes before the files it describes change.
-    shroudforge_game_assets::prepared_stamp::forget(game_directory, file_name)
-        .map_err(LoaderError::Pregame)?;
     shroudforge_loader_config::config::write_document(
         game_directory,
         shroudforge_game_assets::documents::APPLIED,
@@ -63,7 +60,15 @@ pub(super) fn run_inner(
         // their source is set aside and made anew from them (verify_working_baseline.rs). ShroudForge's own rule (a
         // backup of another game version) is one of those reasons.
         let mut recorded = true;
-        match shroudforge_api::check_working_baseline(game_directory, file_name, live_is_last_output) {
+        let baseline = shroudforge_api::check_working_baseline(game_directory, file_name, live_is_last_output);
+        if let shroudforge_api::Baseline::Refuse(why) = &baseline {
+            return Err(LoaderError::Pregame(format!("ShroudForge: {why}")));
+        }
+        // Keep the last-output proof on refusal: another start must not mistake those modded files for clean ones.
+        // Once mutation is allowed, invalidate the old pass stamp before changing any game files.
+        shroudforge_game_assets::prepared_stamp::forget(game_directory, file_name)
+            .map_err(LoaderError::Pregame)?;
+        match baseline {
             shroudforge_api::Baseline::Missing => {
                 shroudforge_api::capture_working_baseline(game_directory, file_name)
                     .map_err(LoaderError::Pregame)?;
