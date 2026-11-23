@@ -129,6 +129,18 @@ Tests (Wine): `startup::verify_working_baseline` (5), `baseline_record` (3), and
 startup passes on a small archive, one after an update that kept the version tag (red before: the old pair went back),
 one with a companion too short for its header under modded game files (red before: it was copied over them).
 
+## EML manifests with null optional metadata (dev.30.7)
+
+EML reads its manifest into a type whose `description`, `license`, `icon` and `dependencies[].optional` are optional
+(`Option`), so `null` there means "not given". ShroudForge's manifest schema allowed null only for `license` and
+`icon`: a package with `"description": null` was refused with "mod: null is not of type string". The schema now takes
+null for `description` and `dependencies[].optional` too (`modules/modloader/manifest/manifest.schema.json`; the
+parsed manifest already had `Option` fields), and every schema error names the field it is about after the document
+(`modules/loader-config/validate_document.rs`): `mod: /description: false is not of type "string"`,
+`mod: /dependencies/0/optional: "yes" is not of types "boolean", "null"`. Errors of the whole document (a missing
+required field) read as before. `authors`, `capabilities` and `dependencies` stay non-null: EML refuses null there as
+well. Tests (Wine): `kiln_manifest_tests` (2, red before), through `ModRegistry::load`.
+
 ## One failing startup mod no longer costs the others (dev.29.18)
 
 ShroudForge writes the packages that need the game data changed (a `patch` part, or `export` without a runtime part)

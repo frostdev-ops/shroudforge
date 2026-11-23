@@ -25,7 +25,11 @@
       "pattern": "^\\d+\\.\\d+\\.\\d+(?:[-+][0-9A-Za-z.-]+)?$"
     },
     "description": {
-      "type": "string",
+      "description": "Optional description. Use null when the mod has none (EML reads null as absent).",
+      "type": [
+        "string",
+        "null"
+      ],
       "maxLength": 2000
     },
     "authors": {
@@ -74,8 +78,11 @@
             "type": "string"
           },
           "optional": {
-            "description": "When true, this mod may start if the dependency is unavailable. Defaults to false.",
-            "type": "boolean",
+            "description": "When true, this mod may start if the dependency is unavailable. Defaults to false (also when null, as EML reads it).",
+            "type": [
+              "boolean",
+              "null"
+            ],
             "default": false
           }
         }

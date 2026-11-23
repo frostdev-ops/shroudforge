@@ -21,6 +21,9 @@ pub use plan_mod_load_order::*;
 mod mod_registry;
 pub use mod_registry::{Mod, ModRegistry};
 mod find_installed_mods;
+// Kiln layer
+#[cfg(test)]
+mod kiln_manifest_tests;
 mod validate_mod_manifest;
 mod validate_setting_presets;
 pub use validate_mod_manifest::validate_manifest;

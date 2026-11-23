@@ -74,7 +74,9 @@ pub fn validate_document(_root: &Path, document: Document, value: &Value) -> Res
         })
         .as_ref()
         .map_err(Clone::clone)?;
-    validator
-        .validate(value)
-        .map_err(|e| format!("{name}: {e}"))
+    // Kiln layer: the error names the field it is about (its JSON pointer), not only the document.
+    validator.validate(value).map_err(|e| match e.instance_path.as_str() {
+        "" => format!("{name}: {e}"),
+        field => format!("{name}: {field}: {e}"),
+    })
 }
