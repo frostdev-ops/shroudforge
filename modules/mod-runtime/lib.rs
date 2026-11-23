@@ -142,6 +142,11 @@ pub use runtime::IngameRuntime;
 pub use startup::manage_asset_baseline::{
     backup_companion_file, create_working_kfc_backup, restore, working_baseline_is_incompatible,
 };
+// Kiln layer: whether the working baseline may go back over the game files, and its record.
+pub use startup::manage_asset_baseline::{
+    capture_working_baseline, record_working_baseline, restore_checked,
+};
+pub use startup::verify_working_baseline::{Baseline, check_working_baseline};
 pub use startup::run_startup_mods::{run, run_with_local_schema};
 // Kiln layer: the package a failed startup pass is pinned on.
 pub use startup::name_failing_mod::PregameModError;

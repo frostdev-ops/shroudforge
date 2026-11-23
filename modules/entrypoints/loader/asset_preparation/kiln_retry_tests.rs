@@ -12,10 +12,10 @@ use std::{fs, path::PathBuf, rc::Rc};
 
 /// A game folder with a small archive pair and the type cache ShroudForge reads before it would extract
 /// the types from the executable (`mod-runtime/reflection/load_type_registry.rs`).
-struct Game(PathBuf);
+pub(super) struct Game(pub(super) PathBuf);
 
 impl Game {
-    fn new(name: &str) -> Game {
+    pub(super) fn new(name: &str) -> Game {
         let root = std::env::temp_dir().join(format!(
             "sf-kiln-retry-{name}-{}-{}",
             std::process::id(),
@@ -64,7 +64,7 @@ impl Game {
     }
 
     /// A switched-on package with a `patch` part whose entrypoint is `lua`, needing `needs`.
-    fn package(&self, id: &str, lua: &str, needs: &[&str]) {
+    pub(super) fn package(&self, id: &str, lua: &str, needs: &[&str]) {
         let package = shroudforge_loader_config::paths::mods_dir(&self.0).join(id);
         fs::create_dir_all(package.join("src")).unwrap();
         let dependencies: Vec<_> = needs
@@ -98,7 +98,7 @@ impl Game {
         );
     }
 
-    fn record(&self) -> serde_json::Value {
+    pub(super) fn record(&self) -> serde_json::Value {
         shroudforge_loader_config::config::read_document(
             &self.0,
             shroudforge_game_assets::documents::APPLIED,
@@ -107,7 +107,7 @@ impl Game {
     }
 
     /// ShroudForge's log of this start (Kiln copies its lines into kiln.log).
-    fn log(&self) -> String {
+    pub(super) fn log(&self) -> String {
         fs::read_to_string(shroudforge_loader_config::paths::current_log(&self.0))
             .unwrap_or_default()
     }

@@ -102,6 +102,26 @@ pub fn current(root: &Path, file_name: &str, inputs: &PassInputs) -> Result<(), 
     Ok(())
 }
 
+/// Whether the live `<stem>.kfc` is the header the last successful pass left (its size and whole
+/// SHA-256, as the record holds them). The working baseline check reads it before the next pass
+/// removes the record: game files that a pass of this runtime wrote are never taken for a clean copy.
+pub fn left_live_header(root: &Path, file_name: &str) -> bool {
+    let Ok(bytes) = fs::read(record_path(root, file_name)) else {
+        return false;
+    };
+    let Ok(recorded) = serde_json::from_slice::<Value>(&bytes) else {
+        return false;
+    };
+    if recorded["scheme"] != SCHEME || recorded["target"] != file_name {
+        return false;
+    }
+    let Ok(live) = with_hash(&root.join(format!("{file_name}.kfc")), None) else {
+        return false;
+    };
+    let then = &recorded["files"]["kfc"];
+    then["size"] == live["size"] && then["sha256"].is_string() && then["sha256"] == live["sha256"]
+}
+
 fn capture(root: &Path, file_name: &str, inputs: &PassInputs) -> Result<Value, String> {
     let file = |suffix: &str| root.join(format!("{file_name}.{suffix}"));
     Ok(json!({
@@ -133,7 +153,7 @@ fn modified_nanos(metadata: &fs::Metadata) -> Result<String, String> {
 }
 
 /// Size and last-write time of a regular file; a missing file is recorded as missing.
-fn identity(path: &Path) -> Result<Value, String> {
+pub(crate) fn identity(path: &Path) -> Result<Value, String> {
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.is_file() => Ok(json!({
             "size": metadata.len(),
@@ -146,7 +166,7 @@ fn identity(path: &Path) -> Result<Value, String> {
 }
 
 /// `identity` plus a SHA-256 of the whole file, or of its first and last `edge` bytes.
-fn with_hash(path: &Path, edge: Option<u64>) -> Result<Value, String> {
+pub(crate) fn with_hash(path: &Path, edge: Option<u64>) -> Result<Value, String> {
     let metadata =
         fs::symlink_metadata(path).map_err(|error| format!("{}: {error}", path.display()))?;
     if !metadata.is_file() {

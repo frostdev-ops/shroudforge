@@ -98,6 +98,37 @@ With a ShroudForge installation in the game folder nothing changes: its Updater 
 missing Updater is still an error. Tests: `cargo test -p shroudforge-game-assets` (host, also under Wine) and
 `outdated_working_backups_are_replaced_without_an_updater` in `shroudforge-modloader` (Wine).
 
+## A working baseline that is not the source of the game files (dev.30.7)
+
+Before every startup pass ShroudForge copies `<stem>.kfc.bak` and `<stem>.kfc_resources.bak` over the game files. It
+checked only the header backup's version tag and archive format, so a header backup from before a game update that
+kept the tag went back over the updated files, and the pass failed with "failed to fill whole buffer" (the old header
+pointed past the end of the resource file). Nothing tied the companion to its header either.
+
+`check_working_baseline` (`modules/mod-runtime/startup/verify_working_baseline.rs`) now decides before the pass:
+
+- **Restore** only a whole pair that is the source of the game files. Whole: both backups are the pair recorded in
+  `<stem>.kfc.baseline.json` when it was made (size, last-write time and SHA-256 of each,
+  `modules/game-files/record_working_baseline.rs`); a pair without a record (made before) must at least hold the
+  header backup's resource data in its companion, and is recorded once restored. Source: the live header is the header
+  backup, or was built over it (its containers, resource chunks and contents unchanged, only additions after them, as
+  every incremental `KFCWriter` writes).
+- **Set aside and make anew** when the pair is not the source of the game files (an update or Steam's file check
+  wrote them), when it is of another game version (ShroudForge's own rule), or when it is not whole while the game's
+  header is its own header: the pair moves away as after a game update (`working_baseline`, the record with it) and
+  `capture_working_baseline` copies both game files, then records them. One `startup-assets` warning says why:
+  `ShroudForge: its clean copy of the game data (<stem>.kfc.bak, <stem>.kfc_resources.bak) was not used: <why>. It was
+  set aside and a new clean copy was made from the game's current files`.
+- **Refuse** when no clean copy is left: the game files carry mods built from a pair that is not whole, the game
+  files are what the last pass of this runtime left (`prepared_stamp::left_live_header`, read before the pass removes
+  that record), or the game's own header points past the end of its resource file. The pass fails with the reason and
+  "Verify the game files in Steam (or update the server files with SteamCMD's validate), then start again";
+  `recover_failed_startup` refuses the same pair (`restore` makes the check too) and leaves every file as it is.
+
+Tests (Wine): `startup::verify_working_baseline` (5), `baseline_record` (3), and `kiln_baseline_tests` (2): whole
+startup passes on a small archive, one after an update that kept the version tag (red before: the old pair went back),
+one with a companion too short for its header under modded game files (red before: it was copied over them).
+
 ## One failing startup mod no longer costs the others (dev.29.18)
 
 ShroudForge writes the packages that need the game data changed (a `patch` part, or `export` without a runtime part)

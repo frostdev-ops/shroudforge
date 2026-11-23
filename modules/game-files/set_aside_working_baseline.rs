@@ -26,11 +26,13 @@ pub const FOLDER: &str = "outdated-working-baseline";
 /// generation folder, so that start continues in the same folder. Moving it
 /// first could leave an old companion beside a newly captured header backup,
 /// and nothing checks a companion on its own.
-/// The middle entry is kiln-eml's seal of the pair; it describes the old one.
-fn names(stem: &str) -> [String; 3] {
+/// The middle entries are kiln-eml's seal of the pair and the runtime's own record of it
+/// (`record_working_baseline.rs`); both describe the old pair.
+fn names(stem: &str) -> [String; 4] {
     [
         format!("{stem}.kfc_resources.bak"),
         format!("{stem}.kfc.bak.integrity"),
+        format!("{stem}.kfc.baseline.json"),
         format!("{stem}.kfc.bak"),
     ]
 }
@@ -115,7 +117,7 @@ fn set_aside_with(
         }
         // `header` is the last one found; it must be the header backup itself.
         let header = header
-            .filter(|_| found.last() == Some(&&names[2]))
+            .filter(|_| found.last() == Some(&&names[3]))
             .ok_or_else(|| io::Error::other("there is no working header backup to set aside"))?;
         let generation = format!(
             "{}-{}",
@@ -142,7 +144,7 @@ fn set_aside_with(
         // finished generation: another pair with the same size and time. It is
         // replaced whole; its seal must not end up beside this pair. Without a
         // header backup the folder is this pair's own interrupted move.
-        if inside.contains(&&names[2]) {
+        if inside.contains(&&names[3]) {
             for name in inside {
                 fs::remove_file(kept.join(name))?;
             }
@@ -209,13 +211,14 @@ mod tests {
     }
 
     #[test]
-    fn the_old_pair_and_its_seal_leave_the_game_folder_and_one_generation_is_kept() {
+    fn the_old_pair_its_seal_and_its_record_leave_the_game_folder_and_one_generation_is_kept() {
         let root = fixture(&[
             ("enshrouded.kfc", "live header"),
             ("enshrouded.kfc_resources", "live resources"),
             ("enshrouded.kfc.bak", "header 1"),
             ("enshrouded.kfc_resources.bak", "resources 1"),
             ("enshrouded.kfc.bak.integrity", "seal 1"),
+            ("enshrouded.kfc.baseline.json", "record 1"),
             ("enshrouded_server.kfc.bak", "the other target"),
         ]);
         let first = set_aside(&root, "enshrouded").unwrap();
@@ -225,6 +228,7 @@ mod tests {
             list(&[
                 ("enshrouded.kfc.bak", "header 1"),
                 ("enshrouded.kfc.bak.integrity", "seal 1"),
+                ("enshrouded.kfc.baseline.json", "record 1"),
                 ("enshrouded.kfc_resources.bak", "resources 1"),
             ])
         );
@@ -232,6 +236,7 @@ mod tests {
             "enshrouded.kfc.bak",
             "enshrouded.kfc_resources.bak",
             "enshrouded.kfc.bak.integrity",
+            "enshrouded.kfc.baseline.json",
         ] {
             assert!(!root.join(gone).exists(), "{gone} is still in the game folder");
         }

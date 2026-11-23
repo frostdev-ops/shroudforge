@@ -29,13 +29,16 @@ pub(super) fn run_inner(
         tracing::warn!(target: "shroudforge::startup", mod_id = %issue.mod_id,
             code = %issue.code, detail = %issue.detail, "Mod skipped during startup preparation");
     }
-    let backup = game_directory.join(format!("{file_name}.kfc.bak"));
     let fingerprint = shroudforge_package::prepared::fingerprint(
         &environment,
         file_name == "enshrouded_server",
         shroudforge_api::API_VERSION,
     )
     .map_err(LoaderError::Pregame)?;
+    // Kiln layer: whether the game's header is what the last pass left, read before that record goes: such game files
+    // are never taken for a clean copy (verify_working_baseline.rs).
+    let live_is_last_output =
+        shroudforge_game_assets::prepared_stamp::left_live_header(game_directory, file_name);
     // Kiln layer: the record of the last pass goes before the files it describes change.
     shroudforge_game_assets::prepared_stamp::forget(game_directory, file_name)
         .map_err(LoaderError::Pregame)?;
@@ -56,28 +59,36 @@ pub(super) fn run_inner(
         shroudforge_game_assets::transaction::recover(game_directory, file_name)
             .map_err(|error| LoaderError::Pregame(error.to_string()))?;
         let resources = game_directory.join(format!("{file_name}.kfc_resources"));
-        if shroudforge_api::working_baseline_is_incompatible(game_utf8, file_name) {
-            crate::recycle_incompatible_game_asset_backups(game_directory, file_name)
-                .map_err(LoaderError::Pregame)?;
-            shroudforge_api::create_working_kfc_backup(game_utf8, file_name).map_err(|()| {
-                LoaderError::Pregame(format!(
-                    "could not create a new {file_name}.kfc working baseline"
-                ))
-            })?;
-            let resources_utf8 = resources.to_str().ok_or_else(|| {
-                LoaderError::Environment("companion resource file path is not valid UTF-8".into())
-            })?;
-            if !shroudforge_api::backup_companion_file(resources_utf8) {
-                return Err(LoaderError::Pregame(format!(
-                    "could not create a new {file_name}.kfc_resources working baseline"
-                )));
+        // Kiln layer: the pair goes back only when it is whole and the source of the game's files; one that is not
+        // their source is set aside and made anew from them (verify_working_baseline.rs). ShroudForge's own rule (a
+        // backup of another game version) is one of those reasons.
+        let mut recorded = true;
+        match shroudforge_api::check_working_baseline(game_directory, file_name, live_is_last_output) {
+            shroudforge_api::Baseline::Missing => {
+                shroudforge_api::capture_working_baseline(game_directory, file_name)
+                    .map_err(LoaderError::Pregame)?;
             }
-            tracing::warn!(target: "shroudforge::startup", target = file_name,
-                "Incompatible working asset backups were moved to the recycle bin and recaptured from the current game files");
-        } else if backup.is_file() && !shroudforge_api::restore(game_utf8, file_name) {
-            return Err(LoaderError::Pregame(format!(
-                "failed to restore the clean {file_name}.kfc baseline"
-            )));
+            shroudforge_api::Baseline::Restore { recorded: whole } => {
+                if !shroudforge_api::restore_checked(game_utf8, file_name) {
+                    return Err(LoaderError::Pregame(format!(
+                        "failed to restore the clean {file_name}.kfc baseline"
+                    )));
+                }
+                recorded = whole;
+            }
+            shroudforge_api::Baseline::Retake(why) => {
+                crate::recycle_incompatible_game_asset_backups(game_directory, file_name)
+                    .map_err(LoaderError::Pregame)?;
+                shroudforge_api::capture_working_baseline(game_directory, file_name)
+                    .map_err(LoaderError::Pregame)?;
+                let _ = shroudforge_logging::append(game_directory, 'W', "startup-assets", &format!(
+                    "ShroudForge: its clean copy of the game data ({file_name}.kfc.bak, {file_name}.kfc_resources.bak) \
+                     was not used: {why}. It was set aside and a new clean copy was made from the game's current files"
+                ));
+            }
+            shroudforge_api::Baseline::Refuse(why) => {
+                return Err(LoaderError::Pregame(format!("ShroudForge: {why}")));
+            }
         }
         let resources = resources.to_str().ok_or_else(|| {
             LoaderError::Environment("companion resource file path is not valid UTF-8".into())
@@ -87,6 +98,12 @@ pub(super) fn run_inner(
                 "failed to back up the clean {}.kfc_resources baseline",
                 file_name
             )));
+        }
+        // Kiln layer: a whole pair without a record (from before records, or a header backup whose companion was only
+        // made now) is recorded, so that later starts can tell it apart.
+        if !recorded {
+            shroudforge_api::record_working_baseline(game_directory, file_name)
+                .map_err(LoaderError::Pregame)?;
         }
         if phase == "startup" {
             shroudforge_api::run_with_local_schema(

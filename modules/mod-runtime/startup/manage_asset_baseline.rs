@@ -258,6 +258,25 @@ fn same_kfc_format(kfc_path: &Path, backup_path: &Path) -> bool {
 }
 
 pub fn restore(game_dir: impl AsRef<Path>, file_name: &str) -> bool {
+    // Kiln layer: only a whole pair that the game files are, or were built from, goes back
+    // (verify_working_baseline.rs).
+    use super::verify_working_baseline::{Baseline, check_working_baseline};
+    match check_working_baseline(game_dir.as_ref().as_std_path(), file_name, false) {
+        Baseline::Restore { .. } | Baseline::Missing => {}
+        Baseline::Retake(why) | Baseline::Refuse(why) => {
+            warn!(
+                stem = file_name,
+                reason = %why,
+                "The working asset backups were not restored over the game files",
+            );
+            return false;
+        }
+    }
+    restore_checked(game_dir, file_name)
+}
+
+/// Kiln layer: `restore` without the check, for a caller that has just made it.
+pub fn restore_checked(game_dir: impl AsRef<Path>, file_name: &str) -> bool {
     let kfc_path = game_dir.as_ref().join(format!("{file_name}.kfc"));
     if crate::startup::manage_asset_baseline::restore_backup(&kfc_path).is_err() {
         return false;
@@ -268,4 +287,22 @@ pub fn restore(game_dir: impl AsRef<Path>, file_name: &str) -> bool {
 
 pub fn backup_companion_file(path: impl AsRef<std::path::Path>) -> bool {
     crate::startup::manage_asset_baseline::create_companion_backup(path).is_ok()
+}
+
+/// Kiln layer: a new working baseline from the game files, both backups at once (a companion backup that is
+/// there without its header backup is replaced too: it belongs to no pair), and its record.
+pub fn capture_working_baseline(game_dir: impl AsRef<std::path::Path>, file_name: &str) -> Result<(), String> {
+    let game = game_dir.as_ref();
+    for extension in ["kfc", "kfc_resources"] {
+        let source = game.join(format!("{file_name}.{extension}"));
+        let backup = game.join(format!("{file_name}.{extension}.bak"));
+        copy_complete(&source, &backup)
+            .map_err(|error| format!("could not copy {} to {}: {error}", source.display(), backup.display()))?;
+    }
+    shroudforge_game_assets::baseline_record::record(game, file_name)
+}
+
+/// Kiln layer: records the working baseline as it is now (a whole pair that had no record).
+pub fn record_working_baseline(game_dir: impl AsRef<std::path::Path>, file_name: &str) -> Result<(), String> {
+    shroudforge_game_assets::baseline_record::record(game_dir.as_ref(), file_name)
 }

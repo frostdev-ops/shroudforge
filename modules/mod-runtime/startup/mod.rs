@@ -9,3 +9,5 @@ pub(crate) mod manage_asset_baseline;
 pub(crate) mod name_failing_mod;
 pub(crate) mod open_game_assets;
 pub(crate) mod run_startup_mods;
+// Kiln layer
+pub(crate) mod verify_working_baseline;
