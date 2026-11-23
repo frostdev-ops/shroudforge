@@ -173,9 +173,12 @@ loader's panic branch in `embedded.rs`) logs one error line, which the record of
 `ShroudForge stopped preparing mod assets because of an internal error while running Forged and Found` (the name a
 player sees, the id when it is blank, on one line, at most 80 characters; without "while running" for a panic outside
 a package), and the panic's message on an info line of its own for a bug report (`Internal error detail, for a bug
-report: ...`, one line). A panic is ShroudForge's own failure, so the pass is not run again without the package; the
-recovery (saved baseline, the game starts without the pass) is upstream's. Tests (host): `name_failing_mod`,
-`report_startup_panic`, `kiln_retry_tests::a_panic_in_the_pass_leaves_one_readable_reason_and_the_saved_baseline`.
+report: ...`, one line, each absolute path in it cut to its last two components, `state/extra.rs:287` or
+`Enshrouded\enshrouded.kfc`, so neither the build machine's folders nor a player's reach a log a player shares). A
+panic is ShroudForge's own failure, so the pass is not run again without the package; the recovery (saved baseline, the
+game starts without the pass) is upstream's. Tests (host): `name_failing_mod`, `report_startup_panic` (the paths:
+Windows, Wine, verbatim, Unix, quoted, with spaces, two in one message), and
+`kiln_retry_tests::a_panic_in_the_pass_leaves_one_readable_reason_and_the_saved_baseline`.
 
 ## One failing startup mod no longer costs the others (dev.29.18)
 
