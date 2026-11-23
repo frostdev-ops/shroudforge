@@ -81,3 +81,59 @@ impl fmt::Debug for StoredLuaValue {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::StoredLuaValue;
+    use crate::lua::LuaValue;
+
+    /// Whether the table the global `watch` held weakly is still alive after a full collection.
+    fn watched_alive(lua: &mlua::Lua) -> bool {
+        lua.gc_collect().unwrap();
+        lua.gc_collect().unwrap();
+        lua.load("return watch[1] ~= nil").eval().unwrap()
+    }
+
+    #[test]
+    fn the_registry_entry_lives_as_long_as_its_last_holder() {
+        let lua = mlua::Lua::new();
+        let table: mlua::Table = lua
+            .load("watch = setmetatable({}, { __mode = 'v' }); local t = { 7 }; watch[1] = t; return t")
+            .eval()
+            .unwrap();
+        let stored = StoredLuaValue::new(&lua, LuaValue::Table(table)).unwrap();
+        let copy = stored.clone();
+        // the same object every time, kept by the entry alone
+        let LuaValue::Table(loaded) = stored.load().unwrap() else {
+            panic!()
+        };
+        assert_eq!(loaded.raw_get::<i64>(1).unwrap(), 7);
+        let watched: mlua::Table = lua.load("return watch[1]").eval().unwrap();
+        assert_eq!(loaded.to_pointer(), watched.to_pointer());
+        drop((loaded, watched));
+        assert!(watched_alive(&lua));
+        drop(stored);
+        assert!(watched_alive(&lua), "a clone still holds the entry");
+        drop(copy);
+        assert!(!watched_alive(&lua), "the last holder freed the entry");
+    }
+
+    #[test]
+    fn plain_values_need_no_state_and_a_closed_state_is_an_error() {
+        let lua = mlua::Lua::new();
+        let number = StoredLuaValue::new(&lua, LuaValue::Integer(5)).unwrap();
+        let text = StoredLuaValue::new(&lua, LuaValue::String(lua.create_string("kept").unwrap()))
+            .unwrap();
+        let copy = text.clone();
+        drop(lua);
+        assert!(matches!(number.load(), Ok(LuaValue::Integer(5))));
+        let error = text.load().unwrap_err().to_string();
+        assert!(
+            error.contains("the Lua state that held this value is closed"),
+            "{error}"
+        );
+        // dropping after the state closed touches nothing of it
+        drop(text);
+        drop(copy);
+    }
+}
