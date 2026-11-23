@@ -141,6 +141,42 @@ parsed manifest already had `Option` fields), and every schema error names the f
 required field) read as before. `authors`, `capabilities` and `dependencies` stay non-null: EML refuses null there as
 well. Tests (Wine): `kiln_manifest_tests` (2, red before), through `ModRegistry::load`.
 
+## Large asset walks keep their Lua values in Lua's registry (dev.30.7)
+
+Every `mlua::Value` that holds a Lua object (a string, table, function or userdata) pins one slot of mlua's auxiliary
+stack while it lives, and that stack has about a million slots; past them mlua panics with "cannot create a Lua
+reference, out of auxiliary stack space". The values of an asset tree kept one such value for every child a mod
+visited (the caches of the game's structs, arrays and variants), a value a mod made one per field and element, and a
+resource one for its `data`, so a startup mod that walked a large asset (Forged and Found 0.16.1 on a player's Steam
+Deck) ran the whole pass into that panic, and the game started without its asset mods. A walk over 350,000 plain
+recipe records, with no mod code, reproduces the exact count (`used 1000194 slots`). Upstream 1.8.1 has the same code.
+
+`StoredLuaValue` (`modules/mod-runtime/lua/stored_lua_value.rs`) keeps such a value in Lua's registry, which has no
+such limit, and loads it as a short-lived `mlua::Value` for each operation: the same Lua object every time, so identity
+(`rawequal`) and edits made through it hold. nil, booleans and numbers stay plain. The entry is freed when its last
+holder drops while the state lives, so a released tree is collected as before; copies share strings and clone userdata
+as `try_clone_lua_value` does. Not changed: the type metadata `game.types` hands out (`session/mod.rs` `types`, the
+caches of `bindings/game/types.rs`) still holds mlua values, bounded by the game's type table rather than by any data.
+
+Tests (host): `lua::resource_values::tests`: a walk over 350,000 game recipes and a mod-made copy of as many (red before
+with the player's panic), the references a walk holds (red before: 3002 for 1,000 recipes, 150002 for 50,000; now
+under 64 whatever the size, and the registry back to its count once the tree is released), identity, edits, copies,
+removal.
+
+## A panic in the startup pass: one plain line (dev.30.7)
+
+The startup pass logged a Rust panic as "Rust panic during startup asset preparation: " and the panic's message, which
+named no mod, meant nothing to a player and could run over several lines. `LuaModRunner::run` now runs each package's
+entrypoint under `PregameModPanic::name_package` (`modules/mod-runtime/startup/name_failing_mod.rs`): a panic there
+unwinds on with the package's name. `report_startup_panic` (`modules/entrypoints/loader/asset_preparation/`, the
+loader's panic branch in `embedded.rs`) logs one error line, which the record of the pass keeps as its `error`:
+`ShroudForge stopped preparing mod assets because of an internal error while running Forged and Found` (the name a
+player sees, the id when it is blank, on one line, at most 80 characters; without "while running" for a panic outside
+a package), and the panic's message on an info line of its own for a bug report (`Internal error detail, for a bug
+report: ...`, one line). A panic is ShroudForge's own failure, so the pass is not run again without the package; the
+recovery (saved baseline, the game starts without the pass) is upstream's. Tests (host): `name_failing_mod`,
+`report_startup_panic`, `kiln_retry_tests::a_panic_in_the_pass_leaves_one_readable_reason_and_the_saved_baseline`.
+
 ## One failing startup mod no longer costs the others (dev.29.18)
 
 ShroudForge writes the packages that need the game data changed (a `patch` part, or `export` without a runtime part)
