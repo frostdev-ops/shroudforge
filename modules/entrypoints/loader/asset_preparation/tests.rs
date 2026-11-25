@@ -66,6 +66,9 @@ fn runtime_exports_do_not_restore_prepared_assets_during_startup() {
     assert!(!export_pass_needed(&root, "enshrouded").unwrap());
     // Kiln layer: without the record of the pass the files are not known to be prepared.
     assert!(!already_applied(&root, "enshrouded", false).unwrap());
+    // Kiln layer: what the pass used in the export folder
+    let touches = shroudforge_game_assets::prepared_stamp::ExportTouches::default();
+    touches.path("map.json");
     let record = |exporters: Option<&std::path::Path>| {
         shroudforge_game_assets::prepared_stamp::record(
             &root,
@@ -75,6 +78,7 @@ fn runtime_exports_do_not_restore_prepared_assets_during_startup() {
                 exports_enabled: true,
                 exporters,
             },
+            &touches,
         )
         .unwrap()
     };

@@ -51,6 +51,9 @@ pub(super) fn run_inner(
     // once more without it (retry_without_failed_mod.rs); `failed` is the package a failure is pinned on.
     let server = file_name == "enshrouded_server";
     let failed = std::cell::RefCell::new(None);
+    // Kiln layer: what the pass's mods use in the export folder, for the record of the pass. A retry adds to the
+    // same note: what the failed attempt used is kept, which can only make the next start apply more often.
+    let export_touches = shroudforge_game_assets::prepared_stamp::ExportTouches::default();
     let apply = |environment: &shroudforge_package::ModEnvironment| -> Result<Vec<serde_json::Value>, LoaderError> {
         failed.replace(None);
         shroudforge_game_assets::transaction::recover(game_directory, file_name)
@@ -120,6 +123,7 @@ pub(super) fn run_inner(
                         patch: true,
                         export: export_enabled,
                         export_dir: None,
+                        export_touches: Some(export_touches.clone()),
                         phase: shroudforge_api::RuntimePhase::Pregame,
                         ..Default::default()
                     },
@@ -142,6 +146,7 @@ pub(super) fn run_inner(
                         patch: true,
                         export: export_enabled,
                         export_dir: None,
+                        export_touches: Some(export_touches.clone()),
                         ..Default::default()
                     },
                 },
@@ -213,6 +218,7 @@ pub(super) fn run_inner(
             exports_enabled: export_enabled,
             exporters: pregame_exporters.then_some(exports.as_path()),
         },
+        &export_touches,
     ) {
         tracing::warn!(target: "shroudforge::startup", target = file_name, %error,
             "Could not record the asset pass; the next start applies the asset mods again");

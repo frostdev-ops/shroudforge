@@ -19,25 +19,42 @@
 //! - `<stem>.kfc` (size, time, SHA-256 of all of it: about 9 MB) and `<stem>.kfc_resources` (size,
 //!   time, SHA-256 of its first and last MiB: about 200 MB is too much to read every start),
 //! - both working backups (size and time),
-//! - when the pass ran pregame exporters: every entry of the export folder (path, kind, size,
-//!   time), because an exporter may read, list or delete what is there.
+//! - when the pass ran pregame exporters: what those exporters used in the export folder, and
+//!   nothing else there (scheme 2, 0.2.0-dev.31.12). The pass notes every path it wrote, read,
+//!   looked for, renamed, copied or deleted through the export API, and every folder it listed
+//!   (`ExportTouches`); the record keeps each one's state: a file's size and SHA-256 (of its first
+//!   and last MiB plus its time when it is over 16 MiB), a folder, nothing there, or a listed
+//!   folder's names. Pregame exporters are not scoped to a folder of their own: they write flat
+//!   files at the top of the export folder (XHL Area Harvest, Auto Loot Plus) as well as folders
+//!   (Unified EML Tweaks), and runtime mods write next to them while the game runs (Unified Tweaks
+//!   Live, World Editor, native DLLs, diagnostics). Scheme 1 listed the whole export folder, so any
+//!   such runtime write ran the whole pass again at the next start (an 11-minute start with the
+//!   Beastmaster packs, player report 2026-11-25).
 //!
 //! Anything that cannot be read, a record of another scheme, or any difference means "apply".
 
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
+    collections::BTreeSet,
     fs,
     io::{Read, Seek, SeekFrom},
     path::{Path, PathBuf},
+    sync::{Arc, Mutex},
     time::UNIX_EPOCH,
 };
 
-const SCHEME: &str = "kiln-sf-prepared 1";
+const SCHEME: &str = "kiln-sf-prepared 2";
+/// Schemes whose `files.kfc` is that of this one: `left_live_header` still reads them.
+const LIVE_HEADER_SCHEMES: [&str; 2] = [SCHEME, "kiln-sf-prepared 1"];
 /// The part of `<stem>.kfc_resources` hashed at each end.
 const EDGE: u64 = 1 << 20;
-/// An export folder with more entries than this is not listed: the pass runs as before.
+/// A pass that used more paths of the export folder than this is not recorded: the next start
+/// runs the pass as before.
 const MAX_EXPORT_ENTRIES: usize = 50_000;
+/// An export file larger than this is known by its size, time and the SHA-256 of its first and
+/// last `EDGE` bytes instead of all of it.
+const WHOLE_EXPORT_HASH: u64 = 16 << 20;
 
 /// What the pass ran with, besides the game files.
 pub struct PassInputs<'a> {
@@ -45,8 +62,70 @@ pub struct PassInputs<'a> {
     pub fingerprint: &'a str,
     /// loader config `exports.enabled` at the pass.
     pub exports_enabled: bool,
-    /// The export folder, when the pass ran a pregame package with the `export` capability.
+    /// The export folder, when the pass ran a pregame package with the `export` capability. Only
+    /// what the pass used there (`ExportTouches`) is recorded and compared.
     pub exporters: Option<&'a Path>,
+}
+
+/// How the pass used a path below the export folder.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Touch {
+    /// A file the pass wrote, read, looked for, renamed, copied or deleted.
+    Path,
+    /// A folder the pass listed.
+    Listing,
+}
+
+/// What the startup pass did in the export folder through ShroudForge's export API (`io.export`,
+/// `io.export_exists`, `io.read_export_to_string`, `io.export_list`, `io.export_rename`,
+/// `io.export_copy`, `io.export_delete`): the paths relative to the export folder, `/` between
+/// their parts. The loader hands one to the pass (`RunOptions::export_touches`) and records it.
+#[derive(Clone, Debug, Default)]
+pub struct ExportTouches(Arc<Mutex<BTreeSet<(Touch, String)>>>);
+
+impl ExportTouches {
+    /// A path the pass wrote, read, looked for, renamed, copied or deleted.
+    pub fn path(&self, relative: &str) {
+        self.add(Touch::Path, relative);
+    }
+
+    /// A folder the pass listed (`""` is the export folder itself).
+    pub fn listing(&self, relative: &str) {
+        self.add(Touch::Listing, relative);
+    }
+
+    fn add(&self, touch: Touch, relative: &str) {
+        let Some(relative) = normalized(relative) else {
+            return;
+        };
+        let mut touched = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        touched.insert((touch, relative));
+    }
+
+    /// Everything noted so far.
+    pub fn touched(&self) -> BTreeSet<(Touch, String)> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+}
+
+/// A relative path's parts joined with `/`; None for a path that leaves the export folder.
+fn normalized(relative: &str) -> Option<String> {
+    let mut parts = Vec::new();
+    for part in relative.split(['/', '\\']) {
+        match part {
+            "" | "." => {}
+            ".." => return None,
+            part if part.contains(':') => return None,
+            part => parts.push(part),
+        }
+    }
+    Some(parts.join("/"))
 }
 
 /// `<game>/<stem>.kfc.prepared.json`, beside `<stem>.kfc.bak`.
@@ -67,10 +146,22 @@ pub fn forget(root: &Path, file_name: &str) -> Result<(), String> {
     }
 }
 
-/// Writes the record of the files as they are now (after a successful pass). Flushed and renamed
-/// like the state file.
-pub fn record(root: &Path, file_name: &str, inputs: &PassInputs) -> Result<(), String> {
-    let stamp = capture(root, file_name, inputs)?;
+/// Writes the record of the files as they are now (after a successful pass), with what the pass
+/// used in the export folder (`touches`, read only when `inputs.exporters` is set). Flushed and
+/// renamed like the state file.
+pub fn record(
+    root: &Path,
+    file_name: &str,
+    inputs: &PassInputs,
+    touches: &ExportTouches,
+) -> Result<(), String> {
+    let touched = touches.touched();
+    if touched.len() > MAX_EXPORT_ENTRIES {
+        return Err(format!(
+            "the pass used more than {MAX_EXPORT_ENTRIES} paths of the export folder"
+        ));
+    }
+    let stamp = capture(root, file_name, inputs, &touched)?;
     crate::config::write_json(&record_path(root, file_name), &stamp)
 }
 
@@ -80,12 +171,18 @@ pub fn record(root: &Path, file_name: &str, inputs: &PassInputs) -> Result<(), S
 pub fn current(root: &Path, file_name: &str, inputs: &PassInputs) -> Result<(), String> {
     let path = record_path(root, file_name);
     let bytes = fs::read(&path).map_err(|error| format!("{}: {error}", path.display()))?;
-    let recorded: Value = serde_json::from_slice(&bytes)
-        .map_err(|error| format!("{}: {error}", path.display()))?;
+    let recorded: Value =
+        serde_json::from_slice(&bytes).map_err(|error| format!("{}: {error}", path.display()))?;
     if recorded["scheme"] != SCHEME {
         return Err("the record is of another scheme".into());
     }
-    let now = capture(root, file_name, inputs)?;
+    // the paths the last pass used in the export folder, to be looked at again
+    let touched = match (&inputs.exporters, recorded_touches(&recorded["exports"])) {
+        (None, _) => BTreeSet::new(),
+        (Some(_), Some(touched)) => touched,
+        (Some(_), None) => return Err("exports differs from the last pass".into()),
+    };
+    let now = capture(root, file_name, inputs, &touched)?;
     for key in [
         "scheme",
         "target",
@@ -112,7 +209,11 @@ pub fn left_live_header(root: &Path, file_name: &str) -> bool {
     let Ok(recorded) = serde_json::from_slice::<Value>(&bytes) else {
         return false;
     };
-    if recorded["scheme"] != SCHEME || recorded["target"] != file_name {
+    if !LIVE_HEADER_SCHEMES
+        .iter()
+        .any(|scheme| recorded["scheme"] == *scheme)
+        || recorded["target"] != file_name
+    {
         return false;
     }
     let Ok(live) = with_hash(&root.join(format!("{file_name}.kfc")), None) else {
@@ -122,7 +223,12 @@ pub fn left_live_header(root: &Path, file_name: &str) -> bool {
     then["size"] == live["size"] && then["sha256"].is_string() && then["sha256"] == live["sha256"]
 }
 
-fn capture(root: &Path, file_name: &str, inputs: &PassInputs) -> Result<Value, String> {
+fn capture(
+    root: &Path,
+    file_name: &str,
+    inputs: &PassInputs,
+    touched: &BTreeSet<(Touch, String)>,
+) -> Result<Value, String> {
     let file = |suffix: &str| root.join(format!("{file_name}.{suffix}"));
     Ok(json!({
         "scheme": SCHEME,
@@ -137,7 +243,7 @@ fn capture(root: &Path, file_name: &str, inputs: &PassInputs) -> Result<Value, S
             "kfcResourcesBackup": identity(&file("kfc_resources.bak"))?,
         },
         "exports": match inputs.exporters {
-            Some(dir) => Value::from(export_entries(dir)?),
+            Some(dir) => json!({"touched": export_state(dir, touched)?}),
             None => Value::Null,
         },
     }))
@@ -177,7 +283,9 @@ pub(crate) fn with_hash(path: &Path, edge: Option<u64>) -> Result<Value, String>
     let mut take = |file: &mut fs::File, mut left: u64| -> Result<(), String> {
         let mut buffer = vec![0u8; 1 << 16];
         while left > 0 {
-            let want = buffer.len().min(usize::try_from(left).unwrap_or(usize::MAX));
+            let want = buffer
+                .len()
+                .min(usize::try_from(left).unwrap_or(usize::MAX));
             let count = file
                 .read(&mut buffer[..want])
                 .map_err(|error| format!("{}: {error}", path.display()))?;
@@ -211,50 +319,86 @@ pub(crate) fn with_hash(path: &Path, edge: Option<u64>) -> Result<Value, String>
     }))
 }
 
-/// Every entry below the export folder, sorted: [path, kind, size, last-write time]. A missing
-/// folder is an empty list. Links are listed, not followed.
-fn export_entries(dir: &Path) -> Result<Vec<Value>, String> {
-    let mut entries = Vec::new();
-    match fs::symlink_metadata(dir) {
-        Ok(metadata) if metadata.is_dir() => {}
-        Ok(_) => return Err(format!("{} is not a folder", dir.display())),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(entries),
-        Err(error) => return Err(format!("{}: {error}", dir.display())),
+/// The (kind, path) pairs of a record's `exports.touched`; None when it has none (a record of a
+/// pass without pregame exporters) or it is not that shape.
+fn recorded_touches(exports: &Value) -> Option<BTreeSet<(Touch, String)>> {
+    let mut touched = BTreeSet::new();
+    for entry in exports.get("touched")?.as_array()? {
+        let touch = match entry.get(0)?.as_str()? {
+            "path" => Touch::Path,
+            "listing" => Touch::Listing,
+            _ => return None,
+        };
+        touched.insert((touch, normalized(entry.get(1)?.as_str()?)?));
     }
-    let mut pending = vec![dir.to_path_buf()];
-    while let Some(folder) = pending.pop() {
-        for entry in fs::read_dir(&folder).map_err(|error| format!("{}: {error}", folder.display()))? {
-            let entry = entry.map_err(|error| format!("{}: {error}", folder.display()))?;
-            let path = entry.path();
-            let metadata = fs::symlink_metadata(&path)
-                .map_err(|error| format!("{}: {error}", path.display()))?;
-            let relative = path
-                .strip_prefix(dir)
-                .map_err(|error| error.to_string())?
-                .components()
-                .map(|part| part.as_os_str().to_string_lossy())
-                .collect::<Vec<_>>()
-                .join("/");
-            let kind = if metadata.is_dir() {
-                pending.push(path.clone());
-                "folder"
-            } else if metadata.is_file() {
-                "file"
+    Some(touched)
+}
+
+/// For each path the pass used, sorted: [kind, path, state now].
+fn export_state(dir: &Path, touched: &BTreeSet<(Touch, String)>) -> Result<Vec<Value>, String> {
+    touched
+        .iter()
+        .map(|(touch, relative)| {
+            let path = relative
+                .split('/')
+                .filter(|part| !part.is_empty())
+                .fold(dir.to_path_buf(), |path, part| path.join(part));
+            Ok(match touch {
+                Touch::Path => json!(["path", relative, path_state(&path)?]),
+                Touch::Listing => json!(["listing", relative, listing_state(&path)?]),
+            })
+        })
+        .collect()
+}
+
+/// A file's size and SHA-256 (no time: a runtime mod or the pass writing the same bytes again is no
+/// change), `"folder"`, `"other"` (a link: not followed), or null when nothing is there.
+fn path_state(path: &Path) -> Result<Value, String> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_file() => {
+            let large = metadata.len() > WHOLE_EXPORT_HASH;
+            let hashed = with_hash(path, large.then_some(EDGE))?;
+            Ok(if large {
+                hashed
             } else {
-                "other"
-            };
-            let size = if metadata.is_file() { metadata.len() } else { 0 };
-            entries.push(json!([relative, kind, size, modified_nanos(&metadata)?]));
-            if entries.len() > MAX_EXPORT_ENTRIES {
-                return Err(format!(
-                    "{} has more than {MAX_EXPORT_ENTRIES} entries",
-                    dir.display()
-                ));
-            }
+                json!({"size": hashed["size"], "sha256": hashed["sha256"]})
+            })
+        }
+        Ok(metadata) if metadata.is_dir() => Ok(Value::from("folder")),
+        Ok(_) => Ok(Value::from("other")),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Value::Null),
+        Err(error) => Err(format!("{}: {error}", path.display())),
+    }
+}
+
+/// The sorted names of a listed folder's entries, with their kind; null when it is not there, and
+/// `"not a folder"` when something else is.
+fn listing_state(path: &Path) -> Result<Value, String> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() => {}
+        Ok(_) => return Ok(Value::from("not a folder")),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Value::Null),
+        Err(error) => return Err(format!("{}: {error}", path.display())),
+    }
+    let mut names = Vec::new();
+    for entry in fs::read_dir(path).map_err(|error| format!("{}: {error}", path.display()))? {
+        let entry = entry.map_err(|error| format!("{}: {error}", path.display()))?;
+        let kind = match entry.file_type() {
+            Ok(kind) if kind.is_dir() => "folder",
+            Ok(kind) if kind.is_file() => "file",
+            Ok(_) => "other",
+            Err(error) => return Err(format!("{}: {error}", entry.path().display())),
+        };
+        names.push(json!([entry.file_name().to_string_lossy(), kind]));
+        if names.len() > MAX_EXPORT_ENTRIES {
+            return Err(format!(
+                "{} has more than {MAX_EXPORT_ENTRIES} entries",
+                path.display()
+            ));
         }
     }
-    entries.sort_by(|a, b| a[0].as_str().cmp(&b[0].as_str()));
-    Ok(entries)
+    names.sort_by(|a, b| a[0].as_str().cmp(&b[0].as_str()));
+    Ok(Value::from(names))
 }
 
 /// Steam's build id of the installation (`buildid` in `steamapps/appmanifest_<app>.acf`), or null
@@ -299,6 +443,10 @@ mod tests {
         }
     }
 
+    /// A game folder after a pass, with the export folder of a player's report (2026-11-25): pregame
+    /// exporters wrote flat files at the export folder's top (XHL Area Harvest, Auto Loot Plus) and a
+    /// folder of their own (Unified EML Tweaks: `unified-tweaks/`); runtime mods write beside them
+    /// while the game runs (Unified Tweaks Live: `unified-tweaks-live/`, World Editor, a native DLL).
     fn game() -> Game {
         let base = std::env::temp_dir().join(format!("sf-prepared-{}", uuid::Uuid::new_v4()));
         let root = base.join("steamapps/common/Enshrouded");
@@ -309,17 +457,55 @@ mod tests {
         )
         .unwrap();
         fs::write(root.join("enshrouded.kfc"), b"patched header").unwrap();
-        fs::write(root.join("enshrouded.kfc_resources"), vec![7u8; 3 * EDGE as usize]).unwrap();
+        fs::write(
+            root.join("enshrouded.kfc_resources"),
+            vec![7u8; 3 * EDGE as usize],
+        )
+        .unwrap();
         fs::write(root.join("enshrouded.kfc.bak"), b"original header").unwrap();
-        fs::write(root.join("enshrouded.kfc_resources.bak"), b"original resources").unwrap();
+        fs::write(
+            root.join("enshrouded.kfc_resources.bak"),
+            b"original resources",
+        )
+        .unwrap();
         let exports = root.join("shroudforge/exports");
-        fs::create_dir_all(exports.join("holster")).unwrap();
-        fs::write(exports.join("holster/map.json"), b"{}").unwrap();
+        fs::create_dir_all(exports.join("unified-tweaks")).unwrap();
+        fs::create_dir_all(exports.join("unified-tweaks-live")).unwrap();
+        fs::write(
+            exports.join("xhl-area-harvest-family-manifest.tsv"),
+            b"family\trows",
+        )
+        .unwrap();
+        fs::write(
+            exports.join("auto-loot-plus-report.txt"),
+            b"boss:field\tlabel",
+        )
+        .unwrap();
+        fs::write(exports.join("unified-tweaks/ut-reference.txt"), b"UTREF 1").unwrap();
+        fs::write(
+            exports.join("unified-tweaks/user-settings.json"),
+            b"{\"a\":1}",
+        )
+        .unwrap();
+        fs::write(exports.join("unified-tweaks-live/level-limit.txt"), b"25").unwrap();
         Game {
             _temp: TempDir(base),
             root,
             exports,
         }
+    }
+
+    /// What the pregame exporters did in that pass: wrote three files, read one, looked for one that
+    /// was not there, listed their own folder.
+    fn pass_touches() -> ExportTouches {
+        let touches = ExportTouches::default();
+        touches.path("xhl-area-harvest-family-manifest.tsv");
+        touches.path("auto-loot-plus-report.txt");
+        touches.path("unified-tweaks/ut-reference.txt");
+        touches.path("unified-tweaks/user-settings.json");
+        touches.path("unified-tweaks/settings-last-launch.json");
+        touches.listing("unified-tweaks");
+        touches
     }
 
     fn inputs<'a>(fingerprint: &'a str, exporters: Option<&'a Path>) -> PassInputs<'a> {
@@ -328,6 +514,10 @@ mod tests {
             exports_enabled: true,
             exporters,
         }
+    }
+
+    fn none() -> ExportTouches {
+        ExportTouches::default()
     }
 
     /// Rewrites a file with the same length and puts its last-write time back: only the hash can
@@ -344,7 +534,8 @@ mod tests {
     }
 
     fn later(path: &Path) {
-        let time = fs::metadata(path).unwrap().modified().unwrap() + std::time::Duration::from_secs(5);
+        let time =
+            fs::metadata(path).unwrap().modified().unwrap() + std::time::Duration::from_secs(5);
         fs::File::options()
             .write(true)
             .open(path)
@@ -353,36 +544,208 @@ mod tests {
             .unwrap();
     }
 
+    /// What runtime mods write into the export folder while the game runs, none of it through the
+    /// pregame pass: new flat files at the top, files in their own folders (new and existing), a
+    /// native DLL's folder, World Editor's state, diagnostics.
+    fn play_a_session(g: &Game, session: u32) {
+        let e = &g.exports;
+        fs::write(
+            e.join("unified-tweaks-live/level-limit.txt"),
+            format!("{}", 25 + session),
+        )
+        .unwrap();
+        fs::write(
+            e.join("unified-tweaks-live/enemy-scale.txt"),
+            format!("scale {session}"),
+        )
+        .unwrap();
+        fs::create_dir_all(e.join("weapon_holster")).unwrap();
+        fs::write(
+            e.join("weapon_holster/start.txt"),
+            format!("start {session}"),
+        )
+        .unwrap();
+        fs::create_dir_all(e.join("world-editor/blueprints")).unwrap();
+        fs::write(
+            e.join("world-editor/editor-state.txt"),
+            format!("state {session}"),
+        )
+        .unwrap();
+        fs::write(e.join(format!("runtime-counter-{session}.txt")), b"x").unwrap();
+        fs::create_dir_all(e.join("diagnostics")).unwrap();
+        fs::write(e.join("diagnostics/capture.runtime"), format!("{session}")).unwrap();
+    }
+
     #[test]
     fn an_unchanged_game_folder_matches_the_record() {
         let g = game();
         let exports = g.exports.clone();
-        record(&g.root, "enshrouded", &inputs("f1", Some(&exports))).unwrap();
-        assert_eq!(current(&g.root, "enshrouded", &inputs("f1", Some(&exports))), Ok(()));
+        record(
+            &g.root,
+            "enshrouded",
+            &inputs("f1", Some(&exports)),
+            &pass_touches(),
+        )
+        .unwrap();
+        assert_eq!(
+            current(&g.root, "enshrouded", &inputs("f1", Some(&exports))),
+            Ok(())
+        );
         let recorded: Value =
             serde_json::from_slice(&fs::read(record_path(&g.root, "enshrouded")).unwrap()).unwrap();
         assert_eq!(recorded["build"], "26430625");
+        assert_eq!(recorded["scheme"], SCHEME);
     }
 
     #[test]
     fn no_record_or_a_forgotten_record_means_apply() {
         let g = game();
         assert!(current(&g.root, "enshrouded", &inputs("f1", None)).is_err());
-        record(&g.root, "enshrouded", &inputs("f1", None)).unwrap();
+        record(&g.root, "enshrouded", &inputs("f1", None), &none()).unwrap();
         forget(&g.root, "enshrouded").unwrap();
         assert!(current(&g.root, "enshrouded", &inputs("f1", None)).is_err());
         forget(&g.root, "enshrouded").unwrap();
     }
 
+    /// The player's case: runtime mods' writes into the export folder are no reason for a pass.
+    #[test]
+    fn runtime_writes_under_exports_by_other_mods_do_not_count() {
+        let g = game();
+        let exports = g.exports.clone();
+        record(
+            &g.root,
+            "enshrouded",
+            &inputs("f1", Some(&exports)),
+            &pass_touches(),
+        )
+        .unwrap();
+        play_a_session(&g, 1);
+        // a runtime mod's folder that was there at the pass, its file touched again
+        later(&g.exports.join("unified-tweaks-live/level-limit.txt"));
+        assert_eq!(
+            current(&g.root, "enshrouded", &inputs("f1", Some(&exports))),
+            Ok(()),
+            "runtime writes outside what the pregame pass used"
+        );
+    }
+
+    /// Each start checks the record and, when it holds, leaves it as it is; sessions in between write
+    /// into the export folder. Three starts, one pass.
+    #[test]
+    fn the_record_stays_current_across_starts_with_sessions_between() {
+        let g = game();
+        let exports = g.exports.clone();
+        record(
+            &g.root,
+            "enshrouded",
+            &inputs("f1", Some(&exports)),
+            &pass_touches(),
+        )
+        .unwrap();
+        let written = fs::read(record_path(&g.root, "enshrouded")).unwrap();
+        for session in 1..=3 {
+            play_a_session(&g, session);
+            assert_eq!(
+                current(&g.root, "enshrouded", &inputs("f1", Some(&exports))),
+                Ok(()),
+                "start {} after session {session}",
+                session + 1
+            );
+            assert!(
+                fs::read(record_path(&g.root, "enshrouded")).unwrap() == written,
+                "a check never rewrites the record"
+            );
+        }
+    }
+
+    /// What the pregame exporters wrote, read or looked for, changed or deleted, means a pass.
+    #[test]
+    fn an_exporters_own_output_changed_or_deleted_counts() {
+        type Change = fn(&Game);
+        let changes: [(&str, Change); 9] = [
+            ("a flat output rewritten", |g| {
+                fs::write(
+                    g.exports.join("xhl-area-harvest-family-manifest.tsv"),
+                    b"other rows",
+                )
+                .unwrap()
+            }),
+            ("a flat output deleted", |g| {
+                fs::remove_file(g.exports.join("auto-loot-plus-report.txt")).unwrap()
+            }),
+            ("an output rewritten with the same length and time", |g| {
+                rewrite_keeping_time(
+                    &g.exports.join("unified-tweaks/ut-reference.txt"),
+                    b"UTREF 2",
+                )
+            }),
+            ("an output in the exporter's folder deleted", |g| {
+                fs::remove_file(g.exports.join("unified-tweaks/ut-reference.txt")).unwrap()
+            }),
+            ("a file the pass read changed", |g| {
+                fs::write(
+                    g.exports.join("unified-tweaks/user-settings.json"),
+                    b"{\"a\":2}",
+                )
+                .unwrap()
+            }),
+            (
+                "a file the pass looked for and did not find appeared",
+                |g| {
+                    fs::write(
+                        g.exports.join("unified-tweaks/settings-last-launch.json"),
+                        b"{}",
+                    )
+                    .unwrap()
+                },
+            ),
+            ("a file added to a folder the pass listed", |g| {
+                fs::write(g.exports.join("unified-tweaks/new.txt"), b"x").unwrap()
+            }),
+            ("an output replaced by a folder", |g| {
+                fs::remove_file(g.exports.join("auto-loot-plus-report.txt")).unwrap();
+                fs::create_dir(g.exports.join("auto-loot-plus-report.txt")).unwrap()
+            }),
+            ("the whole export folder deleted", |g| {
+                fs::remove_dir_all(&g.exports).unwrap()
+            }),
+        ];
+        for (what, change) in changes {
+            let g = game();
+            let exports = g.exports.clone();
+            record(
+                &g.root,
+                "enshrouded",
+                &inputs("f1", Some(&exports)),
+                &pass_touches(),
+            )
+            .unwrap();
+            play_a_session(&g, 1);
+            assert_eq!(
+                current(&g.root, "enshrouded", &inputs("f1", Some(&exports))),
+                Ok(())
+            );
+            change(&g);
+            let result = current(&g.root, "enshrouded", &inputs("f1", Some(&exports)));
+            assert_eq!(
+                result,
+                Err("exports differs from the last pass".to_owned()),
+                "{what}: must apply again"
+            );
+        }
+    }
+
     #[test]
     fn any_change_means_apply() {
         type Change = fn(&Game);
-        let changes: [(&str, Change); 12] = [
+        let changes: [(&str, Change); 9] = [
             ("kfc rewritten, same length and time", |g| {
                 rewrite_keeping_time(&g.root.join("enshrouded.kfc"), b"vanilla header")
             }),
             ("kfc touched", |g| later(&g.root.join("enshrouded.kfc"))),
-            ("kfc removed", |g| fs::remove_file(g.root.join("enshrouded.kfc")).unwrap()),
+            ("kfc removed", |g| {
+                fs::remove_file(g.root.join("enshrouded.kfc")).unwrap()
+            }),
             ("resources start rewritten", |g| {
                 let path = g.root.join("enshrouded.kfc_resources");
                 let mut bytes = fs::read(&path).unwrap();
@@ -400,16 +763,11 @@ mod tests {
             }),
             ("game build", |g| {
                 let manifest = g.root.join("../../appmanifest_1203620.acf");
-                let text = fs::read_to_string(&manifest).unwrap().replace("26430625", "26500000");
+                let text = fs::read_to_string(&manifest)
+                    .unwrap()
+                    .replace("26430625", "26500000");
                 fs::write(manifest, text).unwrap()
             }),
-            ("export rewritten", |g| {
-                fs::write(g.exports.join("holster/map.json"), b"{\"v\":2}").unwrap()
-            }),
-            ("export removed", |g| {
-                fs::remove_file(g.exports.join("holster/map.json")).unwrap()
-            }),
-            ("export added", |g| fs::write(g.exports.join("other.txt"), b"x").unwrap()),
             ("record of another scheme", |g| {
                 let path = record_path(&g.root, "enshrouded");
                 let mut value: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
@@ -420,7 +778,13 @@ mod tests {
         for (what, change) in changes {
             let g = game();
             let exports = g.exports.clone();
-            record(&g.root, "enshrouded", &inputs("f1", Some(&exports))).unwrap();
+            record(
+                &g.root,
+                "enshrouded",
+                &inputs("f1", Some(&exports)),
+                &pass_touches(),
+            )
+            .unwrap();
             change(&g);
             assert!(
                 current(&g.root, "enshrouded", &inputs("f1", Some(&exports))).is_err(),
@@ -429,15 +793,58 @@ mod tests {
         }
     }
 
+    /// A record of scheme 1 (it listed the whole export folder) as 0.2.0-dev.31.10 left it: the first
+    /// start of this runtime applies once, records scheme 2, and the starts after it reuse that pass
+    /// while runtime mods write into the export folder.
+    #[test]
+    fn an_older_scheme_means_one_pass_then_reuse() {
+        let g = game();
+        let exports = g.exports.clone();
+        record(
+            &g.root,
+            "enshrouded",
+            &inputs("f1", Some(&exports)),
+            &pass_touches(),
+        )
+        .unwrap();
+        let path = record_path(&g.root, "enshrouded");
+        let mut old: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        old["scheme"] = json!("kiln-sf-prepared 1");
+        old["exports"] = json!([["auto-loot-plus-report.txt", "file", 16, "1"]]);
+        fs::write(&path, old.to_string()).unwrap();
+        assert_eq!(
+            current(&g.root, "enshrouded", &inputs("f1", Some(&exports))),
+            Err("the record is of another scheme".to_owned())
+        );
+        // the scheme 1 record still proves that the live header is the last pass's output
+        assert!(left_live_header(&g.root, "enshrouded"));
+        // the pass runs and records
+        forget(&g.root, "enshrouded").unwrap();
+        record(
+            &g.root,
+            "enshrouded",
+            &inputs("f1", Some(&exports)),
+            &pass_touches(),
+        )
+        .unwrap();
+        for session in 1..=2 {
+            play_a_session(&g, session);
+            assert_eq!(
+                current(&g.root, "enshrouded", &inputs("f1", Some(&exports))),
+                Ok(())
+            );
+        }
+    }
+
     #[test]
     fn other_pass_inputs_mean_apply() {
         let g = game();
         let exports = g.exports.clone();
-        record(&g.root, "enshrouded", &inputs("f1", None)).unwrap();
+        record(&g.root, "enshrouded", &inputs("f1", None), &none()).unwrap();
         assert_eq!(current(&g.root, "enshrouded", &inputs("f1", None)), Ok(()));
         // another package plan or package file
         assert!(current(&g.root, "enshrouded", &inputs("f2", None)).is_err());
-        // a pregame exporter now (the record has no export listing)
+        // a pregame exporter now (the record has no export state)
         assert!(current(&g.root, "enshrouded", &inputs("f1", Some(&exports))).is_err());
         // exports switched off
         let off = PassInputs {
@@ -448,21 +855,66 @@ mod tests {
         assert!(current(&g.root, "enshrouded", &off).is_err());
         // the server's record is its own
         assert!(current(&g.root, "enshrouded_server", &inputs("f1", None)).is_err());
+        // no pregame exporter any more (the record has an export state)
+        record(
+            &g.root,
+            "enshrouded",
+            &inputs("f1", Some(&exports)),
+            &pass_touches(),
+        )
+        .unwrap();
+        assert!(current(&g.root, "enshrouded", &inputs("f1", None)).is_err());
     }
 
     #[test]
     fn exports_outside_a_pregame_exporter_pass_do_not_count() {
         let g = game();
-        record(&g.root, "enshrouded", &inputs("f1", None)).unwrap();
+        record(&g.root, "enshrouded", &inputs("f1", None), &none()).unwrap();
         fs::write(g.exports.join("world-editor-capture.sfbp"), b"x").unwrap();
         assert_eq!(current(&g.root, "enshrouded", &inputs("f1", None)), Ok(()));
+    }
+
+    /// An exporter that used nothing in the export folder records an empty state, which holds.
+    #[test]
+    fn an_exporter_pass_that_used_no_export_is_current() {
+        let g = game();
+        let exports = g.exports.clone();
+        record(
+            &g.root,
+            "enshrouded",
+            &inputs("f1", Some(&exports)),
+            &none(),
+        )
+        .unwrap();
+        play_a_session(&g, 1);
+        fs::remove_file(g.exports.join("auto-loot-plus-report.txt")).unwrap();
+        assert_eq!(
+            current(&g.root, "enshrouded", &inputs("f1", Some(&exports))),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn touches_keep_relative_paths_inside_the_export_folder() {
+        let touches = ExportTouches::default();
+        touches.path("./a\\b//c.txt");
+        touches.path("../outside.txt");
+        touches.path("C:/outside.txt");
+        touches.listing("");
+        assert_eq!(
+            touches.touched().into_iter().collect::<Vec<_>>(),
+            vec![
+                (Touch::Path, "a/b/c.txt".to_owned()),
+                (Touch::Listing, String::new())
+            ]
+        );
     }
 
     #[test]
     fn a_missing_steam_manifest_is_no_build_on_both_sides() {
         let g = game();
         fs::remove_file(g.root.join("../../appmanifest_1203620.acf")).unwrap();
-        record(&g.root, "enshrouded", &inputs("f1", None)).unwrap();
+        record(&g.root, "enshrouded", &inputs("f1", None), &none()).unwrap();
         assert_eq!(current(&g.root, "enshrouded", &inputs("f1", None)), Ok(()));
     }
 }

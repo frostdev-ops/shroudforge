@@ -45,3 +45,6 @@ mod kiln_retry_tests;
 // Kiln layer
 #[cfg(test)]
 mod kiln_baseline_tests;
+// Kiln layer
+#[cfg(test)]
+mod kiln_exports_reuse_tests;

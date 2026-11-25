@@ -43,6 +43,7 @@ impl AppState {
                 phase: RuntimePhase::Pregame,
                 feature_flags: AppFeatures::empty(),
                 export_dir: root_utf8.join("exports"),
+                export_touches: None,
             },
             type_registry,
             attribute_catalog: OnceCell::new(),
