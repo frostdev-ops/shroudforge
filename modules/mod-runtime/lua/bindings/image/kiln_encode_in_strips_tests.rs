@@ -69,7 +69,7 @@ fn serial(format: PixelFormat, w: usize, h: usize, src: &[u8]) -> Result<Vec<u8>
 /// The strip encode with real helper threads and no minimum strip size.
 fn split(format: PixelFormat, w: usize, h: usize, src: &[u8], threads: usize) -> Result<Vec<u8>, String> {
     outcome(
-        |dst| encode_split(format, w, h, src, dst, threads, 1, &spawn_helper),
+        |dst| encode_split(format, w, h, src, dst, threads, 1, &OsThreads),
         size_of_format(format, w, h),
     )
 }

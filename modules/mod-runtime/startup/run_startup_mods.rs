@@ -22,6 +22,17 @@ fn run_with_api(
 ) -> anyhow::Result<()> {
     debug!("Running lua with options: {:?}", args);
 
+    // Kiln layer: a pregame pass encodes block-compressed textures on several threads (the same bytes), and puts the
+    // count back when it ends. Its callers run outside the Windows loader lock (SF's bootstrap worker, Kiln's early
+    // step, the prepare command); the strip encode never waits for a helper to start in any case.
+    let _encode_threads = (args.options.phase == crate::RuntimePhase::Pregame).then(|| {
+        let threads = crate::EncodeThreads::for_pregame_pass();
+        tracing::info!(target: "shroudforge::startup", threads = crate::encode_threads(),
+            "Block-compressed textures are encoded on {} thread(s) ({} overrides)", crate::encode_threads(),
+            crate::ENCODE_THREADS_VARIABLE);
+        threads
+    });
+
     // check cache if files have changed
 
     let cache_diff = if !args.options.skip_cache {

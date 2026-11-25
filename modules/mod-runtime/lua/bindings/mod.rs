@@ -6,6 +6,8 @@ pub(crate) mod game;
 #[path = "hash_bytes.rs"]
 mod hasher;
 mod image;
+// Kiln layer: the pregame pass sets the texture encode's thread count
+pub(crate) use image::kiln_encode_in_strips;
 #[path = "integer_operations.rs"]
 mod integer;
 mod io;

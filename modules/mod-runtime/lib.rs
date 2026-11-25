@@ -152,6 +152,11 @@ pub use startup::manage_asset_baseline::{
 };
 pub use startup::verify_working_baseline::{Baseline, check_working_baseline};
 pub use startup::run_startup_mods::{run, run_with_local_schema};
+// Kiln layer: block-compressed textures of a pregame pass on several threads (lua/bindings/image/kiln_encode_in_strips.rs).
+pub use env::kiln_encode_in_strips::{
+    EncodeThreads, THREADS_VARIABLE as ENCODE_THREADS_VARIABLE, encode_threads, pregame_encode_threads,
+    textures_encoded_in_strips,
+};
 // Kiln layer: the package a failed startup pass is pinned on.
 pub use startup::name_failing_mod::{PregameModError, PregameModPanic};
 
