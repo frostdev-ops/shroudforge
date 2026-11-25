@@ -17,7 +17,11 @@
 //!   unchanged. A game update or Steam's file check writes a header of its own.
 //!
 //! When the backups are not the source of the game's files, the game's files are a game archive of their own (an
-//! update, Steam's file check): the old pair is set aside and a new one is made from them. When the game's files were
+//! update, Steam's file check): the old pair is set aside and a new one is made from them. Where Steam's manifest of
+//! the installed build is there (`game-files/check_steam_installed_files.rs`), it decides too (0.2.0-dev.31.13): game
+//! files it lists byte for byte are the ones Steam installed and are taken; game files it lists otherwise were changed
+//! since by some program and are refused, with what the player does. The recovery after a failed pass asks the same
+//! (`recover_failed_startup_assets.rs`). When the game's files were
 //! built from a pair that is not whole, or are what this runtime's last pass wrote, neither the pair nor the game's
 //! files are a clean copy: the start refuses and says to verify the game files.
 
