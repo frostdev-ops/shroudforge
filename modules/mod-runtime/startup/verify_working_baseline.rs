@@ -58,7 +58,7 @@ pub fn check_working_baseline(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             let live = KFCFile::from_path(&kfc, false).ok();
             return match live {
-                Some(live) => match replacement(&resources, &live, stem, live_is_last_output, format!("{bak_name} is missing")) {
+                Some(live) => match replacement(game, &resources, &live, stem, live_is_last_output, format!("{bak_name} is missing")) {
                     Baseline::Retake(_) => Baseline::Missing,
                     other => other,
                 },
@@ -89,7 +89,7 @@ pub fn check_working_baseline(
             ),
             _ => "it is in another archive format than the game's files".into(),
         };
-        return replacement(&resources, live.as_ref().unwrap(), stem, live_is_last_output, why);
+        return replacement(game, &resources, live.as_ref().unwrap(), stem, live_is_last_output, why);
     }
     let Some(base) = base else {
         return Baseline::Refuse(refusal(stem, &format!("{bak_name} is not a readable game archive"), "cannot be read"));
@@ -142,11 +142,14 @@ pub fn check_working_baseline(
         }
         None => "the game's files were not built from it".into(),
     };
-    replacement(&resources, &live, stem, live_is_last_output, why)
+    replacement(game, &resources, &live, stem, live_is_last_output, why)
 }
 
-/// Every path that takes a new baseline must prove the same facts, including missing/incompatible backups.
-fn replacement(resources: &Path, live: &KFCFile, stem: &str, live_is_last_output: bool, why: String) -> Baseline {
+/// Every path that takes a new baseline must prove the same facts, including missing/incompatible backups: the game's
+/// files are a whole archive that no pass of this runtime wrote, and, where Steam's manifest of the installed build is
+/// there to say so, the very files Steam installed (`steam_files.rs`). Files that Steam's manifest does not list as
+/// they are were changed by some program since Steam wrote them, and are never a clean copy.
+fn replacement(game: &Path, resources: &Path, live: &KFCFile, stem: &str, live_is_last_output: bool, why: String) -> Baseline {
     if live_is_last_output {
         return Baseline::Refuse(refusal(stem, &why, "are what ShroudForge's last start prepared"));
     }
@@ -162,7 +165,21 @@ fn replacement(resources: &Path, live: &KFCFile, stem: &str, live_is_last_output
             live_length
         ));
     }
-    Baseline::Retake(why)
+    use shroudforge_game_assets::steam_files::{Installed, installed_files};
+    match installed_files(game, stem) {
+        Installed::Same { build } => Baseline::Retake(format!(
+            "{why} (Steam's manifest of {} lists the game's files as they are: they are the ones Steam installed)",
+            Installed::build_words(&build)
+        )),
+        Installed::Differs { build, what } => Baseline::Refuse(refusal(
+            stem,
+            &why,
+            &format!("are not the files Steam installed for {} ({what})", Installed::build_words(&build)),
+        )),
+        // No manifest to compare with (a server installed with SteamCMD, a folder outside a Steam library): the
+        // archive's own structure decides, as it did before Steam's word was read.
+        Installed::Unknown(_) => Baseline::Retake(why),
+    }
 }
 
 /// The text of a refusal: why the pair cannot go back, what the game's files are, and what the player does.

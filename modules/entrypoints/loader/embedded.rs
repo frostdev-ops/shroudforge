@@ -42,7 +42,7 @@ pub fn run_post_install_migrations(root: &Path) -> Result<(), String> {
 
     let executable = shroudforge_loader_config::paths::updater_executable(root);
     if !executable.is_file() {
-        return Ok(());
+        return run_hosted_migrations(root);
     }
     let request = serde_json::to_vec(&serde_json::json!({
         "command": "run-post-install-maintenance"
@@ -89,14 +89,49 @@ pub fn run_post_install_migrations(root: &Path) -> Result<(), String> {
 }
 
 #[cfg(not(windows))]
-pub fn run_post_install_migrations(_: &Path) -> Result<(), String> {
-    Ok(())
+pub fn run_post_install_migrations(root: &Path) -> Result<(), String> {
+    run_hosted_migrations(root)
+}
+
+/// Kiln layer: the post-install migration a start needs where no ShroudForge Updater is installed (a runtime a host
+/// bundles). An earlier ShroudForge kept the windows' `toggleKey`s as Windows virtual-key numbers; this one's loader
+/// settings refuse a number ("Hotkey must be an SDL binding string"), so every startup asset pass failed at its first
+/// read of the settings and no mod of the pass ran (kiln-win1, 2026-11-25: `debugConsole` 121, `worldEditor` 113,
+/// `modloaderUi` 120). The Updater converts them after an install (`maintenance_jobs.rs`
+/// `MigrateLegacyToggleKeys`, the first job it runs); without it they are converted here, the same way, before the
+/// pass. Nothing else in the file changes, and settings without a number are not written.
+fn run_hosted_migrations(root: &Path) -> Result<(), String> {
+    match shroudforge_loader_config::config::migrate_legacy_toggle_key_settings(root) {
+        Ok(true) => {
+            let _ = shroudforge_logging::append(root, 'I', "updater",
+                "The windows' toggle keys in ShroudForge's settings were Windows key numbers from an earlier \
+                 ShroudForge; they were converted to key bindings, as ShroudForge's Updater does after an install");
+            Ok(())
+        }
+        Ok(false) => Ok(()),
+        Err(error) => {
+            let message = format!("could not convert the legacy toggle keys in ShroudForge's settings: {error}");
+            let _ = shroudforge_logging::append(root, 'E', "updater", &message);
+            Err(message)
+        }
+    }
 }
 
 pub(crate) fn recycle_incompatible_game_asset_backups(
     root: &Path,
     target: &str,
 ) -> Result<(), String> {
+    // Kiln layer: a runtime that a host bundles has no Updater. The outdated
+    // pair is then set aside in ShroudForge's backups folder instead (on every
+    // platform: the game is a Windows program, and its tests run on Linux too).
+    if let Some(result) =
+        shroudforge_game_assets::working_baseline::set_aside_without_updater(root, target)
+    {
+        let folder = result?;
+        tracing::warn!(target: "shroudforge::startup", target = target, folder = %folder.display(),
+            "No ShroudForge Updater is installed: the outdated working asset backups were set aside in ShroudForge's backups folder, not in the recycle bin");
+        return Ok(());
+    }
     #[cfg(windows)]
     {
         use std::{io::Write, os::windows::process::CommandExt, process::Stdio};
@@ -105,16 +140,6 @@ pub(crate) fn recycle_incompatible_game_asset_backups(
             "command": "recycle-game-asset-backups",
             "target": target,
         });
-        // Kiln layer: a runtime that a host bundles has no Updater. The outdated
-        // pair is then set aside in ShroudForge's backups folder instead.
-        if let Some(result) =
-            shroudforge_game_assets::working_baseline::set_aside_without_updater(root, target)
-        {
-            let folder = result?;
-            tracing::warn!(target: "shroudforge::startup", target = target, folder = %folder.display(),
-                "No ShroudForge Updater is installed: the outdated working asset backups were set aside in ShroudForge's backups folder, not in the recycle bin");
-            return Ok(());
-        }
         let executable = shroudforge_loader_config::paths::updater_executable(root);
         if !executable.is_file() {
             return Err(
