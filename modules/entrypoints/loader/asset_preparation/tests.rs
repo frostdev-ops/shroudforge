@@ -66,23 +66,24 @@ fn runtime_exports_do_not_restore_prepared_assets_during_startup() {
     assert!(!export_pass_needed(&root, "enshrouded").unwrap());
     // Kiln layer: without the record of the pass the files are not known to be prepared.
     assert!(!already_applied(&root, "enshrouded", false).unwrap());
-    // Kiln layer: what the pass used in the export folder
+    // Kiln layer: what the pass used in the export folder (recorded while exports are on, as here)
     let touches = shroudforge_game_assets::prepared_stamp::ExportTouches::default();
     touches.path("map.json");
-    let record = |exporters: Option<&std::path::Path>| {
+    let exports = shroudforge_loader_config::paths::export_dir(&root);
+    let record = || {
         shroudforge_game_assets::prepared_stamp::record(
             &root,
             "enshrouded",
             &shroudforge_game_assets::prepared_stamp::PassInputs {
                 fingerprint: &fingerprint,
                 exports_enabled: true,
-                exporters,
+                exporters: Some(&exports),
             },
             &touches,
         )
         .unwrap()
     };
-    record(None);
+    record();
     assert!(already_applied(&root, "enshrouded", false).unwrap());
     run_startup(&root).unwrap();
     assert_eq!(
@@ -93,14 +94,13 @@ fn runtime_exports_do_not_restore_prepared_assets_during_startup() {
     std::fs::write(root.join("enshrouded.kfc"), b"vanilla recipe data").unwrap();
     assert!(!already_applied(&root, "enshrouded", false).unwrap());
     std::fs::write(root.join("enshrouded.kfc"), b"already prepared recipe data").unwrap();
-    record(None);
+    record();
     assert!(already_applied(&root, "enshrouded", false).unwrap());
-    // Kiln layer: a pregame exporter's pass is skipped only while the export folder is as it left it.
-    assert!(!already_applied(&root, "enshrouded", true).unwrap());
-    let exports = shroudforge_loader_config::paths::export_dir(&root);
+    // Kiln layer: the pass is skipped only while what it used in the export folder is as it left it.
     std::fs::create_dir_all(&exports).unwrap();
     std::fs::write(exports.join("map.json"), b"{}").unwrap();
-    record(Some(&exports));
+    assert!(!already_applied(&root, "enshrouded", true).unwrap());
+    record();
     assert!(already_applied(&root, "enshrouded", true).unwrap());
     std::fs::remove_file(exports.join("map.json")).unwrap();
     assert!(!already_applied(&root, "enshrouded", true).unwrap());

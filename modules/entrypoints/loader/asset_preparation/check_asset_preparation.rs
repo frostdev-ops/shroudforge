@@ -40,7 +40,7 @@ pub(super) fn export_pass_needed(
 
 /// Kiln layer: `export_pass_needed` no longer forces a pass by itself. A match also needs the
 /// record of the last pass (`shroudforge_game_assets::prepared_stamp`): the game files it left, and
-/// with pregame exporters the export folder, unchanged since.
+/// while exports are on what the pass used in the export folder, unchanged since.
 pub(super) fn already_applied(
     game_directory: &Path,
     file_name: &str,
@@ -88,10 +88,13 @@ pub(super) fn already_applied(
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
     let exports = shroudforge_loader_config::paths::export_dir(game_directory);
+    // While exports are on, any pregame package may have used the export API (it checks the switch,
+    // not the `export` capability), so the record's export part is compared then, as the pass
+    // records it (apply_asset_mods.rs). `export_pass_needed` implies exports on.
     let inputs = shroudforge_game_assets::prepared_stamp::PassInputs {
         fingerprint: &fingerprint,
         exports_enabled,
-        exporters: export_pass_needed.then_some(exports.as_path()),
+        exporters: (exports_enabled || export_pass_needed).then_some(exports.as_path()),
     };
     match shroudforge_game_assets::prepared_stamp::current(game_directory, file_name, &inputs) {
         Ok(()) => Ok(true),

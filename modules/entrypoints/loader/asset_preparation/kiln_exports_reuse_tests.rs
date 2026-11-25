@@ -248,3 +248,42 @@ return {}
     fs::write(exports(&game).join("scratch/new.txt"), b"x").unwrap();
     assert!(!reused(&game), "a file added to the folder the pass listed");
 }
+
+/// Kiln review (0.2.0-dev.31.12): the export API checks the export switch, not the package's
+/// capability, so a pregame package with `patch` alone can read and write exports while exports are
+/// on. What it used there is in the record too: a file it read that changed runs the pass again.
+#[test]
+fn a_patch_only_package_that_uses_the_export_api_is_recorded_too() {
+    let game = Game::new("exports-patch-only");
+    game.package(
+        "reader",
+        r#"
+local value = "none"
+if io.export_exists("reader/settings.txt") then
+  value = io.read_export_to_string("reader/settings.txt")
+end
+io.export("reader/seen.txt", value)
+return {}
+"#,
+        &[],
+    );
+    assert!(
+        !export_pass_needed(&game.0, "enshrouded").unwrap(),
+        "no package has the export capability"
+    );
+    run_startup(&game.0).unwrap();
+    assert_eq!(game.record()["status"], "applied", "{}", game.record());
+    let seen = || fs::read_to_string(exports(&game).join("reader/seen.txt")).unwrap();
+    assert_eq!(seen(), "none");
+    play_a_session(&game, 1);
+    assert!(already_applied(&game.0, "enshrouded", false).unwrap());
+    fs::write(exports(&game).join("reader/settings.txt"), b"on").unwrap();
+    assert!(
+        !already_applied(&game.0, "enshrouded", false).unwrap(),
+        "the export the pass looked for appeared"
+    );
+    run_startup(&game.0).unwrap();
+    assert_eq!(seen(), "on");
+    play_a_session(&game, 2);
+    assert!(already_applied(&game.0, "enshrouded", false).unwrap());
+}

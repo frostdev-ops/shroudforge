@@ -19,13 +19,15 @@
 //! - `<stem>.kfc` (size, time, SHA-256 of all of it: about 9 MB) and `<stem>.kfc_resources` (size,
 //!   time, SHA-256 of its first and last MiB: about 200 MB is too much to read every start),
 //! - both working backups (size and time),
-//! - when the pass ran pregame exporters: what those exporters used in the export folder, and
+//! - while exports are on: what the pass's packages used in the export folder, and
 //!   nothing else there (scheme 2, 0.2.0-dev.31.12). The pass notes every path it wrote, read,
 //!   looked for, renamed, copied or deleted through the export API, and every folder it listed
 //!   (`ExportTouches`); the record keeps each one's state: a file's size and SHA-256 (of its first
 //!   and last MiB plus its time when it is over 16 MiB), a folder, nothing there, or a listed
-//!   folder's names. Pregame exporters are not scoped to a folder of their own: they write flat
-//!   files at the top of the export folder (XHL Area Harvest, Auto Loot Plus) as well as folders
+//!   folder's names; a link by where it leads and what is there, as the export API follows links.
+//!   A pass that used a path the record cannot name leaves no record. Pregame exporters are not
+//!   scoped to a folder of their own: they write flat files at the top of the export folder (XHL
+//!   Area Harvest, Auto Loot Plus) as well as folders
 //!   (Unified EML Tweaks), and runtime mods write next to them while the game runs (Unified Tweaks
 //!   Live, World Editor, native DLLs, diagnostics). Scheme 1 listed the whole export folder, so any
 //!   such runtime write ran the whole pass again at the next start (an 11-minute start with the
@@ -62,8 +64,9 @@ pub struct PassInputs<'a> {
     pub fingerprint: &'a str,
     /// loader config `exports.enabled` at the pass.
     pub exports_enabled: bool,
-    /// The export folder, when the pass ran a pregame package with the `export` capability. Only
-    /// what the pass used there (`ExportTouches`) is recorded and compared.
+    /// The export folder, while exports are on (`exports.enabled`). Every pregame package may use
+    /// the export API then, with the `export` capability or without it (the API checks the switch).
+    /// Only what the pass used there (`ExportTouches`) is recorded and compared.
     pub exporters: Option<&'a Path>,
 }
 
@@ -81,7 +84,15 @@ pub enum Touch {
 /// `io.export_copy`, `io.export_delete`): the paths relative to the export folder, `/` between
 /// their parts. The loader hands one to the pass (`RunOptions::export_touches`) and records it.
 #[derive(Clone, Debug, Default)]
-pub struct ExportTouches(Arc<Mutex<BTreeSet<(Touch, String)>>>);
+pub struct ExportTouches(Arc<Mutex<Noted>>);
+
+#[derive(Debug, Default)]
+struct Noted {
+    touched: BTreeSet<(Touch, String)>,
+    /// Kiln review: the pass used a path the record cannot name (a part with `:`, such as an NTFS
+    /// stream): `record` then writes no record, so the next start runs the pass.
+    unnamed: bool,
+}
 
 impl ExportTouches {
     /// A path the pass wrote, read, looked for, renamed, copied or deleted.
@@ -95,14 +106,16 @@ impl ExportTouches {
     }
 
     fn add(&self, touch: Touch, relative: &str) {
-        let Some(relative) = normalized(relative) else {
-            return;
-        };
-        let mut touched = self
+        let mut noted = self
             .0
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        touched.insert((touch, relative));
+        match normalized(relative) {
+            Some(relative) => {
+                noted.touched.insert((touch, relative));
+            }
+            None => noted.unnamed = true,
+        }
     }
 
     /// Everything noted so far.
@@ -110,7 +123,16 @@ impl ExportTouches {
         self.0
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .touched
             .clone()
+    }
+
+    /// Whether the pass used a path that is not in `touched` because the record cannot name it.
+    fn unnamed(&self) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .unnamed
     }
 }
 
@@ -156,6 +178,9 @@ pub fn record(
     touches: &ExportTouches,
 ) -> Result<(), String> {
     let touched = touches.touched();
+    if touches.unnamed() {
+        return Err("the pass used a path of the export folder the record cannot name".into());
+    }
     if touched.len() > MAX_EXPORT_ENTRIES {
         return Err(format!(
             "the pass used more than {MAX_EXPORT_ENTRIES} paths of the export folder"
@@ -352,9 +377,11 @@ fn export_state(dir: &Path, touched: &BTreeSet<(Touch, String)>) -> Result<Vec<V
 }
 
 /// A file's size and SHA-256 (no time: a runtime mod or the pass writing the same bytes again is no
-/// change), `"folder"`, `"other"` (a link: not followed), or null when nothing is there.
+/// change), `"folder"`, a link by what it leads to (`linked`), `"other"`, or null when nothing is
+/// there.
 fn path_state(path: &Path) -> Result<Value, String> {
     match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => linked(path, path_state),
         Ok(metadata) if metadata.is_file() => {
             let large = metadata.len() > WHOLE_EXPORT_HASH;
             let hashed = with_hash(path, large.then_some(EDGE))?;
@@ -371,10 +398,23 @@ fn path_state(path: &Path) -> Result<Value, String> {
     }
 }
 
-/// The sorted names of a listed folder's entries, with their kind; null when it is not there, and
-/// `"not a folder"` when something else is.
+/// Kiln review: the export API follows links (`io.read_export_to_string` and `io.export_list`
+/// resolve them), so a link is known by where it leads and the state of what is there; null where it
+/// leads nowhere. The resolved path holds no link, so `state` does not come back here.
+fn linked(path: &Path, state: fn(&Path) -> Result<Value, String>) -> Result<Value, String> {
+    match fs::canonicalize(path) {
+        Ok(target) => Ok(json!({"link": target.to_string_lossy(), "state": state(&target)?})),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(json!({"link": null})),
+        Err(error) => Err(format!("{}: {error}", path.display())),
+    }
+}
+
+/// The sorted names of a listed folder's entries, with their kind (a link with where it leads, as
+/// `io.export_list` names it by that); null when it is not there, `"not a folder"` when something
+/// else is, and a link to a folder by what it leads to (`linked`).
 fn listing_state(path: &Path) -> Result<Value, String> {
     match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => return linked(path, listing_state),
         Ok(metadata) if metadata.is_dir() => {}
         Ok(_) => return Ok(Value::from("not a folder")),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Value::Null),
@@ -383,13 +423,19 @@ fn listing_state(path: &Path) -> Result<Value, String> {
     let mut names = Vec::new();
     for entry in fs::read_dir(path).map_err(|error| format!("{}: {error}", path.display()))? {
         let entry = entry.map_err(|error| format!("{}: {error}", path.display()))?;
-        let kind = match entry.file_type() {
-            Ok(kind) if kind.is_dir() => "folder",
-            Ok(kind) if kind.is_file() => "file",
-            Ok(_) => "other",
+        let name = entry.file_name().to_string_lossy().into_owned();
+        names.push(match entry.file_type() {
+            Ok(kind) if kind.is_symlink() => {
+                let target = fs::canonicalize(entry.path())
+                    .ok()
+                    .map(|target| target.to_string_lossy().into_owned());
+                json!([name, "link", target])
+            }
+            Ok(kind) if kind.is_dir() => json!([name, "folder"]),
+            Ok(kind) if kind.is_file() => json!([name, "file"]),
+            Ok(_) => json!([name, "other"]),
             Err(error) => return Err(format!("{}: {error}", entry.path().display())),
-        };
-        names.push(json!([entry.file_name().to_string_lossy(), kind]));
+        });
         if names.len() > MAX_EXPORT_ENTRIES {
             return Err(format!(
                 "{} has more than {MAX_EXPORT_ENTRIES} entries",
@@ -908,6 +954,185 @@ mod tests {
                 (Touch::Listing, String::new())
             ]
         );
+    }
+
+    /// Kiln review (0.2.0-dev.31.12): a path the record cannot name (a part with `:`, such as an NTFS
+    /// stream `file:stream`, which ShroudForge's own path check lets through) leaves no record, so the
+    /// next start runs the pass: what the pass used is never left out of the record.
+    #[test]
+    fn a_path_the_record_cannot_name_leaves_no_record() {
+        let g = game();
+        let exports = g.exports.clone();
+        let touches = pass_touches();
+        touches.path("unified-tweaks/ut-reference.txt:stream");
+        assert!(
+            record(
+                &g.root,
+                "enshrouded",
+                &inputs("f1", Some(&exports)),
+                &touches
+            )
+            .is_err(),
+            "a pass that used a path the record cannot name is not recorded"
+        );
+        assert!(current(&g.root, "enshrouded", &inputs("f1", Some(&exports))).is_err());
+        // a copy of the note shares it
+        let copy = touches.clone();
+        let fresh = ExportTouches::default();
+        fresh.path("a.txt");
+        assert!(record(&g.root, "enshrouded", &inputs("f1", Some(&exports)), &copy).is_err());
+        assert!(record(&g.root, "enshrouded", &inputs("f1", Some(&exports)), &fresh).is_ok());
+    }
+
+    /// Kiln review (0.2.0-dev.31.12): the export API follows links (`io.read_export_to_string` and
+    /// `io.export_list` resolve them), so a link the pass used is known by what it leads to: a file
+    /// read through a link, a folder listed through a link, a listed folder's entry that is a link.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_the_pass_used_is_known_by_what_it_leads_to() {
+        use std::os::unix::fs::symlink;
+        type Change = fn(&Game);
+        let changes: [(&str, Change); 4] = [
+            ("the file a link the pass read leads to changed", |g| {
+                fs::write(
+                    g.exports.join("unified-tweaks/user-settings.json"),
+                    b"{\"a\":2}",
+                )
+                .unwrap()
+            }),
+            ("a file added to the folder a listed link leads to", |g| {
+                fs::write(g.exports.join("unified-tweaks/new.txt"), b"x").unwrap()
+            }),
+            ("an entry of a listed folder links elsewhere", |g| {
+                fs::remove_file(g.exports.join("linked/alias")).unwrap();
+                symlink(
+                    "../xhl-area-harvest-family-manifest.tsv",
+                    g.exports.join("linked/alias"),
+                )
+                .unwrap()
+            }),
+            ("the link the pass read leads nowhere", |g| {
+                fs::remove_file(g.exports.join("unified-tweaks/user-settings.json")).unwrap()
+            }),
+        ];
+        for (what, change) in changes {
+            let g = game();
+            let exports = g.exports.clone();
+            symlink(
+                "unified-tweaks/user-settings.json",
+                exports.join("settings-link.json"),
+            )
+            .unwrap();
+            symlink("unified-tweaks", exports.join("tweaks-link")).unwrap();
+            fs::create_dir_all(exports.join("linked")).unwrap();
+            symlink("../auto-loot-plus-report.txt", exports.join("linked/alias")).unwrap();
+            let touches = ExportTouches::default();
+            touches.path("settings-link.json");
+            touches.listing("tweaks-link");
+            touches.listing("linked");
+            record(
+                &g.root,
+                "enshrouded",
+                &inputs("f1", Some(&exports)),
+                &touches,
+            )
+            .unwrap();
+            play_a_session(&g, 1);
+            assert_eq!(
+                current(&g.root, "enshrouded", &inputs("f1", Some(&exports))),
+                Ok(()),
+                "{what}: unchanged links hold"
+            );
+            change(&g);
+            assert_eq!(
+                current(&g.root, "enshrouded", &inputs("f1", Some(&exports))),
+                Err("exports differs from the last pass".to_owned()),
+                "{what}: must apply again"
+            );
+        }
+    }
+
+    /// Kiln review (0.2.0-dev.31.12): an export folder that is a link (moved to another drive) and that
+    /// the pass listed: a file added at its top runs the pass.
+    #[cfg(unix)]
+    #[test]
+    fn a_linked_export_folder_that_the_pass_listed() {
+        let g = game();
+        let moved = g.root.join("../exports-elsewhere");
+        fs::rename(&g.exports, &moved).unwrap();
+        std::os::unix::fs::symlink(&moved, &g.exports).unwrap();
+        let exports = g.exports.clone();
+        let touches = ExportTouches::default();
+        touches.listing("");
+        touches.path("");
+        record(
+            &g.root,
+            "enshrouded",
+            &inputs("f1", Some(&exports)),
+            &touches,
+        )
+        .unwrap();
+        assert_eq!(
+            current(&g.root, "enshrouded", &inputs("f1", Some(&exports))),
+            Ok(())
+        );
+        fs::write(moved.join("new-at-the-top.txt"), b"x").unwrap();
+        assert!(
+            current(&g.root, "enshrouded", &inputs("f1", Some(&exports))).is_err(),
+            "a file added to the listed export folder"
+        );
+    }
+
+    /// An export file over 16 MiB is known by its size, time and the SHA-256 of its first and last
+    /// MiB: a change at either end or a new time runs the pass.
+    #[test]
+    fn a_large_export_is_known_by_its_size_time_and_ends() {
+        type Change = fn(&Path);
+        let changes: [(&str, Change); 3] = [
+            ("its first byte, same time", |path| {
+                let mut bytes = fs::read(path).unwrap();
+                bytes[0] = 2;
+                rewrite_keeping_time(path, &bytes)
+            }),
+            ("its last byte, same time", |path| {
+                let mut bytes = fs::read(path).unwrap();
+                *bytes.last_mut().unwrap() = 2;
+                rewrite_keeping_time(path, &bytes)
+            }),
+            ("a new time", |path| later(path)),
+        ];
+        for (what, change) in changes {
+            let g = game();
+            let exports = g.exports.clone();
+            let big = exports.join("unified-tweaks/big.bin");
+            fs::write(&big, vec![1u8; (WHOLE_EXPORT_HASH + 1) as usize]).unwrap();
+            let touches = pass_touches();
+            touches.path("unified-tweaks/big.bin");
+            record(
+                &g.root,
+                "enshrouded",
+                &inputs("f1", Some(&exports)),
+                &touches,
+            )
+            .unwrap();
+            let recorded: Value =
+                serde_json::from_slice(&fs::read(record_path(&g.root, "enshrouded")).unwrap())
+                    .unwrap();
+            let state = recorded["exports"]["touched"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|entry| entry[1] == "unified-tweaks/big.bin")
+                .unwrap()[2]
+                .clone();
+            assert!(state["modified"].is_string(), "{state}");
+            assert_eq!(state["size"], WHOLE_EXPORT_HASH + 1);
+            change(&big);
+            assert!(
+                current(&g.root, "enshrouded", &inputs("f1", Some(&exports))).is_err(),
+                "{what}: must apply again"
+            );
+        }
     }
 
     #[test]

@@ -194,21 +194,9 @@ pub(super) fn run_inner(
         }
     };
     // Kiln layer: what this pass left, so that the next start can skip an unchanged pass. Without
-    // the record the next start applies again, as before.
-    let pregame_exporters = export_enabled
-        && environment
-            .plan(
-                file_name == "enshrouded_server",
-                shroudforge_api::API_VERSION,
-            )
-            .iter()
-            .any(|item| {
-                item.info().requires_pregame()
-                    && item
-                        .info()
-                        .capabilities
-                        .contains(&shroudforge_package::Capability::Export)
-            });
+    // the record the next start applies again, as before. While exports are on, every pregame
+    // package can use the export API (it checks the switch, not the package's `export` capability),
+    // so what the pass used there is recorded with or without a pregame exporter.
     let exports = shroudforge_loader_config::paths::export_dir(game_directory);
     if let Err(error) = shroudforge_game_assets::prepared_stamp::record(
         game_directory,
@@ -216,7 +204,7 @@ pub(super) fn run_inner(
         &shroudforge_game_assets::prepared_stamp::PassInputs {
             fingerprint: &fingerprint,
             exports_enabled: export_enabled,
-            exporters: pregame_exporters.then_some(exports.as_path()),
+            exporters: export_enabled.then_some(exports.as_path()),
         },
         &export_touches,
     ) {
