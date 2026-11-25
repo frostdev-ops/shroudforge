@@ -43,4 +43,4 @@ windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Syste
 
 [dev-dependencies]
 shroudforge-game-assets = { path = "../../game-files", features = ["test-fixtures"] }
-kfc = { path = "../../../kfc-parser/crates/kfc", features = ["resource"] }
+kfc = { path = "../../../kfc-parser/crates/kfc", features = ["resource", "content"] }

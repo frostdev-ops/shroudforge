@@ -11,6 +11,9 @@ use crate::{
 mod image;
 mod image_format;
 mod pixel_format;
+// Kiln layer
+#[cfg(test)]
+mod kiln_encode_in_strips_tests;
 use image as value;
 
 pub use value::Image;

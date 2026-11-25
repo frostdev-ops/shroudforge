@@ -48,3 +48,6 @@ mod kiln_baseline_tests;
 // Kiln layer
 #[cfg(test)]
 mod kiln_exports_reuse_tests;
+// Kiln layer
+#[cfg(test)]
+mod kiln_same_pass_content_tests;
