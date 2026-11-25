@@ -316,3 +316,44 @@ fn a_clean_copy_that_cannot_be_finished_leaves_no_half_pair_and_the_old_pair_sta
     assert!(read(&game, "enshrouded.kfc.bak") == header && read(&game, "enshrouded.kfc_resources.bak") == resources);
     assert!(kept_old(&game), "the old pair is still kept aside: {:?}", outdated_generations(&game));
 }
+
+/// Review (0.2.0-dev.31.13): the hosted migration of legacy toggle keys runs at every start without an Updater. It
+/// writes once, converts nothing twice, and leaves settings it cannot convert (or read) as they are, with an error.
+#[test]
+fn the_hosted_toggle_key_migration_writes_once_and_leaves_what_it_cannot_convert() {
+    let game = Game::new("toggle-keys");
+    let path = shroudforge_loader_config::paths::loader_config(&game.0);
+    // already converted: nothing is written
+    let before = fs::read(&path).unwrap();
+    crate::run_post_install_migrations(&game.0).unwrap();
+    assert_eq!(fs::read(&path).unwrap(), before, "settings without a number are not written");
+    // a legacy key (the middle mouse button maps on every platform) beside one that is already a binding
+    set_toggle_key(&game, "worldEditor", serde_json::json!(4));
+    set_toggle_key(&game, "debugConsole", serde_json::json!("SDL:67"));
+    crate::run_post_install_migrations(&game.0).unwrap();
+    let config = shroudforge_loader_config::config::read_loader(&game.0).unwrap();
+    assert_eq!(config["modules"]["worldEditor"]["toggleKey"], "Mouse:2", "{config}");
+    assert_eq!(config["modules"]["debugConsole"]["toggleKey"], "SDL:67", "{config}");
+    let converted = fs::read(&path).unwrap();
+    crate::run_post_install_migrations(&game.0).unwrap();
+    assert_eq!(fs::read(&path).unwrap(), converted, "a second start writes nothing");
+    // numbers that are no key: an error, and the file stays as it was
+    for key in [serde_json::json!(7), serde_json::json!(-1), serde_json::json!(70000), serde_json::json!(1.5)] {
+        set_toggle_key(&game, "modloaderUi", key.clone());
+        let bad = fs::read(&path).unwrap();
+        let error = crate::run_post_install_migrations(&game.0).unwrap_err();
+        assert!(error.contains("modloaderUi.toggleKey"), "{key}: {error}");
+        assert_eq!(fs::read(&path).unwrap(), bad, "{key}: the file stays as it was");
+    }
+    // a file that is not JSON: an error, and the file stays as it was
+    fs::write(&path, b"{ \"modules\": ").unwrap();
+    assert!(crate::run_post_install_migrations(&game.0).is_err());
+    assert_eq!(fs::read(&path).unwrap(), b"{ \"modules\": ");
+    // no settings file: nothing to convert, and none is made
+    fs::remove_file(&path).unwrap();
+    crate::run_post_install_migrations(&game.0).unwrap();
+    assert!(!path.exists());
+    // no temporary file is left beside the settings
+    let left: Vec<_> = fs::read_dir(path.parent().unwrap()).unwrap().map(|entry| entry.unwrap().file_name()).collect();
+    assert!(left.iter().all(|name| !name.to_string_lossy().starts_with(".tmp")), "{left:?}");
+}
