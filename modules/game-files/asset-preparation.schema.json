@@ -13,7 +13,8 @@
     "mods": { "type": "array", "items": { "type": "object", "required": ["id", "version"] } },
     "skipped": { "type": "array", "items": { "type": "object", "required": ["id", "error"] } },
     "retryError": { "type": "string", "minLength": 1 },
-    "recoveryError": { "type": "string", "minLength": 1 }
+    "recoveryError": { "type": "string", "minLength": 1 },
+    "recovery": { "enum": ["restored", "kept"] }
   },
   "allOf": [
     {

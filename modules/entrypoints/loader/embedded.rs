@@ -99,7 +99,8 @@ pub fn run_post_install_migrations(root: &Path) -> Result<(), String> {
 /// read of the settings and no mod of the pass ran (kiln-win1, 2026-11-25: `debugConsole` 121, `worldEditor` 113,
 /// `modloaderUi` 120). The Updater converts them after an install (`maintenance_jobs.rs`
 /// `MigrateLegacyToggleKeys`, the first job it runs); without it they are converted here, the same way, before the
-/// pass. Nothing else in the file changes, and settings without a number are not written.
+/// pass. Settings without a number are not written; settings with one are written as upstream's migration writes
+/// them: read with the defaults and upstream's own updates of older settings, checked, and replaced atomically.
 fn run_hosted_migrations(root: &Path) -> Result<(), String> {
     match shroudforge_loader_config::config::migrate_legacy_toggle_key_settings(root) {
         Ok(true) => {

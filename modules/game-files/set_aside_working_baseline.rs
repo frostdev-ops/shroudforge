@@ -10,7 +10,8 @@
 //! `set_aside` moves the old pair into ShroudForge's backups folder instead:
 //! `<game>/shroudforge/backups/outdated-working-baseline/<stem>/<generation>/`.
 //! Only the newest generation is kept, so the folder does not grow with every
-//! game update.
+//! game update. A header backup set aside without its companion is kept beside
+//! the newest whole pair, never in its place (at most two generations).
 
 use std::{
     fs, io,
@@ -152,11 +153,21 @@ fn set_aside_with(
         for name in found {
             move_file(&root.join(name), &kept.join(name))?;
         }
-        // The pair is out of the game folder; what follows is housekeeping.
+        // The pair is out of the game folder; what follows is housekeeping. Only a whole pair (the header backup and
+        // its companion) takes the place of the generations kept before it. A header backup without its companion
+        // (an unfinished copy of an earlier runtime, another program) never removes a kept whole pair: it replaces
+        // only earlier such halves, so at most one whole pair and one half are kept (review, 0.2.0-dev.31.13).
+        let whole = |folder: &Path| {
+            [&names[0], &names[3]].iter().all(|name| file(&folder.join(name)).is_ok_and(|meta| meta.is_some()))
+        };
+        let kept_whole = whole(&kept);
         if let Some(generations) = kept.parent().and_then(|parent| fs::read_dir(parent).ok()) {
             for entry in generations.flatten() {
                 let older = entry.path();
-                if older != kept && plain(&older).is_ok_and(|meta| meta.is_some_and(|meta| meta.is_dir())) {
+                if older != kept
+                    && plain(&older).is_ok_and(|meta| meta.is_some_and(|meta| meta.is_dir()))
+                    && (kept_whole || !whole(&older))
+                {
                     let _ = fs::remove_dir_all(older);
                 }
             }

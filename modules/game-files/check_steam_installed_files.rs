@@ -395,7 +395,11 @@ fn parse_vdf(text: &str) -> Option<BTreeMap<String, Vdf>> {
             _ => {}
         }
     }
-    fn table(tokens: &mut std::slice::Iter<'_, Token>, nested: bool) -> Option<BTreeMap<String, Vdf>> {
+    // Steam's own files nest three tables deep; a file nested deeper is not one of them, and is not followed down
+    // (one nested without end would overflow the stack of the game's start: review, 0.2.0-dev.31.13).
+    const MAX_DEPTH: usize = 16;
+    fn table(tokens: &mut std::slice::Iter<'_, Token>, depth: usize) -> Option<BTreeMap<String, Vdf>> {
+        let nested = depth > 0;
         let mut out = BTreeMap::new();
         loop {
             let key = match tokens.next() {
@@ -405,14 +409,15 @@ fn parse_vdf(text: &str) -> Option<BTreeMap<String, Vdf>> {
                 Some(Token::Open) => return None,
             };
             let value = match tokens.next()? {
-                Token::Open => Vdf::Table(table(tokens, true)?),
+                Token::Open if depth < MAX_DEPTH => Vdf::Table(table(tokens, depth + 1)?),
+                Token::Open => return None,
                 Token::Text(text) => Vdf::Text(text.clone()),
                 Token::Close => return None,
             };
             out.insert(key, value);
         }
     }
-    table(&mut tokens.iter(), false)
+    table(&mut tokens.iter(), 0)
 }
 
 /// Kiln layer: Steam's records of a game folder, for tests of the callers (feature `test-fixtures`).

@@ -68,7 +68,7 @@ pub(crate) fn recover_failed_startup(game_directory: &Path, detail: &str) -> boo
                 Err(LoaderError::Pregame(format!("ShroudForge: {why}")))
             }
             shroudforge_api::Baseline::Missing => Ok(Recovered::Kept {
-                why: format!("there was no clean copy ({target}.kfc.bak) yet"),
+                why: format!("there was no clean copy ({target}.kfc.bak) in the game folder"),
                 retaken: shroudforge_api::capture_working_baseline(game_directory, target),
             }),
             shroudforge_api::Baseline::Retake(why) => Ok(Recovered::Kept {
@@ -78,8 +78,27 @@ pub(crate) fn recover_failed_startup(game_directory: &Path, detail: &str) -> boo
             }),
         }
     })();
+    // Kiln layer: the record of the failed pass says what its recovery did (`recovery`: the pair was put back, or the
+    // game's own files were kept), or why it could not (`recoveryError`); Kiln's launcher words it so
+    // (kiln-manage sf_startup.rs). Only the record of this failure is changed.
+    let note = |key: &str, value: String| {
+        if let Ok(mut record) = shroudforge_loader_config::config::read_document(
+            game_directory,
+            shroudforge_game_assets::documents::APPLIED,
+        ) && record["status"] == "failed"
+            && record["error"].as_str() == Some(detail)
+        {
+            record[key] = value.into();
+            let _ = shroudforge_loader_config::config::write_document(
+                game_directory,
+                shroudforge_game_assets::documents::APPLIED,
+                &record,
+            );
+        }
+    };
     match result {
         Ok(Recovered::Restored) => {
+            note("recovery", "restored".into());
             let _ = shroudforge_logging::append(
                 game_directory,
                 'W',
@@ -89,6 +108,7 @@ pub(crate) fn recover_failed_startup(game_directory: &Path, detail: &str) -> boo
             true
         }
         Ok(Recovered::Kept { why, retaken }) => {
+            note("recovery", "kept".into());
             let taken = match retaken {
                 Ok(()) => "the game's own files were kept as the new clean copy (the old one was set aside)".to_string(),
                 Err(error) => format!(
@@ -108,21 +128,9 @@ pub(crate) fn recover_failed_startup(game_directory: &Path, detail: &str) -> boo
             true
         }
         Err(error) => {
-            // Kiln layer: the record says why the game data could not be put back, and what the player does, beside the
-            // pass's own error (Kiln's launcher shows both: kiln-manage sf_startup.rs).
-            if let Ok(mut record) = shroudforge_loader_config::config::read_document(
-                game_directory,
-                shroudforge_game_assets::documents::APPLIED,
-            ) && record["status"] == "failed"
-                && record["error"].as_str() == Some(detail)
-            {
-                record["recoveryError"] = error.to_string().into();
-                let _ = shroudforge_loader_config::config::write_document(
-                    game_directory,
-                    shroudforge_game_assets::documents::APPLIED,
-                    &record,
-                );
-            }
+            // Kiln layer: why the game data could not be put back, and what the player does, beside the pass's own error
+            // (Kiln's launcher shows both).
+            note("recoveryError", error.to_string());
             let _ = shroudforge_logging::append(
                 game_directory,
                 'E',

@@ -11,13 +11,23 @@ fn copy_complete(
     backup: impl AsRef<std::path::Path>,
 ) -> std::io::Result<()> {
     let backup = backup.as_ref();
-    let partial = std::path::PathBuf::from(format!("{}.partial", backup.display()));
-    std::fs::copy(source, &partial)?;
+    let partial = partial_path(backup);
+    copy_flushed(source, &partial)?;
+    std::fs::rename(&partial, backup)
+}
+
+/// Kiln layer: where the copy for `backup` is made before it gets that name.
+fn partial_path(backup: &std::path::Path) -> std::path::PathBuf {
+    std::path::PathBuf::from(format!("{}.partial", backup.display()))
+}
+
+/// Kiln layer: `source` copied to `partial` and flushed to the disk.
+fn copy_flushed(source: impl AsRef<std::path::Path>, partial: &std::path::Path) -> std::io::Result<()> {
+    std::fs::copy(source, partial)?;
     std::fs::OpenOptions::new()
         .write(true)
-        .open(&partial)?
-        .sync_all()?;
-    std::fs::rename(&partial, backup)
+        .open(partial)?
+        .sync_all()
 }
 
 pub fn create_backup(kfc_path: impl AsRef<Path>) -> Result<PathBuf, ()> {
@@ -304,13 +314,31 @@ pub fn backup_companion_file(path: impl AsRef<std::path::Path>) -> bool {
 
 /// Kiln layer: a new working baseline from the game files, both backups at once (a companion backup that is
 /// there without its header backup is replaced too: it belongs to no pair), and its record.
+///
+/// Both copies are made and flushed before either gets its name, and the header backup gets its name last. A copy
+/// that cannot be finished (a full disk: the resource file is some 215 MB) leaves no backup and removes its `.partial`
+/// files; a start that ends between the two renames leaves a companion without its header backup, which the next start
+/// replaces (there is no pair yet). A header backup without its companion is never left: the next start would set it
+/// aside as an outdated pair, in the place of the old pair kept aside (review, 0.2.0-dev.31.13).
 pub fn capture_working_baseline(game_dir: impl AsRef<std::path::Path>, file_name: &str) -> Result<(), String> {
     let game = game_dir.as_ref();
-    for extension in ["kfc", "kfc_resources"] {
+    let pair = ["kfc_resources", "kfc"].map(|extension| {
         let source = game.join(format!("{file_name}.{extension}"));
         let backup = game.join(format!("{file_name}.{extension}.bak"));
-        copy_complete(&source, &backup)
-            .map_err(|error| format!("could not copy {} to {}: {error}", source.display(), backup.display()))?;
+        let partial = partial_path(&backup);
+        (source, backup, partial)
+    });
+    for (source, backup, partial) in &pair {
+        if let Err(error) = copy_flushed(source, partial) {
+            for (_, _, partial) in &pair {
+                let _ = std::fs::remove_file(partial);
+            }
+            return Err(format!("could not copy {} to {}: {error}", source.display(), backup.display()));
+        }
+    }
+    for (_, backup, partial) in &pair {
+        std::fs::rename(partial, backup)
+            .map_err(|error| format!("could not name {} {}: {error}", partial.display(), backup.display()))?;
     }
     shroudforge_game_assets::baseline_record::record(game, file_name)
 }
