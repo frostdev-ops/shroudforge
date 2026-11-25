@@ -7,7 +7,8 @@ pub(super) fn lua_get_content(
 
     let guid = args.get::<ContentHash>(0)?;
 
-    if !app_state.kfc_file().contents().contains_key(&guid) {
+    // Kiln layer: a blob created earlier in this pass is there too, as in EML (`has_content`)
+    if !app_state.has_content(&guid) {
         return Ok(None);
     }
 

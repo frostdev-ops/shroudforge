@@ -248,6 +248,36 @@ fails when the DLL lacks the export; `kiln/check-contract.py` compares the defin
 `cargo test -p shroudforge-package kiln_host_skip` (the manifest, the plan, the DLL plan, the sealed list) and
 `cargo test -p shroudforge-modloader --lib kiln_host_skip` (the export).
 
+## Textures on every core, and blobs made earlier in the pass (0.2.0-dev.31.13)
+
+**Block-compressed textures on several threads.** A texture-heavy startup pass spent nearly all its time in one
+call: EMF Beastmaster's three packs spent 397 of their 401 s of Lua in BC7 encode on one core (about 6 minutes of a
+first start). In a pregame pass `image.encode_texture` now cuts a BC1-BC7 texture into strips of whole block rows (at
+least 64 blocks each) and encodes each strip with upstream's own `kfc::content::image::encode`; every block depends
+only on its own 4x4 pixels, so the output is byte for byte the serial encode
+(`modules/mod-runtime/lua/bindings/image/kiln_encode_in_strips.rs`).
+- **Where:** `run_with_api` sets the thread count for a pregame pass only (the startup pass of
+  `shroudforge_prepare_startup` and the `prepare` command) and puts it back when the pass ends; the in-game runtime
+  keeps upstream's serial encode. It logs `Block-compressed textures are encoded on <n> thread(s)`.
+- **How many:** the PC's threads, at most 16. `KILN_SF_ENCODE_THREADS=<n>` overrides it (1 = the serial encode; a
+  count is used as it is, at most 64).
+- **The Windows loader lock:** the pass runs on SF's bootstrap worker (its entry gate) or on the game's main thread in
+  Kiln's early step, both outside DllMain. A thread created while some thread holds the loader lock only starts once
+  it is free, so the calling thread takes strips from the same counter as its helpers and waits only for strips a
+  helper has begun: with no helper running it encodes the whole texture itself. While a helper of an earlier texture
+  has not started, no new helpers are made.
+
+**A blob made earlier in the pass.** `game.assets.get_content` answered only blobs listed in the game's own header.
+EML (and kiln-eml) also answer blobs created earlier in the same pass. The beasts pack writes the English text table
+back as a new blob, the wilds pack's harness script reads it, and under ShroudForge it got nil: the Llama Harness,
+Camel Saddle and Mule Harness were not added. It now asks the pass's new contents first (`AppState::has_content`).
+`get_all_contents` still lists the header only, as in EML.
+
+Tests: `cargo test -p shroudforge-api --lib kiln_encode` (every BC format against the serial bytes, uneven strips,
+helpers that never start, the thread count and its env value) and `cargo test -p shroudforge-modloader --lib
+kiln_same_pass` (whole passes: package A creates a blob and B reads it; a texture the pass encodes on several threads
+is the serial encode).
+
 ## Merging upstream
 
 ```
