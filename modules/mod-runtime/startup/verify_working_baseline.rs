@@ -432,6 +432,95 @@ mod tests {
             "a failed pair restore must leave the previous live header in place");
     }
 
+    /// The game folder of a Steam library (`<library>/steamapps/common/Enshrouded`), and the library.
+    fn library(name: &str) -> (Folder, PathBuf) {
+        let base = folder(name);
+        let game = base.0.join("steamapps/common/Enshrouded");
+        fs::create_dir_all(&game).unwrap();
+        (base, game)
+    }
+
+    /// Steam's records of the build `build` listing the game files as they are now in `game`.
+    fn steam_lists_the_game_files(base: &Folder, game: &Path, build: &str) {
+        let files: Vec<(String, Vec<u8>)> = ["kfc", "kfc_resources"]
+            .iter()
+            .map(|extension| {
+                let name = format!("{STEM}.{extension}");
+                let data = fs::read(game.join(&name)).unwrap();
+                (name, data)
+            })
+            .collect();
+        let listed: Vec<(&str, &[u8])> = files.iter().map(|(name, data)| (name.as_str(), data.as_slice())).collect();
+        shroudforge_game_assets::steam_files::fixture::install_steam_records(&base.0.join("steamapps"), build, &listed);
+    }
+
+    /// kiln-win1, 2026-11-25: the working backups of the build of 2026-10-20 beside the game files of 2026-11-04, which
+    /// are byte for byte what Steam's manifest of the installed build lists.
+    #[test]
+    fn after_a_game_update_steams_manifest_proves_the_game_files_the_new_clean_copy() {
+        let (base, game) = library("steam-same");
+        let update = folder("steam-same-update");
+        archive(&game, "1273043|2026-10-20", b"content before the update");
+        back_up(&game);
+        archive(&update.0, "1287369|2026-11-04", b"content after the update");
+        install(&update.0, &game);
+        steam_lists_the_game_files(&base, &game, "26430625");
+        match check_working_baseline(&game, STEM, false) {
+            Baseline::Retake(why) => {
+                assert!(why.starts_with("it is of game version 1273043|2026-10-20, the game's files are of 1287369|2026-11-04"), "{why}");
+                assert!(why.contains("Steam's manifest of build 26430625 lists the game's files as they are"), "{why}");
+            }
+            other => panic!("{other:?}"),
+        }
+        // Steam's word never makes the last pass's output a clean copy.
+        assert!(matches!(check_working_baseline(&game, STEM, true), Baseline::Refuse(_)));
+    }
+
+    /// The same update, and another program rewrote the game's header since (a whole archive of the new version that
+    /// no pass of this runtime wrote): only Steam's manifest tells, and the start refuses instead of taking it.
+    #[test]
+    fn after_a_game_update_files_that_are_not_steams_are_never_the_new_clean_copy() {
+        let (base, game) = library("steam-differs");
+        let update = folder("steam-differs-update");
+        let other = folder("steam-differs-other");
+        archive(&game, "1273043|2026-10-20", b"content before the update");
+        back_up(&game);
+        let old_pair = (fs::read(game.join(format!("{STEM}.kfc.bak"))).unwrap(),
+            fs::read(game.join(format!("{STEM}.kfc_resources.bak"))).unwrap());
+        archive(&update.0, "1287369|2026-11-04", b"content after the update");
+        install(&update.0, &game);
+        steam_lists_the_game_files(&base, &game, "26430625");
+        archive(&other.0, "1287369|2026-11-04", b"content another program wrote");
+        install(&other.0, &game);
+        match check_working_baseline(&game, STEM, false) {
+            Baseline::Refuse(why) => {
+                assert!(why.contains("are not the files Steam installed for build 26430625"), "{why}");
+                assert!(why.contains("Verify the game files in Steam"), "{why}");
+            }
+            other => panic!("{other:?}"),
+        }
+        // A check changes nothing: the old pair is where it was.
+        assert_eq!(fs::read(game.join(format!("{STEM}.kfc.bak"))).unwrap(), old_pair.0);
+        assert_eq!(fs::read(game.join(format!("{STEM}.kfc_resources.bak"))).unwrap(), old_pair.1);
+        // Without Steam's records the archive's own structure decides, as before.
+        fs::remove_dir_all(base.0.join("depotcache")).unwrap();
+        assert!(matches!(check_working_baseline(&game, STEM, false), Baseline::Retake(_)));
+    }
+
+    /// A first start (no backups yet) over game files that are not Steam's takes no copy of them.
+    #[test]
+    fn a_first_clean_copy_is_not_taken_from_files_that_are_not_steams() {
+        let (base, game) = library("steam-first");
+        archive(&game, "1287369|2026-11-04", b"content Steam installed");
+        steam_lists_the_game_files(&base, &game, "26430625");
+        assert_eq!(check_working_baseline(&game, STEM, false), Baseline::Missing);
+        let other = folder("steam-first-other");
+        archive(&other.0, "1287369|2026-11-04", b"content another program wrote");
+        install(&other.0, &game);
+        assert!(matches!(check_working_baseline(&game, STEM, false),
+            Baseline::Refuse(why) if why.contains("are not the files Steam installed for build 26430625")));
+    }
+
     #[test]
     fn damaged_game_files_are_never_the_new_copy() {
         let game = folder("damaged");

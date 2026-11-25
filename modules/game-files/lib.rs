@@ -14,4 +14,7 @@ pub mod prepared_stamp;
 // Kiln layer: the record of the working baseline, so that a start restores only the pair it made.
 #[path = "record_working_baseline.rs"]
 pub mod baseline_record;
+// Kiln layer: whether the game's asset files are the ones Steam installed, by Steam's own manifest.
+#[path = "check_steam_installed_files.rs"]
+pub mod steam_files;
 pub use request_game_file_restore::*;

@@ -75,3 +75,6 @@ path = "tests/survival_lifecycle.rs"
 [[test]]
 name = "bundled_lua"
 path = "tests/compile_bundled_mods.rs"
+
+[dev-dependencies]
+shroudforge-game-assets = { path = "../game-files", features = ["test-fixtures"] }
