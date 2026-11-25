@@ -196,6 +196,8 @@ fn a_pass_that_fails_after_a_game_update_takes_the_updated_files_as_the_new_clea
     let record = game.record();
     assert_eq!(record["status"], "failed", "{record}");
     assert!(record.get("recoveryError").is_none(), "{record}");
+    // Review (0.2.0-dev.31.13): the record says the game's files were kept, not put back (Kiln's launcher words it so)
+    assert_eq!(record["recovery"], "kept", "{record}");
     // The next start with a working configuration applies over the new pair.
     set_toggle_key(&game, "debugConsole", serde_json::json!("SDL:67"));
     run_startup(&game.0).unwrap();
@@ -273,4 +275,44 @@ fn a_hosted_start_after_a_game_update_with_legacy_toggle_keys_applies() {
     assert_eq!(outdated_generations(&game).len(), 1, "the old pair is kept aside");
     let log = game.log();
     assert!(log.contains("Steam's manifest of build 26430625 lists the game's files as they are"), "{log}");
+}
+
+/// Review (0.2.0-dev.31.13): the disk fills while the new clean copy is made after a game update. The pass has set the
+/// old pair aside; the copy of the header (9 MB) is done, the copy of the resource file (215 MB) fails. Neither the
+/// failed pass nor its recovery (which tries the same again) may leave a header backup without its companion: the
+/// next set-aside would move that one and remove the generation that holds the old pair.
+#[test]
+fn a_clean_copy_that_cannot_be_finished_leaves_no_half_pair_and_the_old_pair_stays_aside() {
+    let game = Game::new("disk-full");
+    game.package("alpha", "return {}", &[]);
+    run_startup(&game.0).unwrap();
+    let old_pair = (read(&game, "enshrouded.kfc.bak"), read(&game, "enshrouded.kfc_resources.bak"));
+    let update = game.0.join("steam-update");
+    archive(&update, b"content of the updated game");
+    install(&update, &game.0);
+    let (header, resources) = (read(&game, "enshrouded.kfc"), read(&game, "enshrouded.kfc_resources"));
+    // what a full disk does to the copy of the resource file: it cannot be written
+    let blocked = game.0.join("enshrouded.kfc_resources.bak.partial");
+    fs::create_dir(&blocked).unwrap();
+
+    let error = run_startup(&game.0).unwrap_err().to_string();
+    assert!(error.contains("enshrouded.kfc_resources"), "{error}");
+    assert!(!game.0.join("enshrouded.kfc.bak").exists(), "no header backup without its companion after the pass");
+    assert!(recover_failed_startup(&game.0, &error), "the game starts on its own files: {}", game.log());
+    assert!(!game.0.join("enshrouded.kfc.bak").exists(), "nor after the recovery");
+    assert!(read(&game, "enshrouded.kfc") == header && read(&game, "enshrouded.kfc_resources") == resources,
+        "the game's files are untouched");
+    let kept_old = |game: &Game| outdated_generations(game).iter().any(|generation| {
+        fs::read(generation.join("enshrouded.kfc.bak")).ok().as_ref() == Some(&old_pair.0)
+            && fs::read(generation.join("enshrouded.kfc_resources.bak")).ok().as_ref() == Some(&old_pair.1)
+    });
+    assert!(kept_old(&game), "the old pair is still kept aside: {:?}", outdated_generations(&game));
+    assert_eq!(game.record()["recovery"], "kept", "{}", game.record());
+
+    // the disk has room again: the next start makes the copy and applies; the old pair is still aside
+    fs::remove_dir(&blocked).unwrap();
+    run_startup(&game.0).unwrap();
+    assert_eq!(game.record()["status"], "applied", "{}", game.record());
+    assert!(read(&game, "enshrouded.kfc.bak") == header && read(&game, "enshrouded.kfc_resources.bak") == resources);
+    assert!(kept_old(&game), "the old pair is still kept aside: {:?}", outdated_generations(&game));
 }

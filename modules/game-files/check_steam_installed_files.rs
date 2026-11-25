@@ -576,6 +576,18 @@ mod tests {
         assert_eq!(installed_files(&game, "enshrouded"), Installed::Same { build: Some("26430625".into()) });
     }
 
+    /// Review (0.2.0-dev.31.13): a corrupt or hostile appmanifest nested without end (it stays below the 1 MiB that is
+    /// read) is not read, and does not overflow the stack of the game's start.
+    #[test]
+    fn an_appmanifest_nested_without_end_tells_nothing() {
+        let (library, game) = library(&FILES);
+        install_steam_records(&library.0.join("steamapps"), "26430625", &FILES);
+        let deep = format!("\"AppState\"\n{}", "{\"a\"".repeat(200_000));
+        assert!(deep.len() < 1 << 20);
+        fs::write(library.0.join("steamapps/appmanifest_1203620.acf"), deep).unwrap();
+        assert!(matches!(installed_files(&game, "enshrouded"), Installed::Unknown(why) if why.contains("cannot be read")));
+    }
+
     #[test]
     fn valves_key_values_read_as_steam_writes_them() {
         let table = parse_vdf("\"AppState\"\n{\n\t\"buildid\"\t\t\"1\"\n\t// a note\n\t\"x\" { \"y\" \"a \\\"b\\\"\" }\n}\n").unwrap();

@@ -226,6 +226,8 @@ fn a_second_failure_starts_without_the_pass_and_records_both_errors() {
         ),
         "{recovered}"
     );
+    // Review (0.2.0-dev.31.13): and it says that the pair went back (Kiln's launcher words it so)
+    assert_eq!(recovered["recovery"], "restored", "{recovered}");
     // and a recovery for another error (a panic) does not take them over
     assert!(recover_failed_startup(
         &game.0,

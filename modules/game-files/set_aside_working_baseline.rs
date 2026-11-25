@@ -262,6 +262,36 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    /// Review (0.2.0-dev.31.13): a header backup without its companion (what an unfinished copy of an earlier runtime
+    /// leaves, or another program) is set aside too, and never takes the place of a kept generation that holds a
+    /// whole pair.
+    #[test]
+    fn a_header_backup_without_its_companion_never_removes_a_kept_whole_pair() {
+        let root = fixture(&[
+            ("enshrouded.kfc.bak", "header 1"),
+            ("enshrouded.kfc_resources.bak", "resources 1"),
+        ]);
+        let whole = set_aside(&root, "enshrouded").unwrap();
+        fs::write(root.join("enshrouded.kfc.bak"), "a header of its own").unwrap();
+        let half = set_aside(&root, "enshrouded").unwrap();
+        assert_ne!(whole, half);
+        assert_eq!(generations(&root, "enshrouded"), { let mut both = vec![whole.clone(), half.clone()]; both.sort(); both });
+        assert_eq!(
+            files(&whole),
+            list(&[("enshrouded.kfc.bak", "header 1"), ("enshrouded.kfc_resources.bak", "resources 1")])
+        );
+        // another half: it replaces the earlier half, and the whole pair stays (two generations at most)
+        fs::write(root.join("enshrouded.kfc.bak"), "another header of its own, longer").unwrap();
+        let other = set_aside(&root, "enshrouded").unwrap();
+        assert_eq!(generations(&root, "enshrouded"), { let mut both = vec![whole.clone(), other.clone()]; both.sort(); both });
+        // the next whole pair replaces them all, as before
+        fs::write(root.join("enshrouded.kfc.bak"), "header 2").unwrap();
+        fs::write(root.join("enshrouded.kfc_resources.bak"), "resources 2").unwrap();
+        let second = set_aside(&root, "enshrouded").unwrap();
+        assert_eq!(generations(&root, "enshrouded"), vec![second]);
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn an_interrupted_move_continues_in_the_same_folder() {
         let root = fixture(&[
