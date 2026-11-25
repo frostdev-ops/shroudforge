@@ -459,7 +459,7 @@ pub mod fixture {
         }
         let mut metadata = Vec::new();
         int(&mut metadata, 1, 1_203_621);
-        int(&mut metadata, 2, 7_226_436_020_230_696_061);
+        int(&mut metadata, 2, 1_000_000_000_000_000_001);
         int(&mut metadata, 4, u64::from(encrypted));
         let mut out = Vec::new();
         for (magic, body) in [(PAYLOAD, payload), (METADATA, metadata), (SIGNATURE, Vec::new())] {
@@ -472,7 +472,9 @@ pub mod fixture {
     }
 
     /// Steam's record of the client in the library whose `steamapps` folder is `steamapps`, at build `build`, and its
-    /// depot manifest listing the game folder's files `listed` (name, bytes).
+    /// depot manifest listing the game folder's files `listed` (name, bytes). The manifest ids are made up: on Windows
+    /// the reader also looks in the depotcache of the Steam installation the registry names, which on a player's PC
+    /// holds the real ones.
     pub fn install_steam_records(steamapps: &Path, build: &str, listed: &[(&str, &[u8])]) {
         fs::create_dir_all(steamapps).unwrap();
         fs::write(
@@ -480,15 +482,15 @@ pub mod fixture {
             format!(
                 "\"AppState\"\n{{\n\t\"appid\"\t\t\"1203620\"\n\t\"StateFlags\"\t\t\"4\"\n\t\"installdir\"\t\t\"Enshrouded\"\n\t\
                  \"buildid\"\t\t\"{build}\"\n\t\"InstalledDepots\"\n\t{{\n\t\t\"1203621\"\n\t\t{{\n\t\t\t\"manifest\"\t\t\
-                 \"7226436020230696061\"\n\t\t\t\"size\"\t\t\"51829059560\"\n\t\t}}\n\t\t\"4951850\"\n\t\t{{\n\t\t\t\
-                 \"manifest\"\t\t\"6070696831490683402\"\n\t\t\t\"dlcappid\"\t\t\"4951850\"\n\t\t}}\n\t}}\n\t\"UserConfig\"\n\t{{\n\t\t\
+                 \"1000000000000000001\"\n\t\t\t\"size\"\t\t\"51829059560\"\n\t\t}}\n\t\t\"4951850\"\n\t\t{{\n\t\t\t\
+                 \"manifest\"\t\t\"1000000000000000002\"\n\t\t\t\"dlcappid\"\t\t\"4951850\"\n\t\t}}\n\t}}\n\t\"UserConfig\"\n\t{{\n\t\t\
                  \"language\"\t\t\"english\"\n\t}}\n}}\n"
             ),
         )
         .unwrap();
         let cache = steamapps.parent().unwrap().join("depotcache");
         fs::create_dir_all(&cache).unwrap();
-        fs::write(cache.join("1203621_7226436020230696061.manifest"), manifest(listed, false)).unwrap();
+        fs::write(cache.join("1203621_1000000000000000001.manifest"), manifest(listed, false)).unwrap();
     }
 }
 
@@ -556,7 +558,7 @@ mod tests {
         // the server's records are another app's
         assert!(matches!(installed_files(&game, "enshrouded_server"), Installed::Unknown(_)));
         // a manifest without the files, or with encrypted names, proves nothing
-        let cache = library.0.join("depotcache/1203621_7226436020230696061.manifest");
+        let cache = library.0.join("depotcache/1203621_1000000000000000001.manifest");
         fs::write(&cache, manifest(&FILES[..1], false)).unwrap();
         assert!(matches!(installed_files(&game, "enshrouded"), Installed::Unknown(why) if why.contains("no installed depot lists")));
         fs::write(&cache, manifest(&FILES, true)).unwrap();
@@ -564,7 +566,7 @@ mod tests {
         fs::write(&cache, &manifest(&FILES, false)[..40]).unwrap();
         assert!(matches!(installed_files(&game, "enshrouded"), Installed::Unknown(why) if why.contains("cut off")));
         fs::remove_file(&cache).unwrap();
-        assert!(matches!(installed_files(&game, "enshrouded"), Installed::Unknown(why) if why.contains("no 1203621_7226436020230696061.manifest")));
+        assert!(matches!(installed_files(&game, "enshrouded"), Installed::Unknown(why) if why.contains("no 1203621_1000000000000000001.manifest")));
     }
 
     #[test]
