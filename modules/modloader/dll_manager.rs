@@ -457,7 +457,9 @@ fn inspect_packages(root: &Path) -> (Vec<DllCandidate>, PackagePlan) {
         let mut load_entries = Vec::new();
         let active = selection_active
             && manifest_state != "invalid"
-            && manifest.is_none_or(|manifest| manifest.enabled);
+            && manifest.is_none_or(|manifest| manifest.enabled)
+            // Kiln layer: a folder without mod.json that the host has off for this start (kiln_host_skip)
+            && !(mod_id.is_none() && crate::kiln_host_skip::is_skipped(&directory));
         let effective_target = match target {
             "client" if load_target.applies_to(false) => Some(DllProfileTarget::Client),
             "server" if load_target.applies_to(true) => Some(DllProfileTarget::Server),

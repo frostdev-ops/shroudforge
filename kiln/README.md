@@ -227,6 +227,27 @@ again. Log lines (category `startup-assets`, level W; Kiln copies them into kiln
 (`kiln_retry_tests.rs` runs whole passes on a small archive pair with made-up packages; `name_failing_mod.rs` raises
 I/O errors through a real Lua call).
 
+## Packages the host has off (0.2.0-dev.31.12)
+
+Kiln hosts this runtime for the player's mod profile. A package folder the player put into the mods folder himself is
+his: Kiln never writes into it, switches it or moves it. So its own switch (`enabled` in its `extended.mod.json`) could
+be on while the profile has the mod off, and ShroudForge ran it (a player's report under Kiln 0.2.0-dev.31.9).
+The host can now name such packages before the startup pass:
+
+```
+shroudforge_host_skip_packages(const uint16_t* ids)   // mod.json ids (or folder names), one per line; kiln/abi/host_skip.h
+```
+
+Every manifest read in this process then has them switched off (`modules/modloader/kiln_host_skip.rs`, checked in
+`read_manifest`): the startup asset pass, the DLL Manager's plan and the live runtime leave them out, and nothing on
+disk changes. A package folder without mod.json (a DLL the DLL Manager loads by its `native-plugin.ini` or a
+compatibility profile) is named by its folder name, and the DLL Manager plans none of its DLLs. The call is additive, refuses an invalid id as a whole, and returns false once
+`shroudforge_prepare_startup` has begun, which fixes the list and logs one `[host-skip]` info line per package. A host
+that never calls it, such as ShroudForge's own bootstrap, gets the behaviour of upstream unchanged. `kiln/build.sh`
+fails when the DLL lacks the export; `kiln/check-contract.py` compares the definition with the header. Tests:
+`cargo test -p shroudforge-package kiln_host_skip` (the manifest, the plan, the DLL plan, the sealed list) and
+`cargo test -p shroudforge-modloader --lib kiln_host_skip` (the export).
+
 ## Merging upstream
 
 ```

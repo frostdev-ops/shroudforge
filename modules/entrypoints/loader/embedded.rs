@@ -8,6 +8,9 @@ mod tests;
 // Kiln layer: tests of the paths only a host-bundled runtime takes.
 #[cfg(test)]
 mod kiln_tests;
+// Kiln layer: the host's skip list (kiln/abi/host_skip.h)
+#[cfg(test)]
+mod kiln_host_skip_tests;
 
 use shroudforge_api::{IngameRuntime, ShroudForgeApi};
 use std::any::Any;
@@ -282,6 +285,32 @@ fn prepare_native_dlls_before_game_entry(game: &Path) -> bool {
     }
 }
 
+/// Kiln layer (kiln/abi/host_skip.h): the host names packages (mod.json ids, one per line, UTF-16, NUL-terminated)
+/// that are off for this start. Each manifest read in this process then has them switched off; their files are not
+/// changed. Additive. False, and nothing taken, for an invalid list or once `shroudforge_prepare_startup` has begun.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn shroudforge_host_skip_packages(ids: *const u16) -> bool {
+    std::panic::catch_unwind(|| {
+        if ids.is_null() {
+            return false;
+        }
+        let mut length = 0usize;
+        unsafe {
+            while length < 65536 && *ids.add(length) != 0 {
+                length += 1;
+            }
+        }
+        if length == 0 || length == 65536 {
+            return false;
+        }
+        let Ok(text) = String::from_utf16(unsafe { std::slice::from_raw_parts(ids, length) }) else {
+            return false;
+        };
+        shroudforge_package::kiln_host_skip::HOST_SKIP.add(text.split('\n'))
+    })
+    .unwrap_or(false)
+}
+
 /// Restore the verified vanilla asset pair without starting the mod runtime.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn shroudforge_prepare_vanilla(game: *const u16) -> bool {
@@ -341,6 +370,11 @@ pub unsafe extern "C" fn shroudforge_prepare_startup(game: *const u16) -> bool {
             return false;
         };
         let _ = shroudforge_logging::initialize(&game, false);
+        // Kiln layer: the host's list is fixed from here on (kiln/abi/host_skip.h)
+        for id in shroudforge_package::kiln_host_skip::HOST_SKIP.seal() {
+            let _ = shroudforge_logging::append(&game, 'I', "host-skip", &format!(
+                "{id}: off in the host's profile, so it does not run this start; its files are not changed"));
+        }
         let started = std::time::Instant::now();
         let migrations_ready = match run_post_install_migrations(&game) {
             Ok(()) => true,

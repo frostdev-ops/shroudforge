@@ -24,6 +24,10 @@ pub fn read_manifest(root: &Path, fs: &mut FileSystem) -> Result<ModManifest, St
     };
     apply_manifest_profile(root, fs, &mut value, &mut extended);
     let mut manifest = parse_manifest_with_extension(root, value, extended)?;
+    // Kiln layer: off for this start at the host's request; the package's own switch stays as it is on disk
+    if crate::kiln_host_skip::is_skipped(&manifest.id) {
+        manifest.enabled = false;
+    }
     let mut source = String::new();
     collect_lua_sources(fs, camino::Utf8Path::new("src"), &mut source)?;
     infer_api_contract(&mut manifest, &source);

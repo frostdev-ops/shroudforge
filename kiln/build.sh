@@ -60,7 +60,7 @@ exports=$(llvm-readobj --coff-exports "$dll")
 for sym in shroudforge_prepare_startup shroudforge_create shroudforge_update shroudforge_destroy \
     shroudforge_input_host_version shroudforge_input_host_begin shroudforge_input_host_raw_key \
     shroudforge_input_host_window_key shroudforge_input_host_mouse_button shroudforge_input_host_reset \
-    shroudforge_input_host_end; do
+    shroudforge_input_host_end shroudforge_host_skip_packages; do
   grep -qx "  Name: $sym" <<<"$exports" || { echo "shroudforge-runtime.dll does not export $sym" >&2; exit 1; }
 done
 

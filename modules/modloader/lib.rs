@@ -24,6 +24,8 @@ mod find_installed_mods;
 // Kiln layer
 #[cfg(test)]
 mod kiln_manifest_tests;
+// Kiln layer: packages the host has off for this start (kiln/abi/host_skip.h)
+pub mod kiln_host_skip;
 mod validate_mod_manifest;
 mod validate_setting_presets;
 pub use validate_mod_manifest::validate_manifest;

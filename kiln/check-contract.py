@@ -40,3 +40,11 @@ for symbol, args, result, c_decl in [
 version = re.search(r'const INPUT_HOST_VERSION: u32 = (\d+);', feed)
 if not version or f'#define SHROUDFORGE_INPUT_HOST_VERSION {version.group(1)}u' not in header:
     raise SystemExit('host key feed version differs between host_input.rs and kiln/abi/input_host.h')
+
+# The host's skip list (kiln/abi/host_skip.h): the Rust definition and the C declaration must agree.
+skip_header = (root / 'kiln/abi/host_skip.h').read_text()
+skip_pattern = re.escape('#[unsafe(no_mangle)]') + r'\s*pub unsafe extern "C" fn shroudforge_host_skip_packages\(\s*ids:\s*\*const u16\s*\)\s*->\s*bool\s*\{'
+if not re.search(skip_pattern, src):
+    raise SystemExit('host skip list signature changed: shroudforge_host_skip_packages')
+if 'bool shroudforge_host_skip_packages(const uint16_t* ids);' not in skip_header:
+    raise SystemExit('kiln/abi/host_skip.h does not declare: shroudforge_host_skip_packages')
