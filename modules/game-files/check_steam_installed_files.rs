@@ -57,6 +57,27 @@ pub struct Listed {
 
 /// What Steam's manifests say about the asset files of `stem` in the game folder `root`.
 pub fn installed_files(root: &Path, stem: &str) -> Installed {
+    let files = [root.join(format!("{stem}.kfc")), root.join(format!("{stem}.kfc_resources"))];
+    compare(root, stem, &files, [None, None])
+}
+
+/// Kiln layer (stale game data, 0.2.0-dev.31.next): what Steam's manifests say about the working baseline of `stem`,
+/// `<stem>.kfc.bak` and `<stem>.kfc_resources.bak`: whether they are byte for byte the `<stem>.kfc` and
+/// `<stem>.kfc_resources` Steam installed for the installed build. A clean copy taken from game files that already
+/// carried a mod's changes (a loader's first backup over files another loader had patched) is a whole archive whose
+/// live files are built over it, so nothing but Steam's word tells it from the game's own (HadToRegister, 2026-11-26:
+/// Auto Loot Plus's auto-smash program in the clean copy, weeks after the mod was removed).
+///
+/// `known`: the size and SHA-1 of a backup as its record keeps them, when the record was just found to describe the
+/// backup byte for byte (`baseline_record::check`): that backup is not read again.
+pub fn installed_backups(root: &Path, stem: &str, known: [Option<Listed>; 2]) -> Installed {
+    let files = [root.join(format!("{stem}.kfc.bak")), root.join(format!("{stem}.kfc_resources.bak"))];
+    compare(root, stem, &files, known)
+}
+
+/// Compares `files` (in the place of `<stem>.kfc` and `<stem>.kfc_resources`) with what Steam's manifests of the
+/// installed build list for those two names.
+fn compare(root: &Path, stem: &str, files: &[PathBuf; 2], known: [Option<Listed>; 2]) -> Installed {
     let app = if stem == "enshrouded_server" { "2278520" } else { "1203620" };
     let Some((steamapps, acf)) = app_manifest(root, app) else {
         return Installed::Unknown(format!("there is no Steam manifest appmanifest_{app}.acf for the game folder"));
@@ -100,8 +121,9 @@ pub fn installed_files(root: &Path, stem: &str) -> Installed {
         if listed.len() != names.len() {
             continue;
         }
-        for (name, listed) in names.iter().zip(&listed) {
-            match differs(&root.join(name), listed) {
+        for ((path, listed), known) in files.iter().zip(&listed).zip(&known) {
+            let name = path.file_name().map_or_else(|| path.display().to_string(), |name| name.to_string_lossy().into_owned());
+            match differs(path, listed, known.as_ref()) {
                 Ok(None) => {}
                 Ok(Some(what)) => return Installed::Differs { build, what: format!("{name} {what}") },
                 Err(error) => return Installed::Unknown(format!("{name} cannot be read: {error}")),
@@ -186,8 +208,9 @@ fn steam_install_path() -> Option<PathBuf> {
     (!path.as_os_str().is_empty()).then_some(path)
 }
 
-/// The file at `path` is not the listed one: how (size first, then SHA-1), or None when it is.
-fn differs(path: &Path, listed: &Listed) -> std::io::Result<Option<String>> {
+/// The file at `path` is not the listed one: how (size first, then SHA-1), or None when it is. `known`: the file's size
+/// and SHA-1 as a record that was just checked against its bytes keeps them; the file is then not read.
+fn differs(path: &Path, listed: &Listed, known: Option<&Listed>) -> std::io::Result<Option<String>> {
     let metadata = fs::symlink_metadata(path)?;
     if !metadata.is_file() {
         return Ok(Some("is not a regular file".into()));
@@ -195,6 +218,15 @@ fn differs(path: &Path, listed: &Listed) -> std::io::Result<Option<String>> {
     if metadata.len() != listed.size {
         return Ok(Some(format!("has {} bytes, Steam's manifest lists {}", metadata.len(), listed.size)));
     }
+    let digest = match known {
+        Some(known) if known.size == metadata.len() => known.sha1,
+        _ => sha1_file(path)?,
+    };
+    Ok((digest != listed.sha1).then(|| "has other bytes than Steam's manifest lists (SHA-1)".into()))
+}
+
+/// The SHA-1 of the whole file at `path` (what Steam's manifests list).
+pub fn sha1_file(path: &Path) -> std::io::Result<[u8; 20]> {
     let mut file = fs::File::open(path)?;
     let mut hasher = Sha1::new();
     let mut buffer = vec![0u8; 1 << 20];
@@ -205,8 +237,7 @@ fn differs(path: &Path, listed: &Listed) -> std::io::Result<Option<String>> {
         }
         hasher.update(&buffer[..read]);
     }
-    let digest = hasher.finalize();
-    Ok((digest.as_slice() != listed.sha1).then(|| "has other bytes than Steam's manifest lists (SHA-1)".into()))
+    Ok(hasher.finalize().into())
 }
 
 /// The entries of `names` in the depot manifest at `path`, in that order (only those found).
@@ -553,6 +584,35 @@ mod tests {
         fs::write(game.join("enshrouded.kfc"), FILES[1].1).unwrap();
         assert!(matches!(installed_files(&game, "enshrouded"),
             Installed::Differs { what, .. } if what == "enshrouded.kfc_resources has 37 bytes, Steam's manifest lists 29"));
+    }
+
+    /// Stale game data (0.2.0-dev.31.next): the working backups are compared with what Steam installed under the game
+    /// files' names; a size and SHA-1 a checked record keeps of a backup stand for its bytes.
+    #[test]
+    fn backups_are_compared_with_the_files_steam_installed() {
+        let (library, game) = library(&FILES);
+        install_steam_records(&library.0.join("steamapps"), "26430625", &FILES);
+        assert!(matches!(installed_backups(&game, "enshrouded", [None, None]), Installed::Unknown(why) if why.contains("cannot be read")));
+        fs::write(game.join("enshrouded.kfc.bak"), FILES[1].1).unwrap();
+        fs::write(game.join("enshrouded.kfc_resources.bak"), FILES[2].1).unwrap();
+        assert_eq!(installed_backups(&game, "enshrouded", [None, None]), Installed::Same { build: Some("26430625".into()) });
+        // a copy of game files a mod had changed (the same length: only the hash tells)
+        fs::write(game.join("enshrouded.kfc.bak"), b"the header Steam installeD").unwrap();
+        assert_eq!(
+            installed_backups(&game, "enshrouded", [None, None]),
+            Installed::Differs {
+                build: Some("26430625".into()),
+                what: "enshrouded.kfc.bak has other bytes than Steam's manifest lists (SHA-1)".into()
+            }
+        );
+        // the live files are not what is compared
+        assert_eq!(installed_files(&game, "enshrouded"), Installed::Same { build: Some("26430625".into()) });
+        // a record's SHA-1 of a backup of that size is taken for its bytes (the caller checked the record first)
+        let steams = Listed { size: FILES[1].1.len() as u64, sha1: Sha1::digest(FILES[1].1).into() };
+        assert_eq!(installed_backups(&game, "enshrouded", [Some(steams.clone()), None]),
+            Installed::Same { build: Some("26430625".into()) });
+        let other = Listed { size: steams.size, sha1: [1; 20] };
+        assert!(matches!(installed_backups(&game, "enshrouded", [Some(other), None]), Installed::Differs { .. }));
     }
 
     #[test]

@@ -50,10 +50,17 @@ pub enum Recorded {
 
 /// Writes the record of the two backups as they are now. Both must be regular files. Flushed and renamed like
 /// ShroudForge's state files.
+///
+/// Stale game data (0.2.0-dev.31.next): each backup's SHA-1 too, the hash Steam's manifests list, so that a later start
+/// compares the pair with Steam's manifest of the installed build without reading it again (`sha1s`).
 pub fn record(root: &Path, stem: &str) -> Result<(), String> {
     let mut files = serde_json::Map::new();
     for (key, name) in backups(stem) {
-        files.insert(key.into(), crate::prepared_stamp::with_hash(&root.join(name), None)?);
+        let path = root.join(name);
+        let mut entry = crate::prepared_stamp::with_hash(&path, None)?;
+        let sha1 = crate::steam_files::sha1_file(&path).map_err(|error| format!("{}: {error}", path.display()))?;
+        entry["sha1"] = json!(hex(&sha1));
+        files.insert(key.into(), entry);
     }
     crate::config::write_json(
         &record_path(root, stem),
@@ -73,6 +80,29 @@ pub fn forget(root: &Path, stem: &str) -> Result<(), String> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(format!("{}: {error}", record_path(root, stem).display())),
     }
+}
+
+/// The size and SHA-1 the record keeps of each backup (header, resources), where it keeps them (records before
+/// 0.2.0-dev.31.next have no SHA-1). They describe the backups only once [`check`] said [`Recorded::Whole`].
+pub fn sha1s(root: &Path, stem: &str) -> [Option<crate::steam_files::Listed>; 2] {
+    let Some(record) = read(root, stem) else { return [None, None] };
+    backups(stem).map(|(key, _)| {
+        let entry = &record["files"][key];
+        let size = entry["size"].as_u64()?;
+        let text = entry["sha1"].as_str()?;
+        let mut sha1 = [0u8; 20];
+        if text.len() != 40 {
+            return None;
+        }
+        for (index, byte) in sha1.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(text.get(index * 2..index * 2 + 2)?, 16).ok()?;
+        }
+        Some(crate::steam_files::Listed { size, sha1 })
+    })
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 /// When the record was written (seconds since 1970), if there is one this runtime reads.
@@ -157,6 +187,27 @@ mod tests {
         rewrite_keeping_time(&root.join("enshrouded.kfc_resources.bak"), b"resources BACKUP");
         assert!(matches!(check(root, "enshrouded").unwrap(),
             Recorded::Broken(why) if why.contains("enshrouded.kfc_resources.bak changed since it was made")));
+    }
+
+    /// Stale game data (0.2.0-dev.31.next): the record keeps each backup's SHA-1 (what Steam's manifests list); a record
+    /// made before it keeps none, and one with a damaged hash gives none.
+    #[test]
+    fn the_record_keeps_each_backups_sha1() {
+        let game = folder();
+        let root = &game.0;
+        assert_eq!(sha1s(root, "enshrouded"), [None, None]);
+        record(root, "enshrouded").unwrap();
+        let [header, resources] = sha1s(root, "enshrouded");
+        let header = header.unwrap();
+        assert_eq!(header.size, 13);
+        assert_eq!(header.sha1, crate::steam_files::sha1_file(&root.join("enshrouded.kfc.bak")).unwrap());
+        assert_eq!(resources.unwrap().sha1, crate::steam_files::sha1_file(&root.join("enshrouded.kfc_resources.bak")).unwrap());
+        let mut value: Value = serde_json::from_slice(&fs::read(record_path(root, "enshrouded")).unwrap()).unwrap();
+        value["files"]["header"].as_object_mut().unwrap().remove("sha1");
+        value["files"]["resources"]["sha1"] = json!("not a hash");
+        fs::write(record_path(root, "enshrouded"), value.to_string()).unwrap();
+        assert_eq!(sha1s(root, "enshrouded"), [None, None]);
+        assert_eq!(check(root, "enshrouded").unwrap(), Recorded::Whole, "an older record still describes its pair");
     }
 
     #[test]

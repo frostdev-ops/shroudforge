@@ -32,6 +32,7 @@
 //!   Live, World Editor, native DLLs, diagnostics). Scheme 1 listed the whole export folder, so any
 //!   such runtime write ran the whole pass again at the next start (an 11-minute start with the
 //!   Beastmaster packs, player report 2026-11-25).
+//! - scheme 3 (0.2.0-dev.31.next): the same, from a pass that proved its clean copy (see `SCHEME`).
 //!
 //! Anything that cannot be read, a record of another scheme, or any difference means "apply".
 
@@ -46,9 +47,13 @@ use std::{
     time::UNIX_EPOCH,
 };
 
-const SCHEME: &str = "kiln-sf-prepared 2";
+/// Scheme 3 (stale game data, 0.2.0-dev.31.next): written only by passes whose clean copy was asked about Steam's
+/// manifest before it went back (`mod-runtime/startup/verify_working_baseline.rs`). A pass of scheme 2 (0.2.0-dev.31.12
+/// to 31.15) restored any whole pair the game's files were built from, also one that carried an uninstalled mod's
+/// changes; its record does not let a start skip that check, so the first start of this runtime runs its pass once.
+const SCHEME: &str = "kiln-sf-prepared 3";
 /// Schemes whose `files.kfc` is that of this one: `left_live_header` still reads them.
-const LIVE_HEADER_SCHEMES: [&str; 2] = [SCHEME, "kiln-sf-prepared 1"];
+const LIVE_HEADER_SCHEMES: [&str; 3] = [SCHEME, "kiln-sf-prepared 2", "kiln-sf-prepared 1"];
 /// The part of `<stem>.kfc_resources` hashed at each end.
 const EDGE: u64 = 1 << 20;
 /// A pass that used more paths of the export folder than this is not recorded: the next start

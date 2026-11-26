@@ -177,7 +177,7 @@ fn a_record_of_the_older_scheme_runs_one_pass_then_reuses_it() {
     run_startup(&game.0).unwrap();
     assert_eq!(passes(&game), "2");
     let new: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-    assert_eq!(new["scheme"], "kiln-sf-prepared 2");
+    assert_eq!(new["scheme"], "kiln-sf-prepared 3");
     for session in 1..=2 {
         play_a_session(&game, session);
         run_startup(&game.0).unwrap();

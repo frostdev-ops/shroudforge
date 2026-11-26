@@ -24,6 +24,18 @@
 //! (`recover_failed_startup_assets.rs`). When the game's files were
 //! built from a pair that is not whole, or are what this runtime's last pass wrote, neither the pair nor the game's
 //! files are a clean copy: the start refuses and says to verify the game files.
+//!
+//! A whole pair that the game's files were built from is not yet the game's own (stale game data, 0.2.0-dev.31.next).
+//! A loader's first copy of game files that another loader had already patched is such a pair: HadToRegister's
+//! (2026-11-26) was made on 2026-11-13 from game files that carried Auto Loot Plus's auto-smash program, recorded on
+//! 11-23 by the first start that kept records, and went back before every pass after the mod was removed, so props
+//! broke on their own within 15 m for weeks, until Steam's file check. Before it goes back, Steam's manifest of the
+//! installed build is asked about the pair itself (`steam_files::installed_backups`; the SHA-1s its record keeps stand
+//! for its bytes once the record is checked). A pair Steam lists byte for byte goes back. A pair Steam lists otherwise
+//! is not the game's own: when the game's files are Steam's, it is set aside and a new one is made from them;
+//! otherwise the start refuses, in plain words, with what the player does ([`STALE_WORDS`]). Where no manifest is there
+//! (a SteamCMD server, a folder outside a Steam library) the pair goes back as before, unless it holds a program a known
+//! mod creates ([`KNOWN_LEFTOVERS`]): then it is refused too. Nothing here writes.
 
 use kfc::container::KFCFile;
 use shroudforge_game_assets::baseline_record::{self, Recorded};
@@ -34,8 +46,8 @@ use std::{fs, path::Path, time::SystemTime};
 pub enum Baseline {
     /// There is no header backup: the pass makes the pair from the game's files, as ShroudForge's first pass does.
     Missing,
-    /// The pair goes back over the game's files. `recorded`: the record already describes it (otherwise the pair is
-    /// recorded once it is restored).
+    /// The pair goes back over the game's files. `recorded`: the record already describes it, with the SHA-1s Steam's
+    /// manifests are compared with (otherwise the pair is recorded once it is restored).
     Restore { recorded: bool },
     /// The pair is not the source of the game's files, which are a game archive of their own: set the pair aside and
     /// make a new one from them (why, in words).
@@ -122,14 +134,14 @@ pub fn check_working_baseline(
     let Some(live) = live else {
         // The game's header does not read: only the pair can mend it.
         return match broken {
-            None => Baseline::Restore { recorded: recorded == Recorded::Whole },
+            None => proven(game, &resources, None, &base, stem, live_is_last_output, &recorded),
             Some(why) => Baseline::Refuse(refusal(stem, &why, "cannot be read")),
         };
     };
     let derived = built_over(&live, &base);
     let same = derived && built_over(&base, &live) && same_bytes(&kfc, &bak);
     match broken {
-        None if derived => return Baseline::Restore { recorded: recorded == Recorded::Whole },
+        None if derived => return proven(game, &resources, Some(&live), &base, stem, live_is_last_output, &recorded),
         Some(why) if derived && !same => {
             return Baseline::Refuse(refusal(stem, &why, "carry mods built from it"));
         }
@@ -184,6 +196,105 @@ fn replacement(game: &Path, resources: &Path, live: &KFCFile, stem: &str, live_i
         // archive's own structure decides, as it did before Steam's word was read.
         Installed::Unknown(_) => Baseline::Retake(why),
     }
+}
+
+/// The plain words a refusal of a clean copy that is not the game's own begins with, for the player (Kiln's launcher
+/// looks for them: kiln-manage `sf_startup.rs`).
+pub const STALE_WORDS: &str = "still contain changes from a mod that isn't installed";
+
+/// Programs that known mods create, and that are never in the game's own data: when a clean copy holds one, the copy
+/// is not the game's own even where no Steam manifest is there to say so, and the refusal names it.
+pub const KNOWN_LEFTOVERS: [(&str, &str); 2] = [
+    (
+        "a5c0de5a-1e00-4d0d-9a11-0000000a5000",
+        "Auto Loot Plus's auto-smash program (it breaks props within 15 m of the player every second)",
+    ),
+    ("a5c0de5a-1e00-4d0d-9a11-0000000a5002", "Auto Loot Plus's auto-smash aura"),
+];
+
+/// The first known leftover the archive `header` lists, in words with its resource id.
+fn leftover(header: &KFCFile) -> Option<String> {
+    KNOWN_LEFTOVERS.iter().find_map(|(guid, what)| {
+        let wanted = kfc::guid::Guid::parse(guid)?;
+        header.resources().keys().iter().any(|id| id.guid() == wanted).then(|| format!("{what}, resource {guid}"))
+    })
+}
+
+/// A whole pair that would go back over the game's files, when it is the game's own (see the module's text): Steam's
+/// manifest of the installed build lists it byte for byte, or no manifest is there and it holds no known leftover.
+/// Otherwise the game's files are the new clean copy when Steam's manifest lists them as they are (and no pass of this
+/// runtime wrote them); when they are not, the start refuses.
+fn proven(
+    game: &Path,
+    resources: &Path,
+    live: Option<&KFCFile>,
+    base: &KFCFile,
+    stem: &str,
+    live_is_last_output: bool,
+    recorded: &Recorded,
+) -> Baseline {
+    use shroudforge_game_assets::steam_files::{Installed, installed_backups, installed_files};
+    let whole = *recorded == Recorded::Whole;
+    // the record was just checked against the backups' bytes: the SHA-1s it keeps stand for them
+    let known = if whole { baseline_record::sha1s(game, stem) } else { [None, None] };
+    let has_sha1 = known.iter().all(Option::is_some);
+    let why = match installed_backups(game, stem, known) {
+        Installed::Same { .. } => None,
+        Installed::Differs { build, what } => Some(format!(
+            "{what} for {}{}",
+            Installed::build_words(&build),
+            leftover(base).map(|found| format!("; it holds {found}")).unwrap_or_default()
+        )),
+        Installed::Unknown(_) => leftover(base).map(|found| format!("it holds {found}")),
+    };
+    let Some(why) = why else {
+        return Baseline::Restore { recorded: whole && has_sha1 };
+    };
+    let fits = live.is_some_and(|live| length(resources).is_some_and(|have| chunks_end(live) <= have));
+    let live_words = match (live, live_is_last_output) {
+        (None, _) => "cannot be read".to_string(),
+        (Some(_), true) => "are what ShroudForge's last start built over it".to_string(),
+        (Some(_), false) if !fits => format!("list more resource data than their {stem}.kfc_resources has"),
+        (Some(_), false) => match installed_files(game, stem) {
+            Installed::Same { build } => {
+                return Baseline::Retake(format!(
+                    "it is not the game's own data ({why}); Steam's manifest of {} lists the game's files as they \
+                     are: they are the ones Steam installed",
+                    Installed::build_words(&build)
+                ));
+            }
+            Installed::Differs { build, what } => {
+                format!("are not the files Steam installed for {} either ({what})", Installed::build_words(&build))
+            }
+            Installed::Unknown(_) => "cannot be shown to be the game's own either (no Steam manifest)".to_string(),
+        },
+    };
+    let also = live
+        .and_then(leftover)
+        .map(|found| format!("; the game's current files hold {found}"))
+        .unwrap_or_default();
+    Baseline::Refuse(stale_refusal(stem, &why, &format!("{live_words}{also}")))
+}
+
+/// The refusal of a clean copy that is not the game's own, beside game files that are not either: the plain words and
+/// what the player does first (Kiln's launcher cuts long words), then why.
+fn stale_refusal(stem: &str, why: &str, live: &str) -> String {
+    let what = if stem == "enshrouded_server" {
+        format!(
+            "Your server files {STALE_WORDS}. Update the server files with SteamCMD's validate (app_update 2278520 \
+             validate), then start again."
+        )
+    } else {
+        format!(
+            "Your game files {STALE_WORDS}. Verify the game files in Steam (Properties > Installed Files > Verify \
+             integrity), then start again."
+        )
+    };
+    format!(
+        "{what} (ShroudForge's clean copy of the game data, {stem}.kfc.bak and {stem}.kfc_resources.bak, is not the \
+         game's own: {why}; and the game's current files {live}, so no clean copy can be made from them. Nothing was \
+         changed.)"
+    )
 }
 
 /// The text of a refusal: why the pair cannot go back, what the game's files are, and what the player does.
