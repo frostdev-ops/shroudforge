@@ -76,13 +76,23 @@ pub(super) fn run_inner(
                 shroudforge_api::capture_working_baseline(game_directory, file_name)
                     .map_err(LoaderError::Pregame)?;
             }
-            shroudforge_api::Baseline::Restore { recorded: whole } => {
+            shroudforge_api::Baseline::Restore { recorded: whole, doubt } => {
                 if !shroudforge_api::restore_checked(game_utf8, file_name) {
                     return Err(LoaderError::Pregame(format!(
                         "failed to restore the clean {file_name}.kfc baseline"
                     )));
                 }
                 recorded = whole;
+                // Kiln layer (stale game data, review): Steam's manifest does not vouch for the pair, and nothing in it
+                // shows a mod's changes: the pass goes on as before, and says so (kiln.log shows this line)
+                if let Some(doubt) = doubt {
+                    let _ = shroudforge_logging::append(
+                        game_directory,
+                        'W',
+                        "startup-assets",
+                        &shroudforge_api::doubt_words(file_name, &doubt),
+                    );
+                }
             }
             shroudforge_api::Baseline::Retake(why) => {
                 crate::recycle_incompatible_game_asset_backups(game_directory, file_name)

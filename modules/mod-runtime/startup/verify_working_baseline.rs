@@ -32,10 +32,15 @@
 //! broke on their own within 15 m for weeks, until Steam's file check. Before it goes back, Steam's manifest of the
 //! installed build is asked about the pair itself (`steam_files::installed_backups`; the SHA-1s its record keeps stand
 //! for its bytes once the record is checked). A pair Steam lists byte for byte goes back. A pair Steam lists otherwise
-//! is not the game's own: when the game's files are Steam's, it is set aside and a new one is made from them;
-//! otherwise the start refuses, in plain words, with what the player does ([`STALE_WORDS`]). Where no manifest is there
-//! (a SteamCMD server, a folder outside a Steam library) the pair goes back as before, unless it holds a program a known
-//! mod creates ([`KNOWN_LEFTOVERS`]): then it is refused too. Nothing here writes.
+//! is not the installed build's own: when the game's files are Steam's, it is set aside and a new one is made from them.
+//! Otherwise the start refuses, in plain words, with what the player does ([`STALE_WORDS`]), only where the pair is
+//! proven to carry a mod's changes: it holds a program a known mod creates ([`KNOWN_LEFTOVERS`]), or its resource file
+//! is the one Steam installed with more data after it (`steam_files::extends`: an archive writer only appends there).
+//! Without such proof (review, 0.2.0-dev.31.next) the pair goes back as before and the start says why it is in doubt
+//! ([`Baseline::Restore`]'s `doubt`): Steam's appmanifest can name a build whose files are not the ones in the folder
+//! (an update it has not finished, a folder copied from another PC), and a refusal there would stop every ShroudForge
+//! mod on a guess. Where no manifest is there (a SteamCMD server, a folder outside a Steam library) only a known mod's
+//! program refuses. Nothing here writes.
 
 use kfc::container::KFCFile;
 use shroudforge_game_assets::baseline_record::{self, Recorded};
@@ -47,8 +52,10 @@ pub enum Baseline {
     /// There is no header backup: the pass makes the pair from the game's files, as ShroudForge's first pass does.
     Missing,
     /// The pair goes back over the game's files. `recorded`: the record already describes it, with the SHA-1s Steam's
-    /// manifests are compared with (otherwise the pair is recorded once it is restored).
-    Restore { recorded: bool },
+    /// manifests are compared with (otherwise the pair is recorded once it is restored). `doubt`: why Steam's manifest
+    /// of the installed build does not vouch for the pair, when nothing in it shows a mod's changes either (the start
+    /// says so and goes on as before this check).
+    Restore { recorded: bool, doubt: Option<String> },
     /// The pair is not the source of the game's files, which are a game archive of their own: set the pair aside and
     /// make a new one from them (why, in words).
     Retake(String),
@@ -220,10 +227,11 @@ fn leftover(header: &KFCFile) -> Option<String> {
     })
 }
 
-/// A whole pair that would go back over the game's files, when it is the game's own (see the module's text): Steam's
-/// manifest of the installed build lists it byte for byte, or no manifest is there and it holds no known leftover.
-/// Otherwise the game's files are the new clean copy when Steam's manifest lists them as they are (and no pass of this
-/// runtime wrote them); when they are not, the start refuses.
+/// A whole pair that would go back over the game's files (see the module's text): it goes back when Steam's manifest of
+/// the installed build lists it byte for byte, or when no manifest is there and it holds no known leftover. Otherwise
+/// the game's files are the new clean copy when Steam's manifest lists them as they are (and no pass of this runtime
+/// wrote them). When they are not, the start refuses only where the pair is proven to carry a mod's changes; without
+/// that proof the pair goes back as before, with the doubt said.
 fn proven(
     game: &Path,
     resources: &Path,
@@ -233,30 +241,46 @@ fn proven(
     live_is_last_output: bool,
     recorded: &Recorded,
 ) -> Baseline {
-    use shroudforge_game_assets::steam_files::{Installed, installed_backups, installed_files};
+    use shroudforge_game_assets::steam_files::{self, Installed, installed_backups, installed_files};
     let whole = *recorded == Recorded::Whole;
     // the record was just checked against the backups' bytes: the SHA-1s it keeps stand for them
     let known = if whole { baseline_record::sha1s(game, stem) } else { [None, None] };
-    let has_sha1 = known.iter().all(Option::is_some);
-    let why = match installed_backups(game, stem, known) {
-        Installed::Same { .. } => None,
-        Installed::Differs { build, what } => Some(format!(
-            "{what} for {}{}",
-            Installed::build_words(&build),
-            leftover(base).map(|found| format!("; it holds {found}")).unwrap_or_default()
-        )),
-        Installed::Unknown(_) => leftover(base).map(|found| format!("it holds {found}")),
-    };
-    let Some(why) = why else {
-        return Baseline::Restore { recorded: whole && has_sha1 };
+    let recorded = whole && known.iter().all(Option::is_some);
+    let held = leftover(base).map(|found| format!("it holds {found}"));
+    let (steam, proof) = match installed_backups(game, stem, known) {
+        Installed::Same { .. } => return Baseline::Restore { recorded, doubt: None },
+        Installed::Differs { build, what } => {
+            // the resource file is Steam's of the installed build with more after it: a writer appended a mod's data
+            let appended = || {
+                let (_, [_, listed]) = steam_files::listed_files(game, stem)?;
+                let resources_bak = game.join(format!("{stem}.kfc_resources.bak"));
+                steam_files::extends(&resources_bak, &listed).ok()?.then(|| {
+                    format!(
+                        "its {stem}.kfc_resources.bak is the {stem}.kfc_resources Steam installed for {} with {} bytes \
+                         more after it (a mod's resources)",
+                        Installed::build_words(&build),
+                        length(&resources_bak).unwrap_or(0).saturating_sub(listed.size)
+                    )
+                })
+            };
+            let proof = held.clone().or_else(appended);
+            (Some(format!("{what} for {}", Installed::build_words(&build))), proof)
+        }
+        Installed::Unknown(_) if held.is_none() => return Baseline::Restore { recorded, doubt: None },
+        Installed::Unknown(_) => (None, held),
     };
     let fits = live.is_some_and(|live| length(resources).is_some_and(|have| chunks_end(live) <= have));
     let live_words = match (live, live_is_last_output) {
         (None, _) => "cannot be read".to_string(),
         (Some(_), true) => "are what ShroudForge's last start built over it".to_string(),
         (Some(_), false) if !fits => format!("list more resource data than their {stem}.kfc_resources has"),
+        // without a manifest the game's files cannot be shown to be Steam's either
+        (Some(_), false) if steam.is_none() => {
+            "cannot be shown to be the game's own either (no Steam manifest)".to_string()
+        }
         (Some(_), false) => match installed_files(game, stem) {
             Installed::Same { build } => {
+                let why = [steam.as_deref(), proof.as_deref()].into_iter().flatten().collect::<Vec<_>>().join("; ");
                 return Baseline::Retake(format!(
                     "it is not the game's own data ({why}); Steam's manifest of {} lists the game's files as they \
                      are: they are the ones Steam installed",
@@ -269,11 +293,31 @@ fn proven(
             Installed::Unknown(_) => "cannot be shown to be the game's own either (no Steam manifest)".to_string(),
         },
     };
+    let Some(proof) = proof else {
+        // Steam's manifest does not vouch for the pair, and nothing in it shows a mod's changes: as before this check
+        return Baseline::Restore { recorded, doubt: steam };
+    };
+    let why = [steam.as_deref(), Some(proof.as_str())].into_iter().flatten().collect::<Vec<_>>().join("; ");
     let also = live
         .and_then(leftover)
         .map(|found| format!("; the game's current files hold {found}"))
         .unwrap_or_default();
     Baseline::Refuse(stale_refusal(stem, &why, &format!("{live_words}{also}")))
+}
+
+/// What a start says when the pair goes back with a doubt (`Baseline::Restore`'s `doubt`): why, and the one thing the
+/// player does if a mod they removed still acts in the game.
+pub fn doubt_words(stem: &str, doubt: &str) -> String {
+    let cure = if stem == "enshrouded_server" {
+        "update the server files with SteamCMD's validate (app_update 2278520 validate)"
+    } else {
+        "verify the game files in Steam (Properties > Installed Files > Verify integrity)"
+    };
+    format!(
+        "ShroudForge: Steam's manifest does not list its clean copy of the game data ({stem}.kfc.bak, \
+         {stem}.kfc_resources.bak) as the installed build's own ({doubt}), but nothing in it shows a mod's changes, so \
+         it was used as before. If a mod you removed still acts in the game, {cure}, then start again"
+    )
 }
 
 /// The refusal of a clean copy that is not the game's own, beside game files that are not either: the plain words and
@@ -438,10 +482,10 @@ mod tests {
         let game = folder("restore");
         archive(&game.0, "game 1", b"vanilla content");
         back_up(&game.0);
-        assert_eq!(check_working_baseline(&game.0, STEM, false), Baseline::Restore { recorded: false });
+        assert_eq!(check_working_baseline(&game.0, STEM, false), Baseline::Restore { recorded: false, doubt: None });
         baseline_record::record(&game.0, STEM).unwrap();
         mod_over(&game.0, b"content a mod added");
-        assert_eq!(check_working_baseline(&game.0, STEM, true), Baseline::Restore { recorded: true });
+        assert_eq!(check_working_baseline(&game.0, STEM, true), Baseline::Restore { recorded: true, doubt: None });
         fs::remove_file(game.0.join(format!("{STEM}.kfc.bak"))).unwrap();
         assert_eq!(check_working_baseline(&game.0, STEM, false), Baseline::Missing);
     }
@@ -553,7 +597,7 @@ mod tests {
         baseline_record::record(&game.0, STEM).unwrap();
         mod_over(&game.0, b"modded content");
         let header = fs::read(game.0.join(format!("{STEM}.kfc"))).unwrap();
-        assert_eq!(check_working_baseline(&game.0, STEM, true), Baseline::Restore { recorded: true });
+        assert_eq!(check_working_baseline(&game.0, STEM, true), Baseline::Restore { recorded: true, doubt: None });
         // A source becomes unavailable after validation, before the second copy (also possible with locks or I/O errors).
         let backup = game.0.join(format!("{STEM}.kfc_resources.bak"));
         fs::remove_file(&backup).unwrap();

@@ -150,7 +150,7 @@ pub use startup::manage_asset_baseline::{
 pub use startup::manage_asset_baseline::{
     capture_working_baseline, record_working_baseline, restore_checked,
 };
-pub use startup::verify_working_baseline::{Baseline, check_working_baseline};
+pub use startup::verify_working_baseline::{Baseline, check_working_baseline, doubt_words};
 pub use startup::run_startup_mods::{run, run_with_local_schema};
 // Kiln layer: block-compressed textures of a pregame pass on several threads (lua/bindings/image/kiln_encode_in_strips.rs).
 pub use env::kiln_encode_in_strips::{
