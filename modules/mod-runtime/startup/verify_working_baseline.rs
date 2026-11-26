@@ -873,6 +873,32 @@ mod tests {
         }
     }
 
+    /// Review (stale game data): a clean copy that is Steam's own, recorded by a runtime before the record kept SHA-1s
+    /// (0.2.0-dev.31.12 to 31.15), goes back on the first start and is recorded again (read once), with or without a
+    /// Steam manifest; the next start reads it no more.
+    #[test]
+    fn a_clean_copy_recorded_before_the_record_kept_sha1s_goes_back_and_is_recorded_again() {
+        let (base, game) = library("old-record");
+        archive(&game, "1287369|2026-11-04", b"content Steam installed");
+        steam_lists_the_game_files(&base, &game, "26430625");
+        back_up(&game);
+        baseline_record::record(&game, STEM).unwrap();
+        let path = baseline_record::record_path(&game, STEM);
+        let mut old: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        for key in ["header", "resources"] {
+            old["files"][key].as_object_mut().unwrap().remove("sha1");
+        }
+        fs::write(&path, old.to_string()).unwrap();
+        mod_over(&game, b"content today's mods add");
+        assert_eq!(check_working_baseline(&game, STEM, true), Baseline::Restore { recorded: false, doubt: None });
+        baseline_record::record(&game, STEM).unwrap();
+        assert_eq!(check_working_baseline(&game, STEM, true), Baseline::Restore { recorded: true, doubt: None });
+        // the same without a Steam manifest (a SteamCMD server)
+        fs::write(&path, old.to_string()).unwrap();
+        fs::remove_dir_all(base.0.join("depotcache")).unwrap();
+        assert_eq!(check_working_baseline(&game, STEM, true), Baseline::Restore { recorded: false, doubt: None });
+    }
+
     #[test]
     fn damaged_game_files_are_never_the_new_copy() {
         let game = folder("damaged");
