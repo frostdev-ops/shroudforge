@@ -357,3 +357,54 @@ fn the_hosted_toggle_key_migration_writes_once_and_leaves_what_it_cannot_convert
     let left: Vec<_> = fs::read_dir(path.parent().unwrap()).unwrap().map(|entry| entry.unwrap().file_name()).collect();
     assert!(left.iter().all(|name| !name.to_string_lossy().starts_with(".tmp")), "{left:?}");
 }
+
+/// HadToRegister, 2026-11-26: a clean copy that a loader took of game files another loader had already patched (Auto
+/// Loot Plus's auto-smash program was in them), whole and recorded, under every pass for weeks after the mod was
+/// removed. Steam's manifest of the installed build lists other bytes than the copy has: the pass refuses to build on
+/// it and says in plain words what the player does, its recovery puts nothing back, and no file is touched. After
+/// Steam's file check the next start sets the copy aside, takes a new one from Steam's files and applies.
+#[test]
+fn a_clean_copy_with_an_uninstalled_mods_changes_is_refused_until_the_game_files_are_verified() {
+    let game = Game::new("stale-copy");
+    game.package("alpha", "return {}", &[]);
+    steam_lists_the_game_files(&game, "26430625");
+    let vanilla = (read(&game, "enshrouded.kfc"), read(&game, "enshrouded.kfc_resources"));
+    // Another loader patched the game's files; an earlier runtime took its first clean copy of them, and recorded it.
+    let base = Rc::new(KFCFile::from_path(game.0.join("enshrouded.kfc"), false).unwrap());
+    let mut writer =
+        KFCWriter::new_incremental_with_options(&game.0, "enshrouded", base, Rc::new(TypeRegistry::default()), options())
+            .unwrap();
+    writer.write_content(&ContentHash::from_data(b"the auto-smash program"), b"the auto-smash program").unwrap();
+    writer.finalize().unwrap();
+    for extension in ["kfc", "kfc_resources"] {
+        fs::copy(game.0.join(format!("enshrouded.{extension}")), game.0.join(format!("enshrouded.{extension}.bak"))).unwrap();
+    }
+    shroudforge_game_assets::baseline_record::record(&game.0, "enshrouded").unwrap();
+    let pair = (read(&game, "enshrouded.kfc.bak"), read(&game, "enshrouded.kfc_resources.bak"));
+    let live = (read(&game, "enshrouded.kfc"), read(&game, "enshrouded.kfc_resources"));
+
+    let error = run_startup(&game.0).unwrap_err().to_string();
+    assert!(error.contains("Your game files still contain changes from a mod that isn't installed. Verify the game \
+        files in Steam (Properties > Installed Files > Verify integrity), then start again."), "{error}");
+    assert!(!recover_failed_startup(&game.0, &error), "nothing is put back: {}", game.log());
+    let record = game.record();
+    assert_eq!(record["status"], "failed", "{record}");
+    assert!(record["recoveryError"].as_str().is_some_and(|why| why.contains("still contain changes from a mod")), "{record}");
+    assert!(read(&game, "enshrouded.kfc") == live.0 && read(&game, "enshrouded.kfc_resources") == live.1,
+        "the game's files are untouched");
+    assert!(read(&game, "enshrouded.kfc.bak") == pair.0 && read(&game, "enshrouded.kfc_resources.bak") == pair.1,
+        "the working backups stay");
+    assert!(outdated_generations(&game).is_empty(), "nothing was set aside");
+    assert!(game.log().contains("still contain changes from a mod that isn't installed"), "{}", game.log());
+
+    // Steam's file check gives the game its own files again.
+    fs::write(game.0.join("enshrouded.kfc"), &vanilla.0).unwrap();
+    fs::write(game.0.join("enshrouded.kfc_resources"), &vanilla.1).unwrap();
+    run_startup(&game.0).unwrap();
+    assert_eq!(game.record()["status"], "applied", "{}", game.record());
+    assert!(read(&game, "enshrouded.kfc.bak") == vanilla.0 && read(&game, "enshrouded.kfc_resources.bak") == vanilla.1,
+        "the new clean copy is Steam's");
+    let generations = outdated_generations(&game);
+    assert_eq!(generations.len(), 1, "the old copy is kept aside");
+    assert!(fs::read(generations[0].join("enshrouded.kfc.bak")).unwrap() == pair.0);
+}

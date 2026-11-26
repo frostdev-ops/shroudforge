@@ -542,6 +542,118 @@ mod tests {
             Baseline::Refuse(why) if why.contains("are not the files Steam installed for build 26430625")));
     }
 
+    /// What a pass leaves when one of its mods creates the resource `guid` (Auto Loot Plus's auto-smash program).
+    fn mod_with_resource(dir: &Path, guid: &str, data: &[u8]) {
+        // one resource type the writer can bundle the resource under
+        let types: TypeRegistry = serde_json::from_str(&format!(
+            r#"{{"version":"test","types":[{{"index":0,"name":"Program","impactName":"Program","qualifiedName":"Program",
+            "size":0,"alignment":0,"elementAlignment":0,"fieldCount":0,"primitiveType":"NONE","flags":"",
+            "nameHash":1,"impactHash":1,"qualifiedHash":{PROGRAM_TYPE},"internalHash":7}}]}}"#
+        ))
+        .unwrap();
+        let base = Rc::new(KFCFile::from_path(dir.join(format!("{STEM}.kfc")), false).unwrap());
+        let mut writer =
+            KFCWriter::new_incremental_with_options(dir, STEM, base, Rc::new(types), options()).unwrap();
+        let id = kfc::guid::ResourceId::new(kfc::guid::Guid::parse(guid).unwrap(), PROGRAM_TYPE, 0);
+        writer.write_resource(&id, data).unwrap();
+        writer.finalize().unwrap();
+    }
+
+    /// The type hash of the test's resource.
+    const PROGRAM_TYPE: u32 = 0x5a5a_5a5a;
+
+    /// Auto Loot Plus 1.1.8's auto-smash program (`impact/autosmash.impact`, `programGuid`).
+    const AUTO_SMASH: &str = "a5c0de5a-1e00-4d0d-9a11-0000000a5000";
+
+    /// HadToRegister, 2026-11-26: a clean copy taken from game files another loader had already patched (Auto Loot
+    /// Plus's auto-smash program in them). The pair is whole (recorded), and the game's files are built over it, so it
+    /// went back before every pass for weeks after the mod was removed: props broke on their own within 15 m. Steam's
+    /// manifest of the installed build lists other bytes than the pair has: it is not the game's own, and the game's
+    /// files (built over it) are not Steam's either, so the start refuses and says what the player does.
+    #[test]
+    fn a_clean_copy_that_carries_a_mods_changes_is_never_restored() {
+        let (base, game) = library("stale-copy");
+        archive(&game, "1287369|2026-11-04", b"content Steam installed");
+        let vanilla = (fs::read(game.join(format!("{STEM}.kfc"))).unwrap(),
+            fs::read(game.join(format!("{STEM}.kfc_resources"))).unwrap());
+        steam_lists_the_game_files(&base, &game, "26430625");
+        // Another loader writes a mod into the game's files; a first backup is then taken of them.
+        mod_with_resource(&game, AUTO_SMASH, b"the auto-smash program");
+        back_up(&game);
+        baseline_record::record(&game, STEM).unwrap();
+        let pair = (fs::read(game.join(format!("{STEM}.kfc.bak"))).unwrap(),
+            fs::read(game.join(format!("{STEM}.kfc_resources.bak"))).unwrap());
+        // Every later pass builds today's mods over that copy.
+        mod_over(&game, b"content today's mods add");
+        for last_output in [true, false] {
+            match check_working_baseline(&game, STEM, last_output) {
+                Baseline::Refuse(why) => {
+                    assert!(why.starts_with("Your game files still contain changes from a mod that isn't installed. \
+                        Verify the game files in Steam (Properties > Installed Files > Verify integrity), then start \
+                        again."), "{why}");
+                    assert!(why.contains("enshrouded.kfc.bak has other bytes than Steam's manifest lists"), "{why}");
+                    assert!(why.contains("Auto Loot Plus"), "the known leftover is named: {why}");
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+        // A check changes nothing.
+        assert!(fs::read(game.join(format!("{STEM}.kfc.bak"))).unwrap() == pair.0);
+        assert!(fs::read(game.join(format!("{STEM}.kfc_resources.bak"))).unwrap() == pair.1);
+        // Steam's file check: the game's files are Steam's again, and the copy is made anew from them.
+        fs::write(game.join(format!("{STEM}.kfc")), &vanilla.0).unwrap();
+        fs::write(game.join(format!("{STEM}.kfc_resources")), &vanilla.1).unwrap();
+        assert!(matches!(check_working_baseline(&game, STEM, false),
+            Baseline::Retake(why) if why.contains("Steam's manifest of build 26430625 lists the game's files as they are")));
+    }
+
+    /// The same copy beside game files that are Steam's and were built over it (it lists less than they do, as a copy
+    /// of an older build with the same version tag would): Steam's files are the clean copy, the old pair is set aside.
+    #[test]
+    fn a_clean_copy_that_is_not_steams_is_retaken_from_steams_files() {
+        let (base, game) = library("stale-copy-retake");
+        // the copy: the game's header without its last content
+        archive(&game, "1287369|2026-11-04", b"content Steam installed");
+        back_up(&game);
+        mod_over(&game, b"content of the build Steam installed after it");
+        steam_lists_the_game_files(&base, &game, "26430625");
+        match check_working_baseline(&game, STEM, false) {
+            Baseline::Retake(why) => {
+                assert!(why.contains("enshrouded.kfc.bak has other bytes than Steam's manifest lists"), "{why}");
+                assert!(why.contains("lists the game's files as they are"), "{why}");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// A clean copy Steam's manifest lists byte for byte goes back as before (and so does one where no manifest is
+    /// there to ask: a SteamCMD server, a folder outside a Steam library), unless it holds a program a known mod made.
+    #[test]
+    fn a_clean_copy_that_is_steams_goes_back_and_one_with_a_known_leftover_does_not() {
+        let (base, game) = library("steam-copy");
+        archive(&game, "1287369|2026-11-04", b"content Steam installed");
+        steam_lists_the_game_files(&base, &game, "26430625");
+        back_up(&game);
+        baseline_record::record(&game, STEM).unwrap();
+        mod_over(&game, b"content today's mods add");
+        assert!(matches!(check_working_baseline(&game, STEM, true), Baseline::Restore { .. }));
+
+        let other = folder("no-steam-leftover");
+        archive(&other.0, "game 1", b"vanilla content");
+        mod_with_resource(&other.0, AUTO_SMASH, b"the auto-smash program");
+        back_up(&other.0);
+        baseline_record::record(&other.0, STEM).unwrap();
+        mod_over(&other.0, b"content today's mods add");
+        match check_working_baseline(&other.0, STEM, true) {
+            Baseline::Refuse(why) => {
+                assert!(why.starts_with("Your game files still contain changes from a mod that isn't installed."), "{why}");
+                assert!(why.contains("Auto Loot Plus's auto-smash program"), "{why}");
+                assert!(why.contains(AUTO_SMASH), "{why}");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
     #[test]
     fn damaged_game_files_are_never_the_new_copy() {
         let game = folder("damaged");

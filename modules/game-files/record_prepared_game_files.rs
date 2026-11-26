@@ -839,6 +839,26 @@ mod tests {
         }
     }
 
+    /// Stale game data (HadToRegister, 2026-11-26): a record of scheme 2, as 0.2.0-dev.31.12 to 31.15 left it, was
+    /// written by a pass that restored its clean copy without asking Steam's manifest whether the copy is the game's
+    /// own. A start never skips its pass on such a record (the pass's check of the clean copy runs once), and the
+    /// record still proves that the live header is that pass's output.
+    #[test]
+    fn a_record_from_before_the_clean_copy_was_proven_means_one_pass() {
+        let g = game();
+        let exports = g.exports.clone();
+        record(&g.root, "enshrouded", &inputs("f1", Some(&exports)), &pass_touches()).unwrap();
+        let path = record_path(&g.root, "enshrouded");
+        let mut old: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        old["scheme"] = json!("kiln-sf-prepared 2");
+        fs::write(&path, old.to_string()).unwrap();
+        assert_eq!(
+            current(&g.root, "enshrouded", &inputs("f1", Some(&exports))),
+            Err("the record is of another scheme".to_owned())
+        );
+        assert!(left_live_header(&g.root, "enshrouded"));
+    }
+
     /// A record of scheme 1 (it listed the whole export folder) as 0.2.0-dev.31.10 left it: the first
     /// start of this runtime applies once, records scheme 2, and the starts after it reuse that pass
     /// while runtime mods write into the export folder.
