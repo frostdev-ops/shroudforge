@@ -369,12 +369,19 @@ fn a_clean_copy_with_an_uninstalled_mods_changes_is_refused_until_the_game_files
     game.package("alpha", "return {}", &[]);
     steam_lists_the_game_files(&game, "26430625");
     let vanilla = (read(&game, "enshrouded.kfc"), read(&game, "enshrouded.kfc_resources"));
-    // Another loader patched the game's files; an earlier runtime took its first clean copy of them, and recorded it.
+    // Another loader patched the game's files (Auto Loot Plus's auto-smash program, the resource its Lua part creates);
+    // an earlier runtime took its first clean copy of them, and recorded it.
+    let types: TypeRegistry = serde_json::from_str(
+        r#"{"version":"test","types":[{"index":0,"name":"ImpactProgram","impactName":"ImpactProgram",
+        "qualifiedName":"keen::ImpactProgram","size":0,"alignment":0,"elementAlignment":0,"fieldCount":0,
+        "primitiveType":"NONE","flags":"","nameHash":1,"impactHash":1,"qualifiedHash":1515870810,"internalHash":7}]}"#,
+    )
+    .unwrap();
     let base = Rc::new(KFCFile::from_path(game.0.join("enshrouded.kfc"), false).unwrap());
-    let mut writer =
-        KFCWriter::new_incremental_with_options(&game.0, "enshrouded", base, Rc::new(TypeRegistry::default()), options())
-            .unwrap();
-    writer.write_content(&ContentHash::from_data(b"the auto-smash program"), b"the auto-smash program").unwrap();
+    let mut writer = KFCWriter::new_incremental_with_options(&game.0, "enshrouded", base, Rc::new(types), options()).unwrap();
+    let program = kfc::guid::Guid::parse("a5c0de5a-1e00-4d0d-9a11-0000000a5000").unwrap();
+    writer.write_resource(&kfc::guid::ResourceId::new(program, 1515870810, 0), b"the auto-smash program").unwrap();
+    writer.write_content(&ContentHash::from_data(b"the auto-smash aura"), b"the auto-smash aura").unwrap();
     writer.finalize().unwrap();
     for extension in ["kfc", "kfc_resources"] {
         fs::copy(game.0.join(format!("enshrouded.{extension}")), game.0.join(format!("enshrouded.{extension}.bak"))).unwrap();
@@ -396,6 +403,7 @@ fn a_clean_copy_with_an_uninstalled_mods_changes_is_refused_until_the_game_files
         "the working backups stay");
     assert!(outdated_generations(&game).is_empty(), "nothing was set aside");
     assert!(game.log().contains("still contain changes from a mod that isn't installed"), "{}", game.log());
+    assert!(error.contains("Auto Loot Plus's auto-smash program"), "the leftover is named: {error}");
 
     // Steam's file check gives the game its own files again.
     fs::write(game.0.join("enshrouded.kfc"), &vanilla.0).unwrap();
@@ -407,4 +415,48 @@ fn a_clean_copy_with_an_uninstalled_mods_changes_is_refused_until_the_game_files
     let generations = outdated_generations(&game);
     assert_eq!(generations.len(), 1, "the old copy is kept aside");
     assert!(fs::read(generations[0].join("enshrouded.kfc.bak")).unwrap() == pair.0);
+}
+
+/// Review (stale game data): Steam's manifest of the installed build lists other bytes than the clean copy has, and
+/// nothing in the copy shows a mod's changes (Steam names a build whose files are not the ones in the folder: an update
+/// it has not finished, a folder copied from another PC). The pass runs on the copy as before, and the log (Kiln's
+/// kiln.log shows ShroudForge's lines) says why the copy is in doubt and the one thing the player does if a mod they
+/// removed still acts in the game.
+#[test]
+fn a_clean_copy_steam_does_not_vouch_for_is_used_as_before_with_a_warning() {
+    let game = Game::new("steam-doubt");
+    game.package("alpha", "return {}", &[]);
+    // the game's files and a recorded clean copy of them, and game files built over it since
+    for extension in ["kfc", "kfc_resources"] {
+        fs::copy(game.0.join(format!("enshrouded.{extension}")), game.0.join(format!("enshrouded.{extension}.bak"))).unwrap();
+    }
+    shroudforge_game_assets::baseline_record::record(&game.0, "enshrouded").unwrap();
+    let base = Rc::new(KFCFile::from_path(game.0.join("enshrouded.kfc"), false).unwrap());
+    let mut writer =
+        KFCWriter::new_incremental_with_options(&game.0, "enshrouded", base, Rc::new(TypeRegistry::default()), options())
+            .unwrap();
+    writer.write_content(&ContentHash::from_data(b"a mod's content"), b"a mod's content").unwrap();
+    writer.finalize().unwrap();
+    let pair = (read(&game, "enshrouded.kfc.bak"), read(&game, "enshrouded.kfc_resources.bak"));
+    // Steam's appmanifest names another build
+    let next = game.0.join("steam-next");
+    archive(&next, b"content of the build Steam names");
+    let files: Vec<(String, Vec<u8>)> = ["enshrouded.kfc", "enshrouded.kfc_resources"]
+        .iter()
+        .map(|name| (name.to_string(), fs::read(next.join(name)).unwrap()))
+        .collect();
+    let listed: Vec<(&str, &[u8])> = files.iter().map(|(name, data)| (name.as_str(), data.as_slice())).collect();
+    shroudforge_game_assets::steam_files::fixture::install_steam_records(&game.0.join("steamapps"), "26430625", &listed);
+
+    run_startup(&game.0).unwrap();
+    assert_eq!(game.record()["status"], "applied", "{}", game.record());
+    assert!(read(&game, "enshrouded.kfc.bak") == pair.0 && read(&game, "enshrouded.kfc_resources.bak") == pair.1,
+        "the clean copy stays");
+    assert!(outdated_generations(&game).is_empty(), "nothing was set aside");
+    let log = game.log();
+    assert!(log.contains("(enshrouded.kfc.bak has ") && log.contains("Steam's manifest lists"), "{log}");
+    assert!(log.contains("for build 26430625)"), "{log}");
+    assert!(log.contains("but nothing in it shows a mod's changes, so it was used as before"), "{log}");
+    assert!(log.contains("If a mod you removed still acts in the game, verify the game files in Steam (Properties > \
+        Installed Files > Verify integrity), then start again"), "{log}");
 }

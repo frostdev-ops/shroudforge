@@ -765,6 +765,70 @@ mod tests {
         }
     }
 
+    /// Steam's records of the build `build` listing the asset files of the folder `from` (another build's, or files
+    /// that are not in the game folder at all).
+    fn steam_lists_the_files_of(base: &Folder, from: &Path, build: &str) {
+        let files: Vec<(String, Vec<u8>)> = ["kfc", "kfc_resources"]
+            .iter()
+            .map(|extension| {
+                let name = format!("{STEM}.{extension}");
+                let data = fs::read(from.join(&name)).unwrap();
+                (name, data)
+            })
+            .collect();
+        let listed: Vec<(&str, &[u8])> = files.iter().map(|(name, data)| (name.as_str(), data.as_slice())).collect();
+        shroudforge_game_assets::steam_files::fixture::install_steam_records(&base.0.join("steamapps"), build, &listed);
+    }
+
+    /// Review (stale game data): Steam's manifest of the installed build can list other bytes than a clean copy has
+    /// while nothing in the copy shows a mod's changes: Steam's appmanifest names a build whose files are not the ones in
+    /// the folder (an update Steam has not finished, a game folder copied from another PC or library, an older tool's
+    /// download). Refusing there would stop every ShroudForge mod on a guess, and Steam's file check may not even cure it.
+    /// Such a copy goes back as before, and the start says why it is in doubt; only a copy that holds a known mod's
+    /// program, or whose resource file is Steam's own with more data after it, is refused.
+    #[test]
+    fn a_clean_copy_steam_does_not_vouch_for_goes_back_when_nothing_in_it_shows_a_mods_changes() {
+        let (base, game) = library("steam-doubt");
+        let next = folder("steam-doubt-next");
+        archive(&game, "1287369|2026-11-04", b"content of the build in the folder");
+        back_up(&game);
+        baseline_record::record(&game, STEM).unwrap();
+        mod_over(&game, b"content today's mods add");
+        // Steam's appmanifest names another build, whose files are not the ones in the folder
+        archive(&next.0, "1287369|2026-11-04", b"content of the build Steam names");
+        steam_lists_the_files_of(&base, &next.0, "26430625");
+        for last_output in [true, false] {
+            match check_working_baseline(&game, STEM, last_output) {
+                Baseline::Restore { .. } => {}
+                other => panic!("last output {last_output}: {other:?}"),
+            }
+        }
+    }
+
+    /// Review (stale game data): a clean copy whose resource file is the one Steam installed with more data after it
+    /// (an archive writer only appends to it: a mod's resources) carries a mod's changes even when the mod is none Kiln
+    /// knows by name. It is refused, and the refusal says what proves it.
+    #[test]
+    fn a_clean_copy_whose_resource_file_is_steams_with_more_after_it_is_refused() {
+        let (base, game) = library("steam-extended");
+        archive(&game, "1287369|2026-11-04", b"content Steam installed");
+        mod_with_resource(&game, "5eed0000-0000-4000-8000-000000000001", b"a resource of the game's own");
+        steam_lists_the_game_files(&base, &game, "26430625");
+        // another loader adds a resource of a mod Kiln does not know, and the first copy is taken of that
+        mod_with_resource(&game, "0dd00000-0000-4000-8000-000000000002", b"a resource some mod made");
+        back_up(&game);
+        baseline_record::record(&game, STEM).unwrap();
+        mod_over(&game, b"content today's mods add");
+        match check_working_baseline(&game, STEM, true) {
+            Baseline::Refuse(why) => {
+                assert!(why.starts_with("Your game files still contain changes from a mod that isn't installed."), "{why}");
+                assert!(why.contains("its enshrouded.kfc_resources.bak is the enshrouded.kfc_resources Steam installed for \
+                    build 26430625 with"), "{why}");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
     #[test]
     fn damaged_game_files_are_never_the_new_copy() {
         let game = folder("damaged");
