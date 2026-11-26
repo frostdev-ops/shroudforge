@@ -7,6 +7,7 @@
 #include "impact/submit_entity_destruction.h"
 #include "impact/submit_building_prop_spawn.h"
 #include "voxels/write_registered_voxel_grid.h"
+#include "engine-hooks/install_engine_hooks.h"
 
 using namespace WorldRuntime::Implementation;
 
@@ -192,8 +193,8 @@ bool OperationAvailable(const char* name) {
         ImpactRuntime::EntityDestructionAvailable()) return true;
     if (name && std::strcmp(name, "runtime.world.entity.spawn") == 0)
         return ImpactRuntime::BuildingPropSpawnAvailable();
-    if (name && std::strcmp(name, "runtime.world.voxel.write") == 0)
-        return RegisteredVoxelGrid::WriteAvailable();
+    if (name && std::strcmp(name, "runtime.world.voxel.write") == 0)  // Kiln fork: the host's writer first
+        return EngineHooks::HostVoxelWriter() ? EngineHooks::HostVoxelWriteReady() : RegisteredVoxelGrid::WriteAvailable();
     const auto* operation = find_operation(name);
     return operation && operation->available;
 }

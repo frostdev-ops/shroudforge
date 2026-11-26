@@ -12,6 +12,7 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <tuple>
 #include <vector>
 
 #include "abi/runtime_host.h"
@@ -241,6 +242,25 @@ std::uint64_t KFC_RUNTIME_CALL fake_install(const char* name, uintptr_t target, 
 }
 void KFC_RUNTIME_CALL fake_remove(std::uint64_t handle) { g_host.removed.push_back(handle); }
 
+// The host's voxel writer (runtime_host.h voxel_write_ready / voxel_write): what it got and what it answers.
+struct FakeVoxels {
+    std::uint32_t ready = 1, outcome = 0, calls = 0;
+    bool result = true;
+    std::int32_t origin[3]{};
+    std::uint32_t dims[3]{};
+    std::vector<std::uint16_t> values;
+} g_voxels;
+std::uint32_t KFC_RUNTIME_CALL fake_voxel_ready() { return g_voxels.ready; }
+bool KFC_RUNTIME_CALL fake_voxel_write(const std::int32_t* origin, const std::uint32_t* dims, const std::uint16_t* values,
+                                       std::size_t count, std::uint32_t* outcome) {
+    ++g_voxels.calls;
+    std::memcpy(g_voxels.origin, origin, sizeof g_voxels.origin);
+    std::memcpy(g_voxels.dims, dims, sizeof g_voxels.dims);
+    g_voxels.values.assign(values, values + count);
+    *outcome = g_voxels.outcome;
+    return g_voxels.result;
+}
+
 KfcRuntimeHost make_host() {
     KfcRuntimeHost h{};
     h.size = sizeof h;
@@ -429,6 +449,46 @@ int main() {
     run_all_and_check("no host again");
     EngineHooks::Uninstall();
     for (const Place& p : kPlaces) CHECK(bytes_are_file(p), "%s restored at the end", p.name);
+
+    // ---- 6. the host's voxel writer (Kiln dev.31): optional, both members inside the offered size ----
+    std::puts("== voxel writer");
+    const std::int32_t at[3]{-3, 64, 7};
+    const std::uint32_t box[3]{2, 1, 2};
+    const std::uint16_t cells[4]{0x0000, 0xff81, 0x8001, 0x0000};
+    std::uint32_t outcome = 9;
+    CHECK(!EngineHooks::HostVoxelWriter(), "no host: no host writer");
+    CHECK(!EngineHooks::HostVoxelWrite(at, box, cells, 4, &outcome) && outcome == 1, "no host: refused, outcome %u", outcome);
+    KfcRuntimeHost v1 = make_host();  // a host that offers hooks only (members NULL)
+    CHECK(KfcRuntimeSetHost(&v1) && !EngineHooks::HostVoxelWriter(), "a hooks-only host has no writer");
+    KfcRuntimeHost cut = make_host();
+    cut.voxel_write_ready = &fake_voxel_ready;
+    cut.voxel_write = &fake_voxel_write;
+    cut.size = static_cast<uint32_t>(offsetof(KfcRuntimeHost, voxel_write));  // an older host's table: writer outside it
+    CHECK(KfcRuntimeSetHost(&cut) && !EngineHooks::HostVoxelWriter(), "members past the offered size are not read");
+    KfcRuntimeHost half = make_host();
+    half.voxel_write = &fake_voxel_write;
+    CHECK(KfcRuntimeSetHost(&half) && !EngineHooks::HostVoxelWriter(), "one member alone is no writer");
+    KfcRuntimeHost full = make_host();
+    full.voxel_write_ready = &fake_voxel_ready;
+    full.voxel_write = &fake_voxel_write;
+    CHECK(KfcRuntimeSetHost(&full) && EngineHooks::HostVoxelWriter(), "a host with both members writes");
+    g_voxels.ready = 0;
+    CHECK(!EngineHooks::HostVoxelWriteReady(), "ready follows the host (no world)");
+    g_voxels.ready = 1;
+    CHECK(EngineHooks::HostVoxelWriteReady(), "ready follows the host (a hosted world)");
+    outcome = 9;
+    CHECK(EngineHooks::HostVoxelWrite(at, box, cells, 4, &outcome) && outcome == 0, "written: outcome %u", outcome);
+    CHECK(g_voxels.calls == 1 && !std::memcmp(g_voxels.origin, at, sizeof at) && !std::memcmp(g_voxels.dims, box, sizeof box) &&
+          g_voxels.values == std::vector<std::uint16_t>(cells, cells + 4), "the host got the box and the cells unchanged");
+    for (const auto& [result, reported, ok, want] : {std::tuple{false, 1u, false, 1u}, {false, 2u, false, 2u}, {false, 3u, false, 3u},
+             {false, 0u, false, 3u}, {false, 7u, false, 3u}, {true, 1u, false, 3u}}) {
+        g_voxels.result = result;
+        g_voxels.outcome = reported;
+        outcome = 9;
+        const bool got = EngineHooks::HostVoxelWrite(at, box, cells, 4, &outcome);
+        CHECK(got == ok && outcome == want, "host %d/%u -> %d/%u (want %d/%u)", result, reported, got, outcome, ok, want);
+    }
+    CHECK(KfcRuntimeSetHost(nullptr) && !EngineHooks::HostVoxelWriter(), "NULL takes the writer away too");
 
     std::printf("%s (%d failure(s))\n", g_failures ? "FAILED" : "ALL PASSED", g_failures);
     return g_failures ? 1 : 0;

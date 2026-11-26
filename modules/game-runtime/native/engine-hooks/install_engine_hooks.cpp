@@ -216,8 +216,30 @@ bool SetHost(const KfcRuntimeHost* offered) {
     host.find_signature = offered->find_signature;
     host.install_hook = offered->install_hook;
     host.remove_hook = offered->remove_hook;
+    // the optional voxel writer: both members inside the offered size, both set, or none
+    const auto voxels = offsetof(KfcRuntimeHost, voxel_write) + sizeof(offered->voxel_write);
+    if (offered->size >= voxels && offered->voxel_write_ready && offered->voxel_write) {
+        host.voxel_write_ready = offered->voxel_write_ready;
+        host.voxel_write = offered->voxel_write;
+    }
     host_offered = true;
     return true;
+}
+
+bool HostVoxelWriter() { return host_offered && host.voxel_write_ready && host.voxel_write; }
+
+bool HostVoxelWriteReady() { return HostVoxelWriter() && host.voxel_write_ready() != 0; }
+
+bool HostVoxelWrite(const std::int32_t* origin, const std::uint32_t* dimensions, const std::uint16_t* values,
+    std::size_t count, std::uint32_t* outcome) {
+    if (!outcome) return false;
+    *outcome = 1;
+    if (!HostVoxelWriter()) return false;
+    std::uint32_t reported = 3;
+    const bool written = host.voxel_write(origin, dimensions, values, count, &reported);
+    // an answer outside the contract is uncertainty, never "nothing changed"
+    *outcome = written ? (reported == 0 ? 0u : 3u) : (reported >= 1 && reported <= 3 ? reported : 3u);
+    return written && reported == 0;
 }
 
 bool Install() {

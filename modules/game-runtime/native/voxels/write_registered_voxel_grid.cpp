@@ -4,6 +4,7 @@
 #include "impact/resolve_registered_operation.h"
 #include "code-inventory/resolve_original_call_graph.h"
 #include "named-services/named_service_contract.h"
+#include "engine-hooks/install_engine_hooks.h"
 #include <atomic>
 #include <deque>
 #include <map>
@@ -330,6 +331,7 @@ bool WriteAvailable() {
 
 void PrepareWriter() {
     if (prepared.load(std::memory_order_acquire) || preparing.load(std::memory_order_acquire)) return;
+    if (EngineHooks::HostVoxelWriter()) return;  // Kiln fork: the host writes (abi/runtime_host.h); nothing to resolve
     const auto now = GetTickCount64();
     if (now < next_preparation_ms.load(std::memory_order_relaxed)) return;
     next_preparation_ms.store(now + 1000, std::memory_order_relaxed);

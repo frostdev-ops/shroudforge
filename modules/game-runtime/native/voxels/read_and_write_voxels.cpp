@@ -3,6 +3,7 @@
 #include "voxels/read_registered_voxel_grid.h"
 #include "voxels/write_registered_voxel_grid.h"
 #include "named-services/named_service_contract.h"
+#include "engine-hooks/install_engine_hooks.h"
 
 using namespace WorldRuntime::Implementation;
 
@@ -99,6 +100,8 @@ bool WriteVoxels(const std::int32_t origin[3], const std::uint32_t dimensions[3]
     WriteRegion expanded;
     if (!origin || !values || !cell_count(dimensions, expected) || count != expected ||
         !plan_write_region(origin, dimensions, expanded)) return false;
+    // Kiln fork: a host with its own voxel writer writes instead (abi/runtime_host.h, voxel_write).
+    if (EngineHooks::HostVoxelWriter()) return EngineHooks::HostVoxelWrite(origin, dimensions, values, count, outcome);
     const auto session = KfcRuntimeWorldSessionId();
     if (!session) return false;
     constexpr ULONGLONG retry_budget_ms = 250;

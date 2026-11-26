@@ -43,6 +43,17 @@ with `kiln.hooks` v2. A host that never calls it, such as ShroudForge's own `win
 upstream unchanged. Test: `cmake --build <dir> --target kfc-runtime-test-engine-hooks`, then run
 `bin/kfc-runtime-test-engine-hooks.exe` under Wine (`kiln/native/tests/`).
 
+## Voxel writes through the host (dev.31)
+
+`runtime.world.voxel.write` normally resolves the game's block writer itself: from the registered terraforming impact it
+reads the game's code down to the writer, and refuses ("voxel write was rejected before changing the world") when a
+function on that path carries a hook or the exe file cannot be compared with the loaded code. Under Kiln that path is
+always hooked. A host table that also fills `voxel_write_ready` and `voxel_write` (`abi/runtime_host.h`, inside the
+offered `size`) takes the write and its availability instead; SF then never resolves its own writer. Kiln writes through
+`kiln.build` on the server world's thread with the same outcome codes (0 written, 1 refused before any change, 2 put
+back, 3 uncertain) and logs every refusal. A host without them, or SF's own `winmm.dll` bootstrap, keeps upstream's
+writer. Test: `kfc-runtime-test-engine-hooks` (section "voxel writer").
+
 ## Keyboard shortcuts through the host (dev.24)
 
 `shroudforge.input.is_keybind_down` and `was_keybind_pressed` take key state from a hidden child process,

@@ -61,6 +61,25 @@ typedef struct KfcRuntimeHost {
 
     /* Takes the hook away (KfcRuntimeShutdown). A thread already inside the callback finishes it. */
     void(KFC_RUNTIME_CALL* remove_hook)(uint64_t handle);
+
+    /* ---- voxel writes through the host (Kiln 0.2.0-dev.31, optional; the version stays 1) ----
+     * A table whose size does not cover both members, or with either NULL, has none: runtime.world.voxel.write then
+     * stays kfc-runtime's own. kfc-runtime's own writer finds the game's block writer by reading the game's code from the
+     * registered terraforming impact down to it, and refuses (outcome 1, "rejected before changing the world") when any
+     * function on that path carries another module's hook, or when the exe file cannot be compared with the loaded code.
+     * A host that hooks the game's terraforming (Kiln does, and so do its mods) always has hooks there.
+     *
+     * voxel_write_ready: non-zero when a write may be attempted now (a world this process runs as its host). Any thread.
+     *   It answers runtime.has("runtime.world.voxel.write").
+     * voxel_write: KfcRuntimeWorldVoxelWrite's contract. origin and dimensions in cells (each >= 1, at most 65536 cells
+     *   in all), `count` values (low byte material, high byte fill), x fastest, then y, then z. True when the world holds
+     *   exactly those cells afterwards. *outcome: 0 written (or already so); 1 refused before anything changed; 2 the
+     *   write did not read back as asked and the earlier cells were written back and read back; 3 anything else (part of
+     *   the write may be in the world). The host logs why it refused or failed. Called from the thread that runs the
+     *   mods; the host may block it briefly (to reach the world's own thread). */
+    uint32_t(KFC_RUNTIME_CALL* voxel_write_ready)(void);
+    bool(KFC_RUNTIME_CALL* voxel_write)(const int32_t* origin, const uint32_t* dimensions, const uint16_t* values,
+                                        size_t count, uint32_t* outcome);
 } KfcRuntimeHost;
 
 KFC_RUNTIME_API bool KFC_RUNTIME_CALL KfcRuntimeSetHost(const KfcRuntimeHost* host);
