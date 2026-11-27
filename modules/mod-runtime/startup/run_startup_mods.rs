@@ -57,6 +57,11 @@ fn run_with_api(
         CacheDiff::new_dirty()
     };
 
+    // Kiln layer: an attempt's change journal starts empty (a retried pass records its committed attempt only)
+    if let Some(journal) = &args.options.change_journal {
+        journal.reset();
+    }
+
     // create a new app state
 
     let app_state = match AppState::new(env.clone(), api, args, &cache_diff) {
@@ -83,6 +88,15 @@ fn run_with_api(
     runner.run()?;
 
     let app_state = runner.lua.app_data_ref::<AppState>().unwrap();
+
+    // Kiln layer: what changed after the change journal stopped comparing (its time budget) is no package's
+    if let Some(journal) = app_state.change_journal()
+        && journal.exhausted()
+    {
+        journal.finish(runner.journal_snapshots(&app_state), |id| {
+            app_state.reader().ok()?.read_resource(id).ok().flatten()
+        });
+    }
 
     super::commit_asset_changes::commit_asset_changes(&runner.lua, &app_state)?;
 

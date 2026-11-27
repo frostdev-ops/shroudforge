@@ -50,6 +50,7 @@ impl IngameRuntime {
                     phase: RuntimePhase::Ingame,
                     // Kiln layer: runtime mods' exports are not the pregame pass's
                     export_touches: None,
+                    change_journal: None,
                 },
             },
             &CacheDiff::new_dirty(),

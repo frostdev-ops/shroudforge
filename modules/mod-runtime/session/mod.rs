@@ -78,6 +78,8 @@ pub struct AppConfig {
     export_dir: PathBuf,
     // Kiln layer: what the pregame pass uses in the export folder (RunOptions::export_touches)
     export_touches: Option<shroudforge_game_assets::prepared_stamp::ExportTouches>,
+    // Kiln layer: the pregame pass's change journal (RunOptions::change_journal)
+    change_journal: Option<crate::change_journal::ChangeJournal>,
 }
 
 bitflags! {
@@ -126,6 +128,12 @@ impl AppState {
     #[inline]
     pub fn export_touches(&self) -> Option<&shroudforge_game_assets::prepared_stamp::ExportTouches> {
         self.config.export_touches.as_ref()
+    }
+
+    /// Kiln layer: the pregame pass's change journal, if the loader asked for one.
+    #[inline]
+    pub fn change_journal(&self) -> Option<&crate::change_journal::ChangeJournal> {
+        self.config.change_journal.as_ref()
     }
 
     #[inline]

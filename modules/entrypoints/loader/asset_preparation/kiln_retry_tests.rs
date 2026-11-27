@@ -412,3 +412,40 @@ fn a_panic_in_the_pass_leaves_one_readable_reason_and_the_saved_baseline() {
     // the next start runs the pass again
     assert!(!already_applied(&game.0, "enshrouded", false).unwrap());
 }
+
+// Kiln layer (the pass's change journal, mod-runtime/startup/kiln_change_journal.rs): a pass writes it beside its record,
+// bound to the <stem>.kfc it published, with the packages it ran (and what each created) and the ones the retry ran
+// without; an unchanged start keeps it byte for byte; a pass that changes the game files again replaces it.
+#[test]
+fn the_pass_writes_its_change_journal_with_the_packages_it_ran_without() {
+    let game = Game::new("journal");
+    game.package("alpha", "game.assets.create_content(buffer.wrap(\"alpha blob\"))\nreturn {}", &[]);
+    game.broken("broken", "boom");
+    game.package("needs-broken", "return {}", &["broken"]);
+    run_startup(&game.0).unwrap();
+    let path = game.0.join("enshrouded.kfc.change-journal.json");
+    let bytes = fs::read(&path).expect("the pass wrote its change journal");
+    let j: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!((&j["format"], &j["dialect"], &j["writer"], &j["attempt"]), (&json!(2), &json!("shroudforge"), &json!("shroudforge"), &json!("retry")), "{j}");
+    // the record of the pass hashes the same header on its own (record_prepared_game_files.rs)
+    let stamp: serde_json::Value =
+        serde_json::from_slice(&fs::read(game.0.join("enshrouded.kfc.prepared.json")).unwrap()).unwrap();
+    assert_eq!(j["generation"], stamp["files"]["kfc"]["sha256"], "bound to the published header: {stamp}");
+    assert_eq!(ids(&j["packages"]), ["alpha"], "{j}");
+    assert_eq!(j["packages"][0]["contents"].as_array().map(Vec::len), Some(1), "{j}");
+    assert_eq!(ids(&j["notApplied"]), ["broken", "needs-broken"], "{j}");
+    assert!(j["notApplied"][0]["reason"].as_str().unwrap().contains("boom"), "{j}");
+    assert_eq!(j["notApplied"][1]["reason"], "needs broken, which failed in the pregame pass");
+    // the next start skips the unchanged pass and keeps the journal as it is
+    assert!(already_applied(&game.0, "enshrouded", false).unwrap());
+    run_startup(&game.0).unwrap();
+    assert_eq!(fs::read(&path).unwrap(), bytes, "an unchanged start keeps the journal");
+    // a fixed package: the pass runs again, the journal names it
+    game.package("broken", "return {}", &[]);
+    run_startup(&game.0).unwrap();
+    let j: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    let mut ran = ids(&j["packages"]);
+    ran.sort_unstable();
+    assert_eq!(ran, ["alpha", "broken", "needs-broken"], "{j}");
+    assert_eq!((&j["attempt"], &j["notApplied"]), (&json!("first"), &json!([])));
+}

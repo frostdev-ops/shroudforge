@@ -84,6 +84,9 @@ impl AppState {
             export_touches: options
                 .export_touches
                 .filter(|_| phase == RuntimePhase::Pregame),
+            change_journal: options
+                .change_journal
+                .filter(|_| phase == RuntimePhase::Pregame),
 
             is_server,
             phase,

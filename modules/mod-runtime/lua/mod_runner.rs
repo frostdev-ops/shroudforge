@@ -75,13 +75,52 @@ impl LuaModRunner {
 
             // a Rust panic in it goes on to the loader with the package's name (`PregameModPanic`)
             let info = r#mod.info();
-            crate::PregameModPanic::name_package(&info.id, &info.name, || {
+            // Kiln layer: what the pass is asked to change while this entrypoint runs is this package's
+            let journal = app_state.change_journal().cloned();
+            if let Some(journal) = &journal {
+                journal.begin(&info.id, Some(info.version.to_string()));
+            }
+            let ran = crate::PregameModPanic::name_package(&info.id, &info.name, || {
                 self.state.require_mod(&info.id, &self.lua)
-            })
-            .map_err(|error| crate::PregameModError::new(&info.id, error))?;
+            });
+            if let Some(journal) = &journal {
+                let registry = app_state.type_registry().clone();
+                journal.end(
+                    self.journal_snapshots(&app_state),
+                    |id| app_state.reader().ok()?.read_resource(id).ok().flatten(),
+                    |id, bytes| {
+                        let r#type = kfc::kfc_format::type_for_resource(&registry, id)?;
+                        kfc::resource::value::Value::from_bytes(&registry, r#type, bytes).ok()
+                    },
+                );
+            }
+            ran.map_err(|error| crate::PregameModError::new(&info.id, error))?;
         }
 
         Ok(())
+    }
+
+    /// Kiln layer: every resource the pass edited so far (a record whose value is replaced or written), as the commit
+    /// would encode it now (`ResourceInfo::apply`, no Lua runs), for the change journal. A record that cannot be encoded is
+    /// left out: the commit fails on it too.
+    pub(crate) fn journal_snapshots(&self, app_state: &AppState) -> Vec<crate::change_journal::Snapshot> {
+        let registry = app_state.type_registry().clone();
+        app_state
+            .get_cached_resources()
+            .into_iter()
+            .filter(|r| r.source_name() != "loaded-runtime")
+            .filter_map(|r| {
+                let value = r.apply(&self.lua).ok()??;
+                let r#type = kfc::kfc_format::type_for_resource(&registry, &r.resource_id)?;
+                let mut bytes = Vec::new();
+                value.write_into(&registry, r#type, &mut bytes).ok()?;
+                Some(crate::change_journal::Snapshot {
+                    id: r.resource_id,
+                    now: Some((value, bytes)),
+                    created: r.source_name() == "asset-transaction",
+                })
+            })
+            .collect()
     }
 
     pub(crate) fn runtime_mod_ids(&self) -> Vec<String> {

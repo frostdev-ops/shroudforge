@@ -131,6 +131,9 @@ pub struct RunOptions {
     /// loader's record of the pass (`shroudforge_game_assets::prepared_stamp`). Read in the pregame
     /// phase only: runtime mods' exports while the game runs are not the pass's.
     pub export_touches: Option<shroudforge_game_assets::prepared_stamp::ExportTouches>,
+    /// Kiln layer: the pregame pass's per-package change journal (`change_journal`), which the loader writes beside
+    /// the record of the pass. Pregame only.
+    pub change_journal: Option<change_journal::ChangeJournal>,
 }
 
 #[derive(Debug, Clone)]
@@ -152,6 +155,8 @@ pub use startup::manage_asset_baseline::{
 };
 pub use startup::verify_working_baseline::{Baseline, check_working_baseline, doubt_words};
 pub use startup::run_startup_mods::{run, run_with_local_schema};
+// Kiln layer: the per-package change journal of the pregame pass (Kiln's registry names packages from it)
+pub use startup::kiln_change_journal as change_journal;
 // Kiln layer: block-compressed textures of a pregame pass on several threads (lua/bindings/image/kiln_encode_in_strips.rs).
 pub use env::kiln_encode_in_strips::{
     EncodeThreads, THREADS_VARIABLE as ENCODE_THREADS_VARIABLE, encode_threads, pregame_encode_threads,

@@ -289,6 +289,30 @@ helpers that never start, the thread count and its env value) and `cargo test -p
 kiln_same_pass` (whole passes: package A creates a blob and B reads it; a texture the pass encodes on several threads
 is the serial encode).
 
+## The pass's change journal for Kiln's registry (0.2.0-dev.32)
+
+Kiln names each package of the pregame pass on the registry fields it changed (Kiln's Conflicts view and
+`kiln/state/registry.json`), and replays an opted-in package's recorded effect after a game update when its Lua no longer
+runs (Kiln's effect replay). Both need to know which package changed what; ShroudForge's own records say only which
+packages ran. `modules/mod-runtime/startup/kiln_change_journal.rs` keeps that record, never a value:
+- after each package's entrypoint (`lua/mod_runner.rs`) every resource the pass edited so far is encoded as the commit
+  encodes it (`ResourceInfo::apply`, no Lua runs) and compared with what it held before that entrypoint (its archive bytes
+  the first time); only one whose bytes differ is decoded and walked member by member, and the package is named on the
+  members that differ, at their published places (`maxStackSize`, `recipes[37].craftingDuration`, `recipes[]` for a list's
+  membership); a list whose length changed is aligned by its unchanged ends, and earlier packages' paths move with it;
+- creations (`session/asset_resources.rs` `add_resource_as`: explicit GUID or drawn) and contents (`create_content`) are
+  noted per package, in order;
+- past 3 s of comparing in one pass (`BUDGET`) the rest of the pass is recorded as no package's (whole resources in
+  `unattributed`, `truncated`), so a large modpack's start is never much slower;
+- the loader (`entrypoints/loader/asset_preparation/apply_asset_mods.rs`) removes `<stem>.kfc.change-journal.json` with
+  the record of the pass before a pass changes the game files, and writes it after a pass succeeded, beside
+  `<stem>.kfc.prepared.json`: Kiln's change journal format 2 (Kiln's `schema/sfi/eml-journal/eml-journal-2.schema.json`,
+  dialect `shroudforge`, writer `shroudforge`), bound to the SHA-256 of the `<stem>.kfc` it published, with the packages
+  the retry ran without as `notApplied`. A start that skips the unchanged pass keeps it.
+Nothing the pass writes changes. Tests: `cargo test -p shroudforge-api --lib kiln_change_journal` (the compare, the
+paths, a pass's record from snapshots, the budget, the file) and `cargo test -p shroudforge-modloader --lib
+the_pass_writes_its_change_journal` (a whole pass with a failing package, an unchanged start, a fixed one).
+
 ## Merging upstream
 
 ```

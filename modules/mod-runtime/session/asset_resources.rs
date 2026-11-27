@@ -252,6 +252,18 @@ impl AppState {
         guid: &ResourceId,
         lua: &mlua::Lua,
     ) -> mlua::Result<()> {
+        self.add_resource_as(value, guid, lua, true)
+    }
+
+    /// Kiln layer: `add_resource`, noting the creation in the pass's change journal (`explicit`: the package gave the
+    /// GUID; else `create_resource` drew it).
+    fn add_resource_as(
+        &self,
+        value: &LuaValue,
+        guid: &ResourceId,
+        lua: &mlua::Lua,
+        explicit: bool,
+    ) -> mlua::Result<()> {
         if !self.has_feature(AppFeatures::PATCH) {
             return Err(LuaError::generic("game.assets.write is unavailable"));
         }
@@ -286,6 +298,10 @@ impl AppState {
         });
 
         resources.insert(*guid, info);
+        drop(resources);
+        if let Some(journal) = self.change_journal() {
+            journal.created(*guid, explicit);
+        }
 
         Ok(())
     }
@@ -318,7 +334,7 @@ impl AppState {
 
         drop(resources);
 
-        self.add_resource(value, &guid, lua)?;
+        self.add_resource_as(value, &guid, lua, false)?;
 
         Ok(guid)
     }
@@ -354,6 +370,10 @@ impl AppState {
 
             // TODO: attach a reader to the writer to avoid cloning
             e.insert(data.to_vec());
+        }
+        // Kiln layer: the pass's change journal lists each content a package created, once per package
+        if let Some(journal) = self.change_journal() {
+            journal.content(guid);
         }
 
         Ok(guid)
@@ -411,6 +431,7 @@ mod asset_transaction_tests {
                 feature_flags: AppFeatures::PATCH,
                 export_dir: root_utf8.join("exports"),
                 export_touches: None,
+                change_journal: None,
             },
             type_registry,
             attribute_catalog: OnceCell::new(),

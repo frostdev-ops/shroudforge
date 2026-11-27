@@ -54,6 +54,9 @@ pub(super) fn run_inner(
     // Kiln layer: what the pass's mods use in the export folder, for the record of the pass. A retry adds to the
     // same note: what the failed attempt used is kept, which can only make the next start apply more often.
     let export_touches = shroudforge_game_assets::prepared_stamp::ExportTouches::default();
+    // Kiln layer: the per-package change journal of the pass (Kiln names the packages on the registry fields they
+    // changed); each attempt starts it anew (run_startup_mods.rs), so it holds the committed attempt's
+    let change_journal = shroudforge_api::change_journal::ChangeJournal::default();
     let apply = |environment: &shroudforge_package::ModEnvironment| -> Result<Vec<serde_json::Value>, LoaderError> {
         failed.replace(None);
         shroudforge_game_assets::transaction::recover(game_directory, file_name)
@@ -71,6 +74,8 @@ pub(super) fn run_inner(
         // Once mutation is allowed, invalidate the old pass stamp before changing any game files.
         shroudforge_game_assets::prepared_stamp::forget(game_directory, file_name)
             .map_err(LoaderError::Pregame)?;
+        // Kiln layer: and its change journal, so none is left naming files that are no longer there
+        shroudforge_api::change_journal::forget(game_directory, file_name).map_err(LoaderError::Pregame)?;
         match baseline {
             shroudforge_api::Baseline::Missing => {
                 shroudforge_api::capture_working_baseline(game_directory, file_name)
@@ -134,6 +139,7 @@ pub(super) fn run_inner(
                         export: export_enabled,
                         export_dir: None,
                         export_touches: Some(export_touches.clone()),
+                        change_journal: Some(change_journal.clone()),
                         phase: shroudforge_api::RuntimePhase::Pregame,
                         ..Default::default()
                     },
@@ -157,6 +163,7 @@ pub(super) fn run_inner(
                         export: export_enabled,
                         export_dir: None,
                         export_touches: Some(export_touches.clone()),
+                        change_journal: Some(change_journal.clone()),
                         ..Default::default()
                     },
                 },
@@ -220,6 +227,26 @@ pub(super) fn run_inner(
     ) {
         tracing::warn!(target: "shroudforge::startup", target = file_name, %error,
             "Could not record the asset pass; the next start applies the asset mods again");
+    }
+    // Kiln layer: the pass's change journal beside its record, bound to the <stem>.kfc it published; the packages the
+    // retry ran without are listed as not applied. Without it Kiln names no package of this pass (nothing else changes).
+    let not_applied: Vec<(String, Option<String>, String)> = retry
+        .skipped
+        .iter()
+        .filter_map(|row| {
+            Some((
+                row.get("id")?.as_str()?.to_owned(),
+                row.get("version").and_then(|v| v.as_str()).map(str::to_owned),
+                row.get("error").and_then(|v| v.as_str()).unwrap_or("not applied").to_owned(),
+            ))
+        })
+        .collect();
+    let attempt = if retry.skipped.is_empty() { "first" } else { "retry" };
+    if let Err(error) =
+        shroudforge_api::change_journal::write(game_directory, file_name, &change_journal, attempt, &not_applied)
+    {
+        tracing::warn!(target: "shroudforge::startup", target = file_name, %error,
+            "Could not write the pass's change journal; Kiln names none of its packages this start");
     }
     let mut record = serde_json::json!({
         "schemaVersion": 1, "status": "applied", "phase": phase, "target": file_name,
