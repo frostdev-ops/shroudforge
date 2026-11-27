@@ -208,3 +208,41 @@ fn the_file_is_bound_to_the_published_header() {
     forget(&root, "enshrouded").unwrap();
     fs::remove_dir_all(&root).unwrap();
 }
+
+// Kiln review (dev.32 review-j3): each package carries a digest of its files (contentSha256), so Kiln's effect replay matches
+// a recorded effect by id, version AND files: the files the pass fingerprint hashes (a dot-file and a log are output, not
+// input), framed as Kiln's other package digests. A package the loader gave no digest for keeps null.
+#[test]
+fn each_package_carries_the_digest_of_its_files() {
+    let root = std::env::temp_dir().join(format!("sf-journal-digest-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    let pkg = root.join("alpha");
+    fs::create_dir_all(pkg.join("src")).unwrap();
+    fs::write(pkg.join("mod.json"), br#"{"id":"alpha","version":"1.0.0"}"#).unwrap();
+    fs::write(pkg.join("src").join("main.lua"), b"return {}").unwrap();
+    let d1 = package_digest(&pkg).unwrap();
+    assert_eq!(d1.len(), 64);
+    assert!(d1.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()), "{d1}");
+    fs::write(pkg.join("lantern.log"), b"written after the pass").unwrap();
+    fs::create_dir_all(pkg.join(".git")).unwrap();
+    fs::write(pkg.join(".git").join("HEAD"), b"ref").unwrap();
+    assert_eq!(package_digest(&pkg).unwrap(), d1, "a log and a dot-entry are no input, as for the pass fingerprint");
+    fs::write(pkg.join("src").join("main.lua"), b"return { changed = true }").unwrap();
+    let d2 = package_digest(&pkg).unwrap();
+    assert_ne!(d2, d1, "a changed file is another digest");
+    fs::rename(pkg.join("src").join("main.lua"), pkg.join("src").join("other.lua")).unwrap();
+    assert_ne!(package_digest(&pkg).unwrap(), d2, "so is a renamed one");
+    assert!(package_digest(&root.join("missing")).is_err());
+    let _ = fs::remove_dir_all(&root);
+    let j = ChangeJournal::default();
+    j.begin("alpha", Some("1.0.0".into()));
+    j.end(Vec::new(), |_| None, |_, _| None);
+    j.begin("beta", None);
+    j.end(Vec::new(), |_| None, |_, _| None);
+    j.digests([("alpha".to_owned(), "ab".repeat(32)), ("broken".to_owned(), "cd".repeat(32))].into_iter().collect());
+    let doc: serde_json::Value =
+        serde_json::from_str(&j.json("enshrouded", &"ef".repeat(32), "retry", &[("broken".into(), None, "boom".into())])).unwrap();
+    assert_eq!(doc["packages"][0]["contentSha256"], "ab".repeat(32));
+    assert_eq!(doc["packages"][1]["contentSha256"], serde_json::Value::Null, "no digest given: null");
+    assert_eq!(doc["notApplied"][0]["contentSha256"], "cd".repeat(32));
+}

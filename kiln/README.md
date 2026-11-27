@@ -308,7 +308,11 @@ packages ran. `modules/mod-runtime/startup/kiln_change_journal.rs` keeps that re
   the record of the pass before a pass changes the game files, and writes it after a pass succeeded, beside
   `<stem>.kfc.prepared.json`: Kiln's change journal format 2 (Kiln's `schema/sfi/eml-journal/eml-journal-2.schema.json`,
   dialect `shroudforge`, writer `shroudforge`), bound to the SHA-256 of the `<stem>.kfc` it published, with the packages
-  the retry ran without as `notApplied`. A start that skips the unchanged pass keeps it.
+  the retry ran without as `notApplied`. A start that skips the unchanged pass keeps it;
+- each package, run or not applied, carries the digest of its files as `contentSha256` (`package_digest`: the files the
+  pass fingerprint hashes, no dot-entry and no `*.log`, framed as Kiln's package digests under the name
+  `kiln.shroudforge.package-files.v1`), so Kiln's effect replay matches a recorded effect by id, version and files. It is
+  computed only when a pass runs.
 Nothing the pass writes changes. Tests: `cargo test -p shroudforge-api --lib kiln_change_journal` (the compare, the
 paths, a pass's record from snapshots, the budget, the file) and `cargo test -p shroudforge-modloader --lib
 the_pass_writes_its_change_journal` (a whole pass with a failing package, an unchanged start, a fixed one).

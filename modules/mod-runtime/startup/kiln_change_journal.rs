@@ -286,6 +286,8 @@ struct State {
     spent: std::time::Duration,
     exhausted: bool,
     unattributed: BTreeSet<ResourceId>,
+    /// Each package's files digest (`package_digest`, given by the loader before it writes the record): contentSha256.
+    digests: HashMap<String, String>,
 }
 
 /// The pass's change journal (shared by the loader, which writes it, and the pass, which fills it): reset when an attempt
@@ -408,6 +410,12 @@ impl ChangeJournal {
         }
     }
 
+    /// The plan's packages' file digests ([`package_digest`]), by id: the record's `contentSha256` of each package it ran
+    /// and of each one not applied (null without one). The loader gives them after the committed attempt.
+    pub fn digests(&self, digests: HashMap<String, String>) {
+        self.state().digests = digests;
+    }
+
     /// Whether the comparing stopped early (the pass calls `finish` then).
     pub fn exhausted(&self) -> bool {
         self.state().exhausted
@@ -482,10 +490,11 @@ impl ChangeJournal {
             }
             truncated |= cut;
             packages.push(format!(
-                "{{\"id\":{},\"version\":{},\"kind\":\"shroudforge\",\"contentSha256\":null,\"settingsSha256\":null,\"truncated\":{cut},\
+                "{{\"id\":{},\"version\":{},\"kind\":\"shroudforge\",\"contentSha256\":{},\"settingsSha256\":null,\"truncated\":{cut},\
                  \"changed\":[{}],\"created\":[{}],\"contents\":[{}]}}",
                 text_json(&p.id),
                 p.version.as_deref().map_or_else(|| "null".into(), text_json),
+                digest_json(&s.digests, &p.id),
                 changed.join(","),
                 created.join(","),
                 contents.join(",")
@@ -498,9 +507,10 @@ impl ChangeJournal {
             .filter(|(id, _, _)| is_sf_id(id) && !ran.contains(id.as_str()) && listed.insert(id.clone()))
             .map(|(id, version, reason)| {
                 format!(
-                    "{{\"id\":{},\"version\":{},\"kind\":\"shroudforge\",\"contentSha256\":null,\"reason\":{}}}",
+                    "{{\"id\":{},\"version\":{},\"kind\":\"shroudforge\",\"contentSha256\":{},\"reason\":{}}}",
                     text_json(id),
                     version.as_deref().map_or_else(|| "null".into(), text_json),
+                    digest_json(&s.digests, id),
                     text_json(&one_line(reason))
                 )
             })
@@ -522,6 +532,48 @@ impl ChangeJournal {
             not_applied.join(",")
         )
     }
+}
+
+/// A package's digest as the record writes it: 64 lower-case hex digits, or null (none given, or not one).
+fn digest_json(digests: &HashMap<String, String>, id: &str) -> String {
+    match digests.get(id) {
+        Some(d) if d.len() == 64 && d.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) => format!("\"{d}\""),
+        _ => "null".into(),
+    }
+}
+
+/// A package folder's files digest, the record's `contentSha256` (lower-case hex): the files the pass fingerprint hashes
+/// (`calculate_preparation_fingerprint.rs`: no entry whose name starts with '.', no `*.log`), sorted by their path below
+/// the folder ('/'-joined, as bytes), framed as Kiln's package digests are (sfi-policy `package_content_sha256`) under its
+/// own name: SHA-256("kiln.shroudforge.package-files.v1\0" || u64le(count) || per file: u64le(path length) || path ||
+/// u64le(size) || SHA-256(bytes)). A package that is one file is that file. Kiln compares it only with this writer's own.
+pub fn package_digest(root: &Path) -> Result<String, String> {
+    let mut files: Vec<(String, PathBuf)> = Vec::new();
+    if root.is_file() {
+        files.push((root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(), root.to_path_buf()));
+    } else {
+        for entry in walkdir::WalkDir::new(root).into_iter().filter_entry(|e| e.depth() == 0 || !e.file_name().to_string_lossy().starts_with('.')) {
+            let entry = entry.map_err(|e| format!("{}: {e}", root.display()))?;
+            if !entry.file_type().is_file() || entry.path().extension().is_some_and(|x| x.eq_ignore_ascii_case("log")) {
+                continue;
+            }
+            let rel = entry.path().strip_prefix(root).map_err(|e| e.to_string())?;
+            let rel: Vec<String> = rel.components().map(|c| c.as_os_str().to_string_lossy().into_owned()).collect();
+            files.push((rel.join("/"), entry.path().to_path_buf()));
+        }
+    }
+    files.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+    let mut total = Sha256::new();
+    total.update(b"kiln.shroudforge.package-files.v1\0");
+    total.update((files.len() as u64).to_le_bytes());
+    for (rel, path) in &files {
+        let bytes = fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        total.update((rel.len() as u64).to_le_bytes());
+        total.update(rel.as_bytes());
+        total.update((bytes.len() as u64).to_le_bytes());
+        total.update(Sha256::digest(&bytes));
+    }
+    Ok(total.finalize().iter().map(|b| format!("{b:02x}")).collect())
 }
 
 fn text_json(s: &str) -> String {

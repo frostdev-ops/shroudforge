@@ -242,6 +242,19 @@ pub(super) fn run_inner(
         })
         .collect();
     let attempt = if retry.skipped.is_empty() { "first" } else { "retry" };
+    // Kiln layer (Kiln review): each pregame package's files digest, so Kiln matches a recorded effect by its files too (the
+    // fingerprint above read the same files moments ago; only a pass that ran pays for it)
+    change_journal.digests(
+        environment
+            .plan(server, shroudforge_api::API_VERSION)
+            .into_iter()
+            .filter(|item| item.info().requires_pregame())
+            .filter_map(|item| {
+                let digest = shroudforge_api::change_journal::package_digest(item.fs().root().as_std_path()).ok()?;
+                Some((item.info().id.to_string(), digest))
+            })
+            .collect(),
+    );
     if let Err(error) =
         shroudforge_api::change_journal::write(game_directory, file_name, &change_journal, attempt, &not_applied)
     {

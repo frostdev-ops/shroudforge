@@ -436,6 +436,10 @@ fn the_pass_writes_its_change_journal_with_the_packages_it_ran_without() {
     assert_eq!(ids(&j["notApplied"]), ["broken", "needs-broken"], "{j}");
     assert!(j["notApplied"][0]["reason"].as_str().unwrap().contains("boom"), "{j}");
     assert_eq!(j["notApplied"][1]["reason"], "needs broken, which failed in the pregame pass");
+    // Kiln review (review-j3): every package with the digest of its files, the ones run without too
+    let hex = |v: &serde_json::Value| v.as_str().is_some_and(|s| s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit()));
+    assert!(hex(&j["packages"][0]["contentSha256"]) && hex(&j["notApplied"][0]["contentSha256"]) && hex(&j["notApplied"][1]["contentSha256"]), "{j}");
+    let broken_digest = j["notApplied"][0]["contentSha256"].clone();
     // the next start skips the unchanged pass and keeps the journal as it is
     assert!(already_applied(&game.0, "enshrouded", false).unwrap());
     run_startup(&game.0).unwrap();
@@ -447,5 +451,7 @@ fn the_pass_writes_its_change_journal_with_the_packages_it_ran_without() {
     let mut ran = ids(&j["packages"]);
     ran.sort_unstable();
     assert_eq!(ran, ["alpha", "broken", "needs-broken"], "{j}");
+    let fixed = j["packages"].as_array().unwrap().iter().find(|p| p["id"] == "broken").unwrap();
+    assert_ne!(fixed["contentSha256"], broken_digest, "its files changed: another digest");
     assert_eq!((&j["attempt"], &j["notApplied"]), (&json!("first"), &json!([])));
 }
