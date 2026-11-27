@@ -302,8 +302,9 @@ packages ran. `modules/mod-runtime/startup/kiln_change_journal.rs` keeps that re
   membership); a list whose length changed is aligned by its unchanged ends, and earlier packages' paths move with it;
 - creations (`session/asset_resources.rs` `add_resource_as`: explicit GUID or drawn) and contents (`create_content`) are
   noted per package, in order;
-- past 3 s of comparing in one pass (`BUDGET`) the rest of the pass is recorded as no package's (whole resources in
-  `unattributed`, `truncated`), so a large modpack's start is never much slower;
+- past 3 s of encoding and comparing in one pass (`BUDGET`, `ChangeJournal::end_with`) the rest of the pass is neither
+  encoded nor compared for it and is recorded as no package's (whole resources in `unattributed`, `truncated`), so a large
+  modpack's start is never much slower;
 - the loader (`entrypoints/loader/asset_preparation/apply_asset_mods.rs`) removes `<stem>.kfc.change-journal.json` with
   the record of the pass before a pass changes the game files, and writes it after a pass succeeded, beside
   `<stem>.kfc.prepared.json`: Kiln's change journal format 2 (Kiln's `schema/sfi/eml-journal/eml-journal-2.schema.json`,

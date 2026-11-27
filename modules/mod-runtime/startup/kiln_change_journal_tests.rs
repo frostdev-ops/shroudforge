@@ -246,3 +246,23 @@ fn each_package_carries_the_digest_of_its_files() {
     assert_eq!(doc["packages"][1]["contentSha256"], serde_json::Value::Null, "no digest given: null");
     assert_eq!(doc["notApplied"][0]["contentSha256"], "cd".repeat(32));
 }
+
+// Kiln review (review-j3): encoding the edited resources after each entrypoint is part of the journal's cost, so it counts
+// toward BUDGET, and past the budget it is not done at all (before, only the comparing was timed: a large modpack paid an
+// encode of every edited resource after every package however long that took).
+#[test]
+fn the_encoding_counts_toward_the_budget_and_stops_with_it() {
+    let j = ChangeJournal::default();
+    j.state().spent = BUDGET;
+    j.state().exhausted = true;
+    j.begin("late", None);
+    let called = std::cell::Cell::new(false);
+    j.end_with(|| { called.set(true); Vec::new() }, |_| None, |_, _| None);
+    assert!(!called.get(), "past the budget no resource is encoded for the journal");
+    assert!(j.state().current.is_none(), "and the package's entrypoint is over");
+    let k = ChangeJournal::default();
+    k.state().spent = BUDGET - std::time::Duration::from_millis(1);
+    k.begin("slow", None);
+    k.end_with(|| { std::thread::sleep(std::time::Duration::from_millis(20)); Vec::new() }, |_| None, |_, _| None);
+    assert!(k.exhausted(), "an encoding that takes the journal past its budget stops it");
+}

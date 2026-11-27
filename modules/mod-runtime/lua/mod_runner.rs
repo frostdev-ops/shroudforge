@@ -85,8 +85,8 @@ impl LuaModRunner {
             });
             if let Some(journal) = &journal {
                 let registry = app_state.type_registry().clone();
-                journal.end(
-                    self.journal_snapshots(&app_state),
+                journal.end_with(
+                    || self.journal_snapshots(&app_state),
                     |id| app_state.reader().ok()?.read_resource(id).ok().flatten(),
                     |id, bytes| {
                         let r#type = kfc::kfc_format::type_for_resource(&registry, id)?;

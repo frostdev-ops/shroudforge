@@ -26,7 +26,8 @@
 //! whole resource, the member holding it), [`JOURNAL_PATH_BYTES`] of paths in all (over: whole resources).
 //!
 //! **Cost.** At each package's end every resource the pass edited so far is encoded once (the commit encodes each once at
-//! the end). Past [`BUDGET`] of that work in one pass, the packages after it are not compared: what changed after it is
+//! the end). Past [`BUDGET`] of that work in one pass (the encoding and the comparing, [`ChangeJournal::end_with`]), the
+//! packages after it are neither encoded nor compared: what changed after it is
 //! listed whole in `unattributed` (named as no package's) and the record says `truncated`, so it never misses a change and
 //! never makes a pass much slower than before.
 use kfc::{
@@ -46,7 +47,7 @@ pub const TOTAL_ENTRIES: usize = 32768;
 pub const RESOURCE_PATHS: usize = 16384;
 pub const PATH_BYTES: usize = 256;
 pub const JOURNAL_PATH_BYTES: usize = 8 << 20;
-/// The comparing a pass may spend; past it the rest of the pass is recorded as no package's.
+/// The encoding and comparing a pass may spend; past it the rest of the pass is recorded as no package's.
 pub const BUDGET: std::time::Duration = std::time::Duration::from_secs(3);
 
 // ---- the member paths ----
@@ -391,6 +392,24 @@ impl ChangeJournal {
             tracing::warn!(target: "shroudforge::startup", spent_ms = s.spent.as_millis() as u64,
                 "The change journal stopped comparing after {} package(s): later changes are recorded as no package's", current + 1);
         }
+    }
+
+    /// [`end`](Self::end) with the edited resources encoded by `snapshots` only while the journal is within its budget, the
+    /// encoding counted toward it (the pass calls this: encoding every edited resource after every package is most of the
+    /// journal's cost). Past the budget nothing is encoded and the entrypoint is simply over.
+    pub fn end_with<S: IntoIterator<Item = Snapshot>>(
+        &self,
+        snapshots: impl FnOnce() -> S,
+        archive: impl Fn(&ResourceId) -> Option<Vec<u8>>,
+        decode: impl Fn(&ResourceId, &[u8]) -> Option<Value>,
+    ) {
+        if self.exhausted() {
+            return self.end(Vec::new(), archive, decode);
+        }
+        let started = std::time::Instant::now();
+        let resources: Vec<Snapshot> = snapshots().into_iter().collect();
+        self.state().spent += started.elapsed();
+        self.end(resources, archive, decode);
     }
 
     /// The pass's end (before its commit), with its edited resources then: when the comparing stopped early, each one
